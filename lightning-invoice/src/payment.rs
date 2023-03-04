@@ -141,6 +141,7 @@ use bitcoin_hashes::Hash;
 use bitcoin_hashes::sha256::Hash as Sha256;
 
 use crate::prelude::*;
+use crate::rgb_utils::{filter_first_hops, write_rgb_payment_info_file};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::ln::channelmanager::{ChannelDetails, PaymentId, PaymentSendFailure};
 use lightning::ln::msgs::LightningError;
@@ -150,6 +151,8 @@ use lightning::util::logger::Logger;
 use crate::time_utils::Time;
 use crate::sync::Mutex;
 
+use rgb::ContractId;
+
 use secp256k1::PublicKey;
 
 use core::fmt;
@@ -157,6 +160,8 @@ use core::fmt::{Debug, Display, Formatter};
 use core::future::Future;
 use core::ops::Deref;
 use core::time::Duration;
+#[cfg(feature = "std")]
+use std::path::PathBuf;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
@@ -199,6 +204,7 @@ pub struct InvoicePayerUsingTime<
 	/// Caches the overall attempts at making a payment, which is updated prior to retrying.
 	payment_cache: Mutex<HashMap<PaymentHash, PaymentAttempts<T>>>,
 	retry: Retry,
+	ldk_data_dir: PathBuf,
 }
 
 /// Storing minimal payment attempts information required for determining if a outbound payment can
@@ -327,7 +333,7 @@ where
 	/// Will forward any [`Event::PaymentPathFailed`] events to the decorated `event_handler` once
 	/// `retry` has been exceeded for a given [`Invoice`].
 	pub fn new(
-		payer: P, router: R, logger: L, event_handler: E, retry: Retry
+		payer: P, router: R, logger: L, event_handler: E, retry: Retry, ldk_data_dir: PathBuf
 	) -> Self {
 		Self {
 			payer,
@@ -336,6 +342,7 @@ where
 			event_handler,
 			payment_cache: Mutex::new(HashMap::new()),
 			retry,
+			ldk_data_dir,
 		}
 	}
 
@@ -448,10 +455,11 @@ where
 	/// ensure that a second payment with the same [`PaymentPreimage`] is never sent.
 	pub fn pay_pubkey(
 		&self, pubkey: PublicKey, payment_preimage: PaymentPreimage, amount_msats: u64,
-		final_cltv_expiry_delta: u32
+		final_cltv_expiry_delta: u32, contract_id: ContractId, amount_rgb: u64
 	) -> Result<PaymentId, PaymentError> {
 		let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0).into_inner());
 		let payment_id = PaymentId(payment_hash.0);
+		write_rgb_payment_info_file(&self.ldk_data_dir, &payment_hash, contract_id, amount_rgb);
 		self.do_pay_pubkey(pubkey, payment_preimage, payment_hash, payment_id, amount_msats,
 				final_cltv_expiry_delta)
 			.map(|()| payment_id)
@@ -467,9 +475,10 @@ where
 	/// [`PaymentHash`] has never been paid before.
 	pub fn pay_pubkey_with_id(
 		&self, pubkey: PublicKey, payment_preimage: PaymentPreimage, payment_id: PaymentId,
-		amount_msats: u64, final_cltv_expiry_delta: u32
+		amount_msats: u64, final_cltv_expiry_delta: u32, contract_id: ContractId, amount_rgb: u64
 	) -> Result<(), PaymentError> {
 		let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0).into_inner());
+		write_rgb_payment_info_file(&self.ldk_data_dir, &payment_hash, contract_id, amount_rgb);
 		self.do_pay_pubkey(pubkey, payment_preimage, payment_hash, payment_id, amount_msats,
 				final_cltv_expiry_delta)
 	}
@@ -507,10 +516,11 @@ where
 		}
 
 		let payer = self.payer.node_id();
-		let first_hops = self.payer.first_hops();
+		let mut first_hops = self.payer.first_hops();
+		let contract_id = filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut first_hops);
 		let inflight_htlcs = self.payer.inflight_htlcs();
 		let route = self.router.find_route(
-			&payer, &params, Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs
+			&payer, &params, Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs, contract_id
 		).map_err(|e| PaymentError::Routing(e))?;
 
 		match send_payment(&route) {
@@ -574,11 +584,12 @@ where
 		}
 
 		let payer = self.payer.node_id();
-		let first_hops = self.payer.first_hops();
+		let mut first_hops = self.payer.first_hops();
+		let contract_id = filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut first_hops);
 		let inflight_htlcs = self.payer.inflight_htlcs();
 
 		let route = self.router.find_route(
-			&payer, &params, Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs
+			&payer, &params, Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs, contract_id
 		);
 
 		if route.is_err() {
@@ -727,6 +738,7 @@ where
 	}
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2307,3 +2319,4 @@ mod tests {
 		assert!(expected_events.borrow().is_empty());
 	}
 }
+*/

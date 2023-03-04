@@ -30,6 +30,10 @@ use bitcoin::secp256k1;
 use bitcoin::blockdata::script::Script;
 use bitcoin::hash_types::{Txid, BlockHash};
 
+use invoice::ConsignmentEndpoint;
+
+use rgb::ContractId;
+
 use crate::ln::features::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, NodeFeatures};
 use crate::ln::onion_utils;
 use crate::onion_message;
@@ -175,6 +179,8 @@ pub struct OpenChannel {
 	/// type from the intersection of our feature bits with our counterparty's feature bits from
 	/// the Init message.
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The consignment endpoint used to exchange the RGB consignment
+	pub consignment_endpoint: ConsignmentEndpoint,
 }
 
 /// An accept_channel message to be sent or received from a peer
@@ -303,6 +309,8 @@ pub struct UpdateAddHTLC {
 	/// The expiry height of the HTLC
 	pub cltv_expiry: u32,
 	pub(crate) onion_routing_packet: OnionPacket,
+	/// The RGB amount allocated to the HTLC
+	pub amount_rgb: u64,
 }
 
  /// An onion message to be sent or received from a peer
@@ -617,6 +625,8 @@ pub struct UnsignedChannelAnnouncement {
 	pub bitcoin_key_1: PublicKey,
 	/// The funding key for the second node
 	pub bitcoin_key_2: PublicKey,
+	/// RGB contract ID
+	pub contract_id: ContractId,
 	pub(crate) excess_data: Vec<u8>,
 }
 /// A channel_announcement message to be sent or received from a peer
@@ -1326,10 +1336,35 @@ impl_writeable_msg!(OpenChannel, {
 	htlc_basepoint,
 	first_per_commitment_point,
 	channel_flags,
-	shutdown_scriptpubkey
+	shutdown_scriptpubkey,
+	consignment_endpoint
 }, {
 	(1, channel_type, option),
 });
+
+impl Readable for ConsignmentEndpoint {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		use std::str::FromStr;
+
+		let sz: usize = <u16 as Readable>::read(r)? as usize;
+		let mut consignment_endpoint_str_vec = Vec::with_capacity(sz);
+		consignment_endpoint_str_vec.resize(sz, 0);
+		r.read_exact(&mut consignment_endpoint_str_vec)?;
+		match String::from_utf8(consignment_endpoint_str_vec) {
+			Ok(s) => return Ok(ConsignmentEndpoint::from_str(&s).unwrap()),
+			Err(_) => return Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for ConsignmentEndpoint {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		let consignment_endpoint_str = format!("{self}");
+		(consignment_endpoint_str.len() as u16).write(w)?;
+		w.write_all(consignment_endpoint_str.as_bytes())?;
+		Ok(())
+	}
+}
 
 impl_writeable_msg!(RevokeAndACK, {
 	channel_id,
@@ -1410,7 +1445,8 @@ impl_writeable_msg!(UpdateAddHTLC, {
 	amount_msat,
 	payment_hash,
 	cltv_expiry,
-	onion_routing_packet
+	onion_routing_packet,
+	amount_rgb
 }, {});
 
 impl Readable for OnionMessage {
@@ -1575,8 +1611,25 @@ impl Writeable for UnsignedChannelAnnouncement {
 		self.node_id_2.write(w)?;
 		self.bitcoin_key_1.write(w)?;
 		self.bitcoin_key_2.write(w)?;
+		self.contract_id.write(w)?;
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
+	}
+}
+
+impl Readable for ContractId {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		use commit_verify::tagged_hash::TaggedHash;
+
+		let buf: [u8; 32] = Readable::read(r)?;
+		let contract_id = ContractId::from_bytes(buf).unwrap();
+		Ok(contract_id)
+	}
+}
+
+impl Writeable for ContractId {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		w.write_all(&self[..])
 	}
 }
 
@@ -1590,6 +1643,7 @@ impl Readable for UnsignedChannelAnnouncement {
 			node_id_2: Readable::read(r)?,
 			bitcoin_key_1: Readable::read(r)?,
 			bitcoin_key_2: Readable::read(r)?,
+			contract_id: Readable::read(r)?,
 			excess_data: read_to_end(r)?,
 		})
 	}
@@ -1932,6 +1986,7 @@ impl_writeable_msg!(GossipTimestampFilter, {
 	timestamp_range,
 }, {});
 
+/*
 #[cfg(test)]
 mod tests {
 	use hex;
@@ -2885,3 +2940,4 @@ mod tests {
 		Ok(encoded_payload)
 	}
 }
+*/

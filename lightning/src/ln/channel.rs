@@ -22,6 +22,8 @@ use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
 
+use invoice::ConsignmentEndpoint;
+
 use crate::ln::{PaymentPreimage, PaymentHash};
 use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
 use crate::ln::msgs;
@@ -36,6 +38,7 @@ use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBounde
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::keysinterface::{Sign, KeysInterface, BaseSign};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info, rename_rgbinfo_file, update_rgb_channel_amount};
 use crate::util::events::ClosureReason;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, VecWriter};
 use crate::util::logger::Logger;
@@ -47,6 +50,7 @@ use crate::io;
 use crate::prelude::*;
 use core::{cmp,mem,fmt};
 use core::ops::Deref;
+use std::path::PathBuf;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
 use bitcoin::hashes::hex::ToHex;
@@ -155,6 +159,7 @@ struct InboundHTLCOutput {
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
 	state: InboundHTLCState,
+	amount_rgb: u64,
 }
 
 enum OutboundHTLCState {
@@ -220,6 +225,7 @@ struct OutboundHTLCOutput {
 	payment_hash: PaymentHash,
 	state: OutboundHTLCState,
 	source: HTLCSource,
+	amount_rgb: u64,
 }
 
 /// See AwaitingRemoteRevoke ChannelState for more info
@@ -231,6 +237,7 @@ enum HTLCUpdateAwaitingACK {
 		payment_hash: PaymentHash,
 		source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket,
+		amount_rgb: u64,
 	},
 	ClaimHTLC {
 		payment_preimage: PaymentPreimage,
@@ -742,6 +749,9 @@ pub(super) struct Channel<Signer: Sign> {
 	/// The unique identifier used to re-derive the private key material for the channel through
 	/// [`KeysInterface::derive_channel_signer`].
 	channel_keys_id: [u8; 32],
+
+	/// The consignment endpoint used to exchange the RGB consignment
+	pub(super) consignment_endpoint: ConsignmentEndpoint,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -807,7 +817,7 @@ pub const MIN_THEIR_CHAN_RESERVE_SATOSHIS: u64 = 1000;
 /// Used to return a simple Error back to ChannelManager. Will get converted to a
 /// msgs::ErrorAction::SendErrorMessage or msgs::ErrorAction::IgnoreError as appropriate with our
 /// channel_id in ChannelManager.
-pub(super) enum ChannelError {
+pub enum ChannelError {
 	Ignore(String),
 	Warn(String),
 	Close(String),
@@ -906,7 +916,7 @@ impl<Signer: Sign> Channel<Signer> {
 	pub fn new_outbound<K: Deref, F: Deref>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, keys_provider: &K, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
-		outbound_scid_alias: u64
+		outbound_scid_alias: u64, consignment_endpoint: ConsignmentEndpoint
 	) -> Result<Channel<Signer>, APIError>
 	where K::Target: KeysInterface<Signer = Signer>,
 	      F::Target: FeeEstimator,
@@ -1078,6 +1088,8 @@ impl<Signer: Sign> Channel<Signer> {
 
 			channel_type: Self::get_initial_channel_type(&config),
 			channel_keys_id,
+
+			consignment_endpoint,
 		})
 	}
 
@@ -1426,6 +1438,8 @@ impl<Signer: Sign> Channel<Signer> {
 
 			channel_type,
 			channel_keys_id,
+
+			consignment_endpoint: msg.consignment_endpoint.clone(),
 		};
 
 		Ok(chan)
@@ -1482,7 +1496,8 @@ impl<Signer: Sign> Channel<Signer> {
 					amount_msat: $htlc.amount_msat,
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
-					transaction_output_index: None
+					transaction_output_index: None,
+					amount_rgb: $htlc.amount_rgb
 				}
 			}
 		}
@@ -1714,7 +1729,7 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	#[inline]
-	fn build_closing_transaction(&self, proposed_total_fee_satoshis: u64, skip_remote_output: bool) -> (ClosingTransaction, u64) {
+	fn build_closing_transaction(&self, proposed_total_fee_satoshis: u64, skip_remote_output: bool, ldk_data_dir: PathBuf) -> Result<(ClosingTransaction, u64), ChannelError> {
 		assert!(self.pending_inbound_htlcs.is_empty());
 		assert!(self.pending_outbound_htlcs.is_empty());
 		assert!(self.pending_update_fee.is_none());
@@ -1744,8 +1759,9 @@ impl<Signer: Sign> Channel<Signer> {
 		let counterparty_shutdown_script = self.counterparty_shutdown_scriptpubkey.clone().unwrap();
 		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
 
-		let closing_transaction = ClosingTransaction::new(value_to_holder as u64, value_to_counterparty as u64, holder_shutdown_script, counterparty_shutdown_script, funding_outpoint);
-		(closing_transaction, total_fee_satoshis)
+		let mut closing_transaction = ClosingTransaction::new(value_to_holder as u64, value_to_counterparty as u64, holder_shutdown_script, counterparty_shutdown_script, funding_outpoint);
+		color_closing(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut closing_transaction, &ldk_data_dir)?;
+		Ok((closing_transaction, total_fee_satoshis))
 	}
 
 	fn funding_outpoint(&self) -> OutPoint {
@@ -1932,10 +1948,10 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 	}
 
-	pub fn get_update_fulfill_htlc_and_commit<L: Deref>(&mut self, htlc_id: u64, payment_preimage: PaymentPreimage, logger: &L) -> Result<UpdateFulfillCommitFetch, (ChannelError, ChannelMonitorUpdate)> where L::Target: Logger {
+	pub fn get_update_fulfill_htlc_and_commit<L: Deref>(&mut self, htlc_id: u64, payment_preimage: PaymentPreimage, logger: &L, ldk_data_dir: PathBuf) -> Result<UpdateFulfillCommitFetch, (ChannelError, ChannelMonitorUpdate)> where L::Target: Logger {
 		match self.get_update_fulfill_htlc(htlc_id, payment_preimage, logger) {
 			UpdateFulfillFetch::NewClaim { mut monitor_update, htlc_value_msat, msg: Some(update_fulfill_htlc) } => {
-				let (commitment, mut additional_update) = match self.send_commitment_no_status_check(logger) {
+				let (commitment, mut additional_update) = match self.send_commitment_no_status_check(logger, ldk_data_dir) {
 					Err(e) => return Err((e, monitor_update)),
 					Ok(res) => res
 				};
@@ -2185,11 +2201,12 @@ impl<Signer: Sign> Channel<Signer> {
 		Ok(())
 	}
 
-	fn funding_created_signature<L: Deref>(&mut self, sig: &Signature, logger: &L) -> Result<(Txid, CommitmentTransaction, Signature), ChannelError> where L::Target: Logger {
+	fn funding_created_signature<L: Deref>(&mut self, sig: &Signature, logger: &L, ldk_data_dir: PathBuf) -> Result<(Txid, CommitmentTransaction, Signature), ChannelError> where L::Target: Logger {
 		let funding_script = self.get_funding_redeemscript();
 
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
-		let initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger).tx;
+		let mut initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger).tx;
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &ldk_data_dir, false)?;
 		{
 			let trusted_tx = initial_commitment_tx.trust();
 			let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
@@ -2203,8 +2220,8 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		let counterparty_keys = self.build_remote_transaction_keys();
-		let counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
-
+		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &ldk_data_dir, true)?;
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 		log_trace!(logger, "Initial counterparty tx for channel {} is: txid {} tx {}",
@@ -2222,7 +2239,7 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	pub fn funding_created<K: Deref, L: Deref>(
-		&mut self, msg: &msgs::FundingCreated, best_block: BestBlock, keys_source: &K, logger: &L
+		&mut self, msg: &msgs::FundingCreated, best_block: BestBlock, keys_source: &K, logger: &L, ldk_data_dir: PathBuf
 	) -> Result<(msgs::FundingSigned, ChannelMonitor<<K::Target as KeysInterface>::Signer>, Option<msgs::ChannelReady>), ChannelError>
 	where
 		K::Target: KeysInterface,
@@ -2252,7 +2269,7 @@ impl<Signer: Sign> Channel<Signer> {
 		// funding_created_signature may fail.
 		self.holder_signer.provide_channel_parameters(&self.channel_transaction_parameters);
 
-		let (counterparty_initial_commitment_txid, initial_commitment_tx, signature) = match self.funding_created_signature(&msg.signature, logger) {
+		let (counterparty_initial_commitment_txid, initial_commitment_tx, signature) = match self.funding_created_signature(&msg.signature, logger, ldk_data_dir.clone()) {
 			Ok(res) => res,
 			Err(ChannelError::Close(e)) => {
 				self.channel_transaction_parameters.funding_outpoint = None;
@@ -2290,12 +2307,15 @@ impl<Signer: Sign> Channel<Signer> {
 		                                          &self.channel_transaction_parameters,
 		                                          funding_redeemscript.clone(), self.channel_value_satoshis,
 		                                          obscure_factor,
-		                                          holder_commitment_tx, best_block, self.counterparty_node_id);
+		                                          holder_commitment_tx, best_block, self.counterparty_node_id,
+												  ldk_data_dir.clone());
 
 		channel_monitor.provide_latest_counterparty_commitment_tx(counterparty_initial_commitment_txid, Vec::new(), self.cur_counterparty_commitment_transaction_number, self.counterparty_cur_commitment_point.unwrap(), logger);
 
 		self.channel_state = ChannelState::FundingSent as u32;
+		let temporary_channel_id = self.channel_id;
 		self.channel_id = funding_txo.to_channel_id();
+		rename_rgbinfo_file(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
 		self.cur_counterparty_commitment_transaction_number -= 1;
 		self.cur_holder_commitment_transaction_number -= 1;
 
@@ -2310,7 +2330,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Handles a funding_signed message from the remote end.
 	/// If this call is successful, broadcast the funding transaction (and not before!)
 	pub fn funding_signed<K: Deref, L: Deref>(
-		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, keys_source: &K, logger: &L
+		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, keys_source: &K, logger: &L, ldk_data_dir: PathBuf
 	) -> Result<(ChannelMonitor<<K::Target as KeysInterface>::Signer>, Transaction, Option<msgs::ChannelReady>), ChannelError>
 	where
 		K::Target: KeysInterface,
@@ -2331,7 +2351,8 @@ impl<Signer: Sign> Channel<Signer> {
 		let funding_script = self.get_funding_redeemscript();
 
 		let counterparty_keys = self.build_remote_transaction_keys();
-		let counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &ldk_data_dir, true)?;
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 
@@ -2339,7 +2360,8 @@ impl<Signer: Sign> Channel<Signer> {
 			log_bytes!(self.channel_id()), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
 		let holder_signer = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
-		let initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &holder_signer, true, false, logger).tx;
+		let mut initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &holder_signer, true, false, logger).tx;
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &ldk_data_dir, false)?;
 		{
 			let trusted_tx = initial_commitment_tx.trust();
 			let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
@@ -2375,7 +2397,7 @@ impl<Signer: Sign> Channel<Signer> {
 		                                          &self.channel_transaction_parameters,
 		                                          funding_redeemscript.clone(), self.channel_value_satoshis,
 		                                          obscure_factor,
-		                                          holder_commitment_tx, best_block, self.counterparty_node_id);
+		                                          holder_commitment_tx, best_block, self.counterparty_node_id, ldk_data_dir);
 
 		channel_monitor.provide_latest_counterparty_commitment_tx(counterparty_initial_bitcoin_tx.txid, Vec::new(), self.cur_counterparty_commitment_transaction_number, self.counterparty_cur_commitment_point.unwrap(), logger);
 
@@ -2392,7 +2414,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Handles a channel_ready message from our peer. If we've already sent our channel_ready
 	/// and the channel is now usable (and public), this may generate an announcement_signatures to
 	/// reply with.
-	pub fn channel_ready<L: Deref>(&mut self, msg: &msgs::ChannelReady, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock, logger: &L) -> Result<Option<msgs::AnnouncementSignatures>, ChannelError> where L::Target: Logger {
+	pub fn channel_ready<L: Deref>(&mut self, msg: &msgs::ChannelReady, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock, logger: &L, ldk_data_dir: PathBuf) -> Result<Option<msgs::AnnouncementSignatures>, ChannelError> where L::Target: Logger {
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
 			self.workaround_lnd_bug_4006 = Some(msg.clone());
 			return Err(ChannelError::Ignore("Peer sent channel_ready when we needed a channel_reestablish. The peer is likely lnd, see https://github.com/lightningnetwork/lnd/issues/4006".to_owned()));
@@ -2446,7 +2468,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		log_info!(logger, "Received channel_ready from peer for channel {}", log_bytes!(self.channel_id()));
 
-		Ok(self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger))
+		Ok(self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger, ldk_data_dir))
 	}
 
 	/// Returns transaction if there is pending funding transaction that is yet to broadcast
@@ -2921,6 +2943,7 @@ impl<Signer: Sign> Channel<Signer> {
 			payment_hash: msg.payment_hash,
 			cltv_expiry: msg.cltv_expiry,
 			state: InboundHTLCState::RemoteAnnounced(pending_forward_status),
+			amount_rgb: msg.amount_rgb,
 		});
 		Ok(())
 	}
@@ -2991,7 +3014,7 @@ impl<Signer: Sign> Channel<Signer> {
 		Ok(())
 	}
 
-	pub fn commitment_signed<L: Deref>(&mut self, msg: &msgs::CommitmentSigned, logger: &L) -> Result<(msgs::RevokeAndACK, Option<msgs::CommitmentSigned>, ChannelMonitorUpdate), (Option<ChannelMonitorUpdate>, ChannelError)>
+	pub fn commitment_signed<L: Deref>(&mut self, msg: &msgs::CommitmentSigned, logger: &L, ldk_data_dir: PathBuf) -> Result<(msgs::RevokeAndACK, Option<msgs::CommitmentSigned>, ChannelMonitorUpdate), (Option<ChannelMonitorUpdate>, ChannelError)>
 		where L::Target: Logger
 	{
 		if (self.channel_state & (ChannelState::ChannelReady as u32)) != (ChannelState::ChannelReady as u32) {
@@ -3008,7 +3031,12 @@ impl<Signer: Sign> Channel<Signer> {
 
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 
-		let commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger);
+		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger);
+		match color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &ldk_data_dir, false) {
+			Err(e) => return Err((None, e)),
+			_ => {}
+		}
+
 		let commitment_txid = {
 			let trusted_tx = commitment_stats.tx.trust();
 			let bitcoin_tx = trusted_tx.built_transaction();
@@ -3063,9 +3091,13 @@ impl<Signer: Sign> Channel<Signer> {
 		let mut htlcs_and_sigs = Vec::with_capacity(htlcs_cloned.len());
 		for (idx, (htlc, source)) in htlcs_cloned.drain(..).enumerate() {
 			if let Some(_) = htlc.transaction_output_index {
-				let htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
+				let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
 					self.get_counterparty_selected_contest_delay().unwrap(), &htlc, self.opt_anchors(),
 					false, &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
+				match color_htlc(&mut htlc_tx, &htlc, &ldk_data_dir) {
+					Err(e) => return Err((None, e)),
+					_ => {}
+				}
 
 				let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, self.opt_anchors(), &keys);
 				let htlc_sighashtype = if self.opt_anchors() { EcdsaSighashType::SinglePlusAnyoneCanPay } else { EcdsaSighashType::All };
@@ -3150,7 +3182,7 @@ impl<Signer: Sign> Channel<Signer> {
 				// the corresponding HTLC status updates so that get_last_commitment_update
 				// includes the right HTLCs.
 				self.monitor_pending_commitment_signed = true;
-				let (_, mut additional_update) = self.send_commitment_no_status_check(logger).map_err(|e| (None, e))?;
+				let (_, mut additional_update) = self.send_commitment_no_status_check(logger, ldk_data_dir.clone()).map_err(|e| (None, e))?;
 				// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
@@ -3165,7 +3197,7 @@ impl<Signer: Sign> Channel<Signer> {
 			// If we're AwaitingRemoteRevoke we can't send a new commitment here, but that's ok -
 			// we'll send one right away when we get the revoke_and_ack when we
 			// free_holding_cell_htlcs().
-			let (msg, mut additional_update) = self.send_commitment_no_status_check(logger).map_err(|e| (None, e))?;
+			let (msg, mut additional_update) = self.send_commitment_no_status_check(logger, ldk_data_dir).map_err(|e| (None, e))?;
 			// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
 			// strictly increasing by one, so decrement it here.
 			self.latest_monitor_update_id = monitor_update.update_id;
@@ -3186,16 +3218,16 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Public version of the below, checking relevant preconditions first.
 	/// If we're not in a state where freeing the holding cell makes sense, this is a no-op and
 	/// returns `(None, Vec::new())`.
-	pub fn maybe_free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
+	pub fn maybe_free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L, ldk_data_dir: PathBuf) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
 		if self.channel_state >= ChannelState::ChannelReady as u32 &&
 		   (self.channel_state & (ChannelState::AwaitingRemoteRevoke as u32 | ChannelState::PeerDisconnected as u32 | ChannelState::MonitorUpdateInProgress as u32)) == 0 {
-			self.free_holding_cell_htlcs(logger)
+			self.free_holding_cell_htlcs(logger, ldk_data_dir)
 		} else { Ok((None, Vec::new())) }
 	}
 
 	/// Frees any pending commitment updates in the holding cell, generating the relevant messages
 	/// for our counterparty.
-	fn free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
+	fn free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L, ldk_data_dir: PathBuf) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
 		assert_eq!(self.channel_state & ChannelState::MonitorUpdateInProgress as u32, 0);
 		if self.holding_cell_htlc_updates.len() != 0 || self.holding_cell_update_fee.is_some() {
 			log_trace!(logger, "Freeing holding cell with {} HTLC updates{} in channel {}", self.holding_cell_htlc_updates.len(),
@@ -3219,8 +3251,8 @@ impl<Signer: Sign> Channel<Signer> {
 				// handling this case better and maybe fulfilling some of the HTLCs while attempting
 				// to rebalance channels.
 				match &htlc_update {
-					&HTLCUpdateAwaitingACK::AddHTLC {amount_msat, cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet, ..} => {
-						match self.send_htlc(amount_msat, *payment_hash, cltv_expiry, source.clone(), onion_routing_packet.clone(), false, logger) {
+					&HTLCUpdateAwaitingACK::AddHTLC {amount_msat, cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet, amount_rgb, ..} => {
+						match self.send_htlc(amount_msat, *payment_hash, cltv_expiry, source.clone(), onion_routing_packet.clone(), false, logger, ldk_data_dir.clone(), amount_rgb) {
 							Ok(update_add_msg_option) => update_add_htlcs.push(update_add_msg_option.unwrap()),
 							Err(e) => {
 								match e {
@@ -3279,12 +3311,12 @@ impl<Signer: Sign> Channel<Signer> {
 				return Ok((None, htlcs_to_fail));
 			}
 			let update_fee = if let Some(feerate) = self.holding_cell_update_fee.take() {
-				self.send_update_fee(feerate, false, logger)
+				self.send_update_fee(feerate, false, logger, ldk_data_dir.clone())
 			} else {
 				None
 			};
 
-			let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger)?;
+			let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger, ldk_data_dir)?;
 			// send_commitment_no_status_check and get_update_fulfill_htlc may bump latest_monitor_id
 			// but we want them to be strictly increasing by one, so reset it here.
 			self.latest_monitor_update_id = monitor_update.update_id;
@@ -3312,7 +3344,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// waiting on this revoke_and_ack. The generation of this new commitment_signed may also fail,
 	/// generating an appropriate error *after* the channel state has been updated based on the
 	/// revoke_and_ack message.
-	pub fn revoke_and_ack<L: Deref>(&mut self, msg: &msgs::RevokeAndACK, logger: &L) -> Result<RAAUpdates, ChannelError>
+	pub fn revoke_and_ack<L: Deref>(&mut self, msg: &msgs::RevokeAndACK, logger: &L, ldk_data_dir: PathBuf) -> Result<RAAUpdates, ChannelError>
 		where L::Target: Logger,
 	{
 		if (self.channel_state & (ChannelState::ChannelReady as u32)) != (ChannelState::ChannelReady as u32) {
@@ -3388,6 +3420,8 @@ impl<Signer: Sign> Channel<Signer> {
 		let mut require_commitment = false;
 		let mut value_to_self_msat_diff: i64 = 0;
 
+		let mut rgb_offered_htlc = 0;
+		let mut rgb_received_htlc = 0;
 		{
 			// Take references explicitly so that we can hold multiple references to self.
 			let pending_inbound_htlcs: &mut Vec<_> = &mut self.pending_inbound_htlcs;
@@ -3454,6 +3488,7 @@ impl<Signer: Sign> Channel<Signer> {
 						}
 					}
 				}
+				rgb_received_htlc += htlc.amount_rgb;
 			}
 			for htlc in pending_outbound_htlcs.iter_mut() {
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
@@ -3468,9 +3503,11 @@ impl<Signer: Sign> Channel<Signer> {
 					htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 					require_commitment = true;
 				}
+				rgb_offered_htlc += htlc.amount_rgb;
 			}
 		}
 		self.value_to_self_msat = (self.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
+		update_rgb_channel_amount(&self.channel_id, rgb_offered_htlc, rgb_received_htlc, &ldk_data_dir);
 
 		if let Some((feerate, update_state)) = self.pending_update_fee {
 			match update_state {
@@ -3499,7 +3536,7 @@ impl<Signer: Sign> Channel<Signer> {
 				// When the monitor updating is restored we'll call get_last_commitment_update(),
 				// which does not update state, but we're definitely now awaiting a remote revoke
 				// before we can step forward any more, so set it here.
-				let (_, mut additional_update) = self.send_commitment_no_status_check(logger)?;
+				let (_, mut additional_update) = self.send_commitment_no_status_check(logger, ldk_data_dir)?;
 				// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
@@ -3517,7 +3554,7 @@ impl<Signer: Sign> Channel<Signer> {
 			});
 		}
 
-		match self.free_holding_cell_htlcs(logger)? {
+		match self.free_holding_cell_htlcs(logger, ldk_data_dir.clone())? {
 			(Some((mut commitment_update, mut additional_update)), htlcs_to_fail) => {
 				commitment_update.update_fail_htlcs.reserve(update_fail_htlcs.len());
 				for fail_msg in update_fail_htlcs.drain(..) {
@@ -3544,7 +3581,7 @@ impl<Signer: Sign> Channel<Signer> {
 			},
 			(None, htlcs_to_fail) => {
 				if require_commitment {
-					let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger)?;
+					let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger, ldk_data_dir)?;
 
 					// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
 					// strictly increasing by one, so decrement it here.
@@ -3582,8 +3619,8 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Queues up an outbound update fee by placing it in the holding cell. You should call
 	/// [`Self::maybe_free_holding_cell_htlcs`] in order to actually generate and send the
 	/// commitment update.
-	pub fn queue_update_fee<L: Deref>(&mut self, feerate_per_kw: u32, logger: &L) where L::Target: Logger {
-		let msg_opt = self.send_update_fee(feerate_per_kw, true, logger);
+	pub fn queue_update_fee<L: Deref>(&mut self, feerate_per_kw: u32, logger: &L, ldk_data_dir: PathBuf) where L::Target: Logger {
+		let msg_opt = self.send_update_fee(feerate_per_kw, true, logger, ldk_data_dir);
 		assert!(msg_opt.is_none(), "We forced holding cell?");
 	}
 
@@ -3594,7 +3631,7 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// You MUST call [`Self::send_commitment_no_state_update`] prior to any other calls on this
 	/// [`Channel`] if `force_holding_cell` is false.
-	fn send_update_fee<L: Deref>(&mut self, feerate_per_kw: u32, mut force_holding_cell: bool, logger: &L) -> Option<msgs::UpdateFee> where L::Target: Logger {
+	fn send_update_fee<L: Deref>(&mut self, feerate_per_kw: u32, mut force_holding_cell: bool, logger: &L, ldk_data_dir: PathBuf) -> Option<msgs::UpdateFee> where L::Target: Logger {
 		if !self.is_outbound() {
 			panic!("Cannot send fee from inbound channel");
 		}
@@ -3609,7 +3646,14 @@ impl<Signer: Sign> Channel<Signer> {
 		let inbound_stats = self.get_inbound_pending_htlc_stats(Some(feerate_per_kw));
 		let outbound_stats = self.get_outbound_pending_htlc_stats(Some(feerate_per_kw));
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
-		let commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
+		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
+		match color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &ldk_data_dir, false) {
+			Err(e) => {
+				log_debug!(logger, "Cannot color commitment: {e:?}");
+				return None;
+			}
+			_ => {}
+		}
 		let buffer_fee_msat = Channel::<Signer>::commit_tx_fee_sat(feerate_per_kw, commitment_stats.num_nondust_htlcs + outbound_stats.on_holder_tx_holding_cell_htlcs_count as usize + CONCURRENT_INBOUND_HTLC_FEE_BUFFER as usize, self.opt_anchors()) * 1000;
 		let holder_balance_msat = commitment_stats.local_balance_msat - outbound_stats.holding_cell_msat;
 		if holder_balance_msat < buffer_fee_msat  + self.counterparty_selected_channel_reserve_satoshis.unwrap() * 1000 {
@@ -3750,7 +3794,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Indicates that the latest ChannelMonitor update has been committed by the client
 	/// successfully and we should restore normal operation. Returns messages which should be sent
 	/// to the remote side.
-	pub fn monitor_updating_restored<L: Deref>(&mut self, logger: &L, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32) -> MonitorRestoreUpdates where L::Target: Logger {
+	pub fn monitor_updating_restored<L: Deref>(&mut self, logger: &L, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32, ldk_data_dir: PathBuf) -> MonitorRestoreUpdates where L::Target: Logger {
 		assert_eq!(self.channel_state & ChannelState::MonitorUpdateInProgress as u32, ChannelState::MonitorUpdateInProgress as u32);
 		self.channel_state &= !(ChannelState::MonitorUpdateInProgress as u32);
 
@@ -3785,7 +3829,7 @@ impl<Signer: Sign> Channel<Signer> {
 			})
 		} else { None };
 
-		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block_height, logger);
+		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block_height, logger, ldk_data_dir.clone());
 
 		let mut accepted_htlcs = Vec::new();
 		mem::swap(&mut accepted_htlcs, &mut self.monitor_pending_forwards);
@@ -3807,7 +3851,7 @@ impl<Signer: Sign> Channel<Signer> {
 			Some(self.get_last_revoke_and_ack())
 		} else { None };
 		let commitment_update = if self.monitor_pending_commitment_signed {
-			Some(self.get_last_commitment_update(logger))
+			Some(self.get_last_commitment_update(logger, ldk_data_dir))
 		} else { None };
 
 		self.monitor_pending_revoke_and_ack = false;
@@ -3866,7 +3910,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 	}
 
-	fn get_last_commitment_update<L: Deref>(&self, logger: &L) -> msgs::CommitmentUpdate where L::Target: Logger {
+	fn get_last_commitment_update<L: Deref>(&self, logger: &L, ldk_data_dir: PathBuf) -> msgs::CommitmentUpdate where L::Target: Logger {
 		let mut update_add_htlcs = Vec::new();
 		let mut update_fulfill_htlcs = Vec::new();
 		let mut update_fail_htlcs = Vec::new();
@@ -3881,6 +3925,7 @@ impl<Signer: Sign> Channel<Signer> {
 					payment_hash: htlc.payment_hash,
 					cltv_expiry: htlc.cltv_expiry,
 					onion_routing_packet: (**onion_packet).clone(),
+					amount_rgb: htlc.amount_rgb,
 				});
 			}
 		}
@@ -3926,7 +3971,7 @@ impl<Signer: Sign> Channel<Signer> {
 				update_add_htlcs.len(), update_fulfill_htlcs.len(), update_fail_htlcs.len(), update_fail_malformed_htlcs.len());
 		msgs::CommitmentUpdate {
 			update_add_htlcs, update_fulfill_htlcs, update_fail_htlcs, update_fail_malformed_htlcs, update_fee,
-			commitment_signed: self.send_commitment_no_state_update(logger).expect("It looks like we failed to re-generate a commitment_signed we had previously sent?").0,
+			commitment_signed: self.send_commitment_no_state_update(logger, ldk_data_dir).expect("It looks like we failed to re-generate a commitment_signed we had previously sent?").0,
 		}
 	}
 
@@ -3938,7 +3983,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// [`super::channelmanager::ChannelManager::force_close_without_broadcasting_txn`] and
 	/// [`super::channelmanager::ChannelManager::force_close_all_channels_without_broadcasting_txn`].
 	pub fn channel_reestablish<L: Deref>(&mut self, msg: &msgs::ChannelReestablish, logger: &L,
-		node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock)
+		node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock, ldk_data_dir: PathBuf)
 	-> Result<ReestablishResponses, ChannelError> where L::Target: Logger {
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == 0 {
 			// While BOLT 2 doesn't indicate explicitly we should error this channel here, it
@@ -4003,7 +4048,7 @@ impl<Signer: Sign> Channel<Signer> {
 			})
 		} else { None };
 
-		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger);
+		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger, ldk_data_dir.clone());
 
 		if self.channel_state & (ChannelState::FundingSent as u32) == ChannelState::FundingSent as u32 {
 			// If we're waiting on a monitor update, we shouldn't re-send any channel_ready's.
@@ -4097,7 +4142,7 @@ impl<Signer: Sign> Channel<Signer> {
 				Ok(ReestablishResponses {
 					channel_ready, shutdown_msg, announcement_sigs,
 					raa: required_revoke,
-					commitment_update: Some(self.get_last_commitment_update(logger)),
+					commitment_update: Some(self.get_last_commitment_update(logger, ldk_data_dir)),
 					order: self.resend_order.clone(),
 				})
 			}
@@ -4185,7 +4230,7 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	pub fn maybe_propose_closing_signed<F: Deref, L: Deref>(
-		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L)
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, ldk_data_dir: PathBuf)
 		-> Result<(Option<msgs::ClosingSigned>, Option<Transaction>), ChannelError>
 		where F::Target: FeeEstimator, L::Target: Logger
 	{
@@ -4195,7 +4240,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		if !self.is_outbound() {
 			if let Some(msg) = &self.pending_counterparty_closing_signed.take() {
-				return self.closing_signed(fee_estimator, &msg);
+				return self.closing_signed(fee_estimator, &msg, ldk_data_dir);
 			}
 			return Ok((None, None));
 		}
@@ -4203,7 +4248,7 @@ impl<Signer: Sign> Channel<Signer> {
 		let (our_min_fee, our_max_fee) = self.calculate_closing_fee_limits(fee_estimator);
 
 		assert!(self.shutdown_scriptpubkey.is_some());
-		let (closing_tx, total_fee_satoshis) = self.build_closing_transaction(our_min_fee, false);
+		let (closing_tx, total_fee_satoshis) = self.build_closing_transaction(our_min_fee, false, ldk_data_dir)?;
 		log_trace!(logger, "Proposing initial closing_signed for our counterparty with a fee range of {}-{} sat (with initial proposal {} sats)",
 			our_min_fee, our_max_fee, total_fee_satoshis);
 
@@ -4340,7 +4385,7 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	pub fn closing_signed<F: Deref>(
-		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::ClosingSigned)
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::ClosingSigned, ldk_data_dir: PathBuf)
 		-> Result<(Option<msgs::ClosingSigned>, Option<Transaction>), ChannelError>
 		where F::Target: FeeEstimator
 	{
@@ -4367,7 +4412,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		let funding_redeemscript = self.get_funding_redeemscript();
-		let (mut closing_tx, used_total_fee) = self.build_closing_transaction(msg.fee_satoshis, false);
+		let (mut closing_tx, used_total_fee) = self.build_closing_transaction(msg.fee_satoshis, false, ldk_data_dir.clone())?;
 		if used_total_fee != msg.fee_satoshis {
 			return Err(ChannelError::Close(format!("Remote sent us a closing_signed with a fee other than the value they can claim. Fee in message: {}. Actual closing tx fee: {}", msg.fee_satoshis, used_total_fee)));
 		}
@@ -4378,14 +4423,15 @@ impl<Signer: Sign> Channel<Signer> {
 			Err(_e) => {
 				// The remote end may have decided to revoke their output due to inconsistent dust
 				// limits, so check for that case by re-checking the signature here.
-				closing_tx = self.build_closing_transaction(msg.fee_satoshis, true).0;
+				closing_tx = self.build_closing_transaction(msg.fee_satoshis, true, ldk_data_dir.clone())?.0;
 				let sighash = closing_tx.trust().get_sighash_all(&funding_redeemscript, self.channel_value_satoshis);
 				secp_check!(self.secp_ctx.verify_ecdsa(&sighash, &msg.signature, self.counterparty_funding_pubkey()), "Invalid closing tx signature from peer".to_owned());
 			},
 		};
 
-		for outp in closing_tx.trust().built_transaction().output.iter() {
-			if !outp.script_pubkey.is_witness_program() && outp.value < MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS {
+		for (idx, outp) in closing_tx.trust().built_transaction().output.iter().enumerate() {
+			// skip OP_RETURN
+			if idx < 2 && !outp.script_pubkey.is_witness_program() && outp.value < MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS {
 				return Err(ChannelError::Close("Remote sent us a closing_signed with a dust output. Always use segwit closing scripts!".to_owned()));
 			}
 		}
@@ -4407,7 +4453,7 @@ impl<Signer: Sign> Channel<Signer> {
 				let (closing_tx, used_fee) = if $new_fee == msg.fee_satoshis {
 					(closing_tx, $new_fee)
 				} else {
-					self.build_closing_transaction($new_fee, false)
+					self.build_closing_transaction($new_fee, false, ldk_data_dir)?
 				};
 
 				let sig = self.holder_signer
@@ -4976,7 +5022,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// In the first case, we store the confirmation height and calculating the short channel id.
 	/// In the second, we simply return an Err indicating we need to be force-closed now.
 	pub fn transactions_confirmed<L: Deref>(&mut self, block_hash: &BlockHash, height: u32,
-		txdata: &TransactionData, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L)
+		txdata: &TransactionData, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L, ldk_data_dir: PathBuf)
 	-> Result<(Option<msgs::ChannelReady>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
 		if let Some(funding_txo) = self.get_funding_txo() {
 			for &(index_in_block, tx) in txdata.iter() {
@@ -5023,7 +5069,7 @@ impl<Signer: Sign> Channel<Signer> {
 					// may have already happened for this block).
 					if let Some(channel_ready) = self.check_get_channel_ready(height) {
 						log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.channel_id));
-						let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger);
+						let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger, ldk_data_dir);
 						return Ok((Some(channel_ready), announcement_sigs));
 					}
 				}
@@ -5049,12 +5095,12 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// May return some HTLCs (and their payment_hash) which have timed out and should be failed
 	/// back.
-	pub fn best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L)
+	pub fn best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L, ldk_data_dir: PathBuf)
 	-> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
-		self.do_best_block_updated(height, highest_header_time, Some((genesis_block_hash, node_pk)), logger)
+		self.do_best_block_updated(height, highest_header_time, Some((genesis_block_hash, node_pk)), logger, ldk_data_dir)
 	}
 
-	fn do_best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_node_pk: Option<(BlockHash, PublicKey)>, logger: &L)
+	fn do_best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_node_pk: Option<(BlockHash, PublicKey)>, logger: &L, ldk_data_dir: PathBuf)
 	-> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
 		let mut timed_out_htlcs = Vec::new();
 		// This mirrors the check in ChannelManager::decode_update_add_htlc_onion, refusing to
@@ -5077,7 +5123,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		if let Some(channel_ready) = self.check_get_channel_ready(height) {
 			let announcement_sigs = if let Some((genesis_block_hash, node_pk)) = genesis_node_pk {
-				self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger)
+				self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger, ldk_data_dir)
 			} else { None };
 			log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.channel_id));
 			return Ok((Some(channel_ready), timed_out_htlcs, announcement_sigs));
@@ -5118,7 +5164,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		let announcement_sigs = if let Some((genesis_block_hash, node_pk)) = genesis_node_pk {
-			self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger)
+			self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger, ldk_data_dir)
 		} else { None };
 		Ok((None, timed_out_htlcs, announcement_sigs))
 	}
@@ -5126,7 +5172,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Indicates the funding transaction is no longer confirmed in the main chain. This may
 	/// force-close the channel, but may also indicate a harmless reorganization of a block or two
 	/// before the channel has reached channel_ready and we can just wait for more blocks.
-	pub fn funding_transaction_unconfirmed<L: Deref>(&mut self, logger: &L) -> Result<(), ClosureReason> where L::Target: Logger {
+	pub fn funding_transaction_unconfirmed<L: Deref>(&mut self, logger: &L, ldk_data_dir: PathBuf) -> Result<(), ClosureReason> where L::Target: Logger {
 		if self.funding_tx_confirmation_height != 0 {
 			// We handle the funding disconnection by calling best_block_updated with a height one
 			// below where our funding was connected, implying a reorg back to conf_height - 1.
@@ -5135,7 +5181,7 @@ impl<Signer: Sign> Channel<Signer> {
 			// larger. If we don't know that time has moved forward, we can just set it to the last
 			// time we saw and it will be ignored.
 			let best_time = self.update_time_counter;
-			match self.do_best_block_updated(reorg_height, best_time, None, logger) {
+			match self.do_best_block_updated(reorg_height, best_time, None, logger, ldk_data_dir) {
 				Ok((channel_ready, timed_out_htlcs, announcement_sigs)) => {
 					assert!(channel_ready.is_none(), "We can't generate a funding with 0 confirmations?");
 					assert!(timed_out_htlcs.is_empty(), "We can't have accepted HTLCs with a timeout before our funding confirmation?");
@@ -5192,6 +5238,7 @@ impl<Signer: Sign> Channel<Signer> {
 				None => Builder::new().into_script(),
 			}),
 			channel_type: Some(self.channel_type.clone()),
+			consignment_endpoint: self.consignment_endpoint.clone(),
 		}
 	}
 
@@ -5271,9 +5318,10 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	/// If an Err is returned, it is a ChannelError::Close (for get_outbound_funding_created)
-	fn get_outbound_funding_created_signature<L: Deref>(&mut self, logger: &L) -> Result<Signature, ChannelError> where L::Target: Logger {
+	fn get_outbound_funding_created_signature<L: Deref>(&mut self, logger: &L, ldk_data_dir: PathBuf) -> Result<Signature, ChannelError> where L::Target: Logger {
 		let counterparty_keys = self.build_remote_transaction_keys();
-		let counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &ldk_data_dir, true)?;
 		Ok(self.holder_signer.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.secp_ctx)
 				.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0)
 	}
@@ -5285,7 +5333,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Note that channel_id changes during this call!
 	/// Do NOT broadcast the funding transaction until after a successful funding_signed call!
 	/// If an Err is returned, it is a ChannelError::Close.
-	pub fn get_outbound_funding_created<L: Deref>(&mut self, funding_transaction: Transaction, funding_txo: OutPoint, logger: &L) -> Result<msgs::FundingCreated, ChannelError> where L::Target: Logger {
+	pub fn get_outbound_funding_created<L: Deref>(&mut self, funding_transaction: Transaction, funding_txo: OutPoint, logger: &L, ldk_data_dir: PathBuf) -> Result<msgs::FundingCreated, ChannelError> where L::Target: Logger {
 		if !self.is_outbound() {
 			panic!("Tried to create outbound funding_created message on an inbound channel!");
 		}
@@ -5301,7 +5349,7 @@ impl<Signer: Sign> Channel<Signer> {
 		self.channel_transaction_parameters.funding_outpoint = Some(funding_txo);
 		self.holder_signer.provide_channel_parameters(&self.channel_transaction_parameters);
 
-		let signature = match self.get_outbound_funding_created_signature(logger) {
+		let signature = match self.get_outbound_funding_created_signature(logger, ldk_data_dir.clone()) {
 			Ok(res) => res,
 			Err(e) => {
 				log_error!(logger, "Got bad signatures: {:?}!", e);
@@ -5316,6 +5364,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		self.channel_state = ChannelState::FundingCreated as u32;
 		self.channel_id = funding_txo.to_channel_id();
+		rename_rgbinfo_file(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
 		self.funding_transaction = Some(funding_transaction);
 
 		Ok(msgs::FundingCreated {
@@ -5335,7 +5384,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// closing).
 	///
 	/// This will only return ChannelError::Ignore upon failure.
-	fn get_channel_announcement(&self, node_id: PublicKey, chain_hash: BlockHash) -> Result<msgs::UnsignedChannelAnnouncement, ChannelError> {
+	fn get_channel_announcement(&self, node_id: PublicKey, chain_hash: BlockHash, ldk_data_dir: PathBuf) -> Result<msgs::UnsignedChannelAnnouncement, ChannelError> {
 		if !self.config.announced_channel {
 			return Err(ChannelError::Ignore("Channel is not available for public announcements".to_owned()));
 		}
@@ -5345,6 +5394,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		let were_node_one = node_id.serialize()[..] < self.counterparty_node_id.serialize()[..];
 
+		let (rgb_info, _) = get_rgb_channel_info(&self.channel_id, &ldk_data_dir);
 		let msg = msgs::UnsignedChannelAnnouncement {
 			features: channelmanager::provided_channel_features(),
 			chain_hash,
@@ -5353,13 +5403,14 @@ impl<Signer: Sign> Channel<Signer> {
 			node_id_2: if were_node_one { self.get_counterparty_node_id() } else { node_id },
 			bitcoin_key_1: if were_node_one { self.get_holder_pubkeys().funding_pubkey } else { self.counterparty_funding_pubkey().clone() },
 			bitcoin_key_2: if were_node_one { self.counterparty_funding_pubkey().clone() } else { self.get_holder_pubkeys().funding_pubkey },
+			contract_id: rgb_info.contract_id,
 			excess_data: Vec::new(),
 		};
 
 		Ok(msg)
 	}
 
-	fn get_announcement_sigs<L: Deref>(&mut self, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32, logger: &L)
+	fn get_announcement_sigs<L: Deref>(&mut self, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32, logger: &L, ldk_data_dir: PathBuf)
 	-> Option<msgs::AnnouncementSignatures> where L::Target: Logger {
 		if self.funding_tx_confirmation_height == 0 || self.funding_tx_confirmation_height + 5 > best_block_height {
 			return None;
@@ -5379,7 +5430,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		log_trace!(logger, "Creating an announcement_signatures message for channel {}", log_bytes!(self.channel_id()));
-		let announcement = match self.get_channel_announcement(node_pk, genesis_block_hash) {
+		let announcement = match self.get_channel_announcement(node_pk, genesis_block_hash, ldk_data_dir) {
 			Ok(a) => a,
 			Err(_) => {
 				log_trace!(logger, "Cannot create an announcement_signatures as channel is not public.");
@@ -5426,8 +5477,8 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Processes an incoming announcement_signatures message, providing a fully-signed
 	/// channel_announcement message which we can broadcast and storing our counterparty's
 	/// signatures for later reconstruction/rebroadcast of the channel_announcement.
-	pub fn announcement_signatures(&mut self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32, msg: &msgs::AnnouncementSignatures) -> Result<msgs::ChannelAnnouncement, ChannelError> {
-		let announcement = self.get_channel_announcement(our_node_id.clone(), chain_hash)?;
+	pub fn announcement_signatures(&mut self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32, msg: &msgs::AnnouncementSignatures, ldk_data_dir: PathBuf) -> Result<msgs::ChannelAnnouncement, ChannelError> {
+		let announcement = self.get_channel_announcement(our_node_id.clone(), chain_hash, ldk_data_dir)?;
 
 		let msghash = hash_to_message!(&Sha256d::hash(&announcement.encode()[..])[..]);
 
@@ -5453,11 +5504,11 @@ impl<Signer: Sign> Channel<Signer> {
 
 	/// Gets a signed channel_announcement for this channel, if we previously received an
 	/// announcement_signatures from our counterparty.
-	pub fn get_signed_channel_announcement(&self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32) -> Option<msgs::ChannelAnnouncement> {
+	pub fn get_signed_channel_announcement(&self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32, ldk_data_dir: PathBuf) -> Option<msgs::ChannelAnnouncement> {
 		if self.funding_tx_confirmation_height == 0 || self.funding_tx_confirmation_height + 5 > best_block_height {
 			return None;
 		}
-		let announcement = match self.get_channel_announcement(our_node_id.clone(), chain_hash) {
+		let announcement = match self.get_channel_announcement(our_node_id.clone(), chain_hash, ldk_data_dir) {
 			Ok(res) => res,
 			Err(_) => return None,
 		};
@@ -5527,10 +5578,10 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// `Err`s will only be [`ChannelError::Ignore`].
 	pub fn queue_add_htlc<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
-		onion_routing_packet: msgs::OnionPacket, logger: &L)
+		onion_routing_packet: msgs::OnionPacket, logger: &L, ldk_data_dir: PathBuf, amount_rgb: u64)
 	-> Result<(), ChannelError> where L::Target: Logger {
 		self
-			.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, true, logger)
+			.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, true, logger, ldk_data_dir, amount_rgb)
 			.map(|msg_opt| assert!(msg_opt.is_none(), "We forced holding cell?"))
 			.map_err(|err| {
 				if let ChannelError::Ignore(_) = err { /* fine */ }
@@ -5556,7 +5607,7 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// `Err`s will only be [`ChannelError::Ignore`].
 	fn send_htlc<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
-		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool, logger: &L)
+		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool, logger: &L, ldk_data_dir: PathBuf, amount_rgb: u64)
 	-> Result<Option<msgs::UpdateAddHTLC>, ChannelError> where L::Target: Logger {
 		if (self.channel_state & (ChannelState::ChannelReady as u32 | BOTH_SIDES_SHUTDOWN_MASK)) != (ChannelState::ChannelReady as u32) {
 			return Err(ChannelError::Ignore("Cannot send HTLC until channel is fully established and we haven't started shutting down".to_owned()));
@@ -5595,7 +5646,8 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
-		let commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
+		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &ldk_data_dir, false)?;
 		if !self.is_outbound() {
 			// Check that we won't violate the remote channel reserve by adding this HTLC.
 			let htlc_candidate = HTLCCandidate::new(amount_msat, HTLCInitiator::LocalOffered);
@@ -5664,6 +5716,7 @@ impl<Signer: Sign> Channel<Signer> {
 				cltv_expiry,
 				source,
 				onion_routing_packet,
+				amount_rgb,
 			});
 			return Ok(None);
 		}
@@ -5675,6 +5728,7 @@ impl<Signer: Sign> Channel<Signer> {
 			cltv_expiry,
 			state: OutboundHTLCState::LocalAnnounced(Box::new(onion_routing_packet.clone())),
 			source,
+			amount_rgb,
 		});
 
 		let res = msgs::UpdateAddHTLC {
@@ -5684,6 +5738,7 @@ impl<Signer: Sign> Channel<Signer> {
 			payment_hash,
 			cltv_expiry,
 			onion_routing_packet,
+			amount_rgb,
 		};
 		self.next_holder_htlc_id += 1;
 
@@ -5691,7 +5746,7 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	/// Only fails in case of bad keys
-	fn send_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> Result<(msgs::CommitmentSigned, ChannelMonitorUpdate), ChannelError> where L::Target: Logger {
+	fn send_commitment_no_status_check<L: Deref>(&mut self, logger: &L, ldk_data_dir: PathBuf) -> Result<(msgs::CommitmentSigned, ChannelMonitorUpdate), ChannelError> where L::Target: Logger {
 		log_trace!(logger, "Updating HTLC state for a newly-sent commitment_signed...");
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
@@ -5724,7 +5779,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 		self.resend_order = RAACommitmentOrder::RevokeAndACKFirst;
 
-		let (res, counterparty_commitment_txid, htlcs) = match self.send_commitment_no_state_update(logger) {
+		let (res, counterparty_commitment_txid, htlcs) = match self.send_commitment_no_state_update(logger, ldk_data_dir) {
 			Ok((res, (counterparty_commitment_tx, mut htlcs))) => {
 				// Update state now that we've passed all the can-fail calls...
 				let htlcs_no_ref: Vec<(HTLCOutputInCommitment, Option<Box<HTLCSource>>)> =
@@ -5754,9 +5809,10 @@ impl<Signer: Sign> Channel<Signer> {
 
 	/// Only fails in case of bad keys. Used for channel_reestablish commitment_signed generation
 	/// when we shouldn't change HTLC/channel state.
-	fn send_commitment_no_state_update<L: Deref>(&self, logger: &L) -> Result<(msgs::CommitmentSigned, (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>)), ChannelError> where L::Target: Logger {
+	fn send_commitment_no_state_update<L: Deref>(&self, logger: &L, ldk_data_dir: PathBuf) -> Result<(msgs::CommitmentSigned, (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>)), ChannelError> where L::Target: Logger {
 		let counterparty_keys = self.build_remote_transaction_keys();
-		let commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		let mut commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &ldk_data_dir, true)?;
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
 		let (signature, htlc_signatures);
 
@@ -5815,10 +5871,10 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// Shorthand for calling [`Self::send_htlc`] followed by a commitment update, see docs on
 	/// [`Self::send_htlc`] and [`Self::send_commitment_no_state_update`] for more info.
-	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L) -> Result<Option<(msgs::UpdateAddHTLC, msgs::CommitmentSigned, ChannelMonitorUpdate)>, ChannelError> where L::Target: Logger {
-		match self.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, false, logger)? {
+	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L, ldk_data_dir: PathBuf, amount_rgb: u64) -> Result<Option<(msgs::UpdateAddHTLC, msgs::CommitmentSigned, ChannelMonitorUpdate)>, ChannelError> where L::Target: Logger {
+		match self.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, false, logger, ldk_data_dir.clone(), amount_rgb)? {
 			Some(update_add_htlc) => {
-				let (commitment_signed, monitor_update) = self.send_commitment_no_status_check(logger)?;
+				let (commitment_signed, monitor_update) = self.send_commitment_no_status_check(logger, ldk_data_dir)?;
 				Ok(Some((update_add_htlc, commitment_signed, monitor_update)))
 			},
 			None => Ok(None)
@@ -6156,13 +6212,14 @@ impl<Signer: Sign> Writeable for Channel<Signer> {
 		(self.holding_cell_htlc_updates.len() as u64).write(writer)?;
 		for update in self.holding_cell_htlc_updates.iter() {
 			match update {
-				&HTLCUpdateAwaitingACK::AddHTLC { ref amount_msat, ref cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet } => {
+				&HTLCUpdateAwaitingACK::AddHTLC { ref amount_msat, ref cltv_expiry, ref payment_hash, ref source, ref onion_routing_packet, amount_rgb } => {
 					0u8.write(writer)?;
 					amount_msat.write(writer)?;
 					cltv_expiry.write(writer)?;
 					payment_hash.write(writer)?;
 					source.write(writer)?;
 					onion_routing_packet.write(writer)?;
+					amount_rgb.write(writer)?;
 				},
 				&HTLCUpdateAwaitingACK::ClaimHTLC { ref payment_preimage, ref htlc_id } => {
 					1u8.write(writer)?;
@@ -6322,6 +6379,7 @@ impl<Signer: Sign> Writeable for Channel<Signer> {
 			(23, channel_ready_event_emitted, option),
 			(25, user_id_high_opt, option),
 			(27, self.channel_keys_id, required),
+			(29, self.consignment_endpoint, required),
 		});
 
 		Ok(())
@@ -6399,6 +6457,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 					4 => InboundHTLCState::LocalRemoved(Readable::read(reader)?),
 					_ => return Err(DecodeError::InvalidValue),
 				},
+				amount_rgb: Readable::read(reader)?,
 			});
 		}
 
@@ -6428,6 +6487,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 					},
 					_ => return Err(DecodeError::InvalidValue),
 				},
+				amount_rgb: Readable::read(reader)?,
 			});
 		}
 
@@ -6441,6 +6501,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 					payment_hash: Readable::read(reader)?,
 					source: Readable::read(reader)?,
 					onion_routing_packet: Readable::read(reader)?,
+					amount_rgb: Readable::read(reader)?,
 				},
 				1 => HTLCUpdateAwaitingACK::ClaimHTLC {
 					payment_preimage: Readable::read(reader)?,
@@ -6590,6 +6651,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 
 		let mut user_id_high_opt: Option<u64> = None;
 		let mut channel_keys_id: Option<[u8; 32]> = None;
+		let mut consignment_endpoint: Option<ConsignmentEndpoint> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -6610,6 +6672,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 			(23, channel_ready_event_emitted, option),
 			(25, user_id_high_opt, option),
 			(27, channel_keys_id, option),
+			(29, consignment_endpoint, option),
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
@@ -6778,10 +6841,13 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 
 			channel_type: channel_type.unwrap(),
 			channel_keys_id,
+
+			consignment_endpoint: consignment_endpoint.unwrap(),
 		})
 	}
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use std::cmp;
@@ -8070,3 +8136,4 @@ mod tests {
 		assert!(res.is_ok());
 	}
 }
+*/

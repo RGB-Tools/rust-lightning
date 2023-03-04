@@ -1934,7 +1934,8 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 					|| peer.awaiting_pong_timer_tick_intervals as u64 >
 						MAX_BUFFER_DRAIN_TICK_INTERVALS_PER_PEER as u64 * peers_lock.len() as u64
 				{
-					descriptors_needing_disconnect.push(descriptor.clone());
+					println!("PeerManager timer_tick_occurred skip disconnect push");
+					//descriptors_needing_disconnect.push(descriptor.clone());
 					continue;
 				}
 				peer.received_message_since_timer_tick = false;
@@ -1981,7 +1982,6 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 	// broadcast_node_announcement panics) of the maximum-length addresses would fit in a 64KB
 	// message...
 	const HALF_MESSAGE_IS_ADDRS: u32 = ::core::u16::MAX as u32 / (NetAddress::MAX_LEN as u32 + 1) / 2;
-	#[deny(const_err)]
 	#[allow(dead_code)]
 	// ...by failing to compile if the number of addresses that would be half of a message is
 	// smaller than 100:

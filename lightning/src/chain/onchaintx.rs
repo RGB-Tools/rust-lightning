@@ -46,6 +46,7 @@ use core::ops::Deref;
 use core::mem::replace;
 #[cfg(anchors)]
 use core::mem::swap;
+use std::path::PathBuf;
 use bitcoin::hashes::Hash;
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
@@ -266,6 +267,8 @@ pub struct OnchainTxHandler<ChannelSigner: Sign> {
 	onchain_events_awaiting_threshold_conf: Vec<OnchainEventEntry>,
 
 	pub(super) secp_ctx: Secp256k1<secp256k1::All>,
+
+	ldk_data_dir: PathBuf,
 }
 
 const SERIALIZATION_VERSION: u8 = 1;
@@ -282,6 +285,8 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 		self.prev_holder_htlc_sigs.write(writer)?;
 
 		self.channel_transaction_parameters.write(writer)?;
+
+		self.ldk_data_dir.write(writer)?;
 
 		let mut key_data = VecWriter(Vec::new());
 		self.signer.write(&mut key_data)?;
@@ -338,6 +343,8 @@ impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHan
 		let prev_holder_htlc_sigs = Readable::read(reader)?;
 
 		let channel_parameters = Readable::read(reader)?;
+
+		let ldk_data_dir = Readable::read(reader)?;
 
 		// Read the serialized signer bytes, but don't deserialize them, as we'll obtain our signer
 		// by re-deriving the private key material.
@@ -410,12 +417,13 @@ impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHan
 			#[cfg(anchors)]
 			pending_claim_events: HashMap::new(),
 			secp_ctx,
+			ldk_data_dir,
 		})
 	}
 }
 
 impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
-	pub(crate) fn new(destination_script: Script, signer: ChannelSigner, channel_parameters: ChannelTransactionParameters, holder_commitment: HolderCommitmentTransaction, secp_ctx: Secp256k1<secp256k1::All>) -> Self {
+	pub(crate) fn new(destination_script: Script, signer: ChannelSigner, channel_parameters: ChannelTransactionParameters, holder_commitment: HolderCommitmentTransaction, secp_ctx: Secp256k1<secp256k1::All>, ldk_data_dir: PathBuf) -> Self {
 		OnchainTxHandler {
 			destination_script,
 			holder_commitment,
@@ -432,6 +440,8 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 			pending_claim_events: HashMap::new(),
 
 			secp_ctx,
+
+			ldk_data_dir,
 		}
 	}
 
@@ -1024,7 +1034,7 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 				let trusted_tx = self.holder_commitment.trust();
 				let counterparty_htlc_sig = self.holder_commitment.counterparty_htlc_sigs[*htlc_idx];
 				htlc_tx = Some(trusted_tx
-					.get_signed_htlc_tx(&self.channel_transaction_parameters.as_holder_broadcastable(), *htlc_idx, &counterparty_htlc_sig, htlc_sig, preimage));
+					.get_signed_htlc_tx(&self.channel_transaction_parameters.as_holder_broadcastable(), *htlc_idx, &counterparty_htlc_sig, htlc_sig, preimage, &self.ldk_data_dir));
 			}
 		}
 		// If the HTLC doesn't spend the current holder commitment, check if it spends the previous one
@@ -1038,10 +1048,11 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 					let trusted_tx = holder_commitment.trust();
 					let counterparty_htlc_sig = holder_commitment.counterparty_htlc_sigs[*htlc_idx];
 					htlc_tx = Some(trusted_tx
-						.get_signed_htlc_tx(&self.channel_transaction_parameters.as_holder_broadcastable(), *htlc_idx, &counterparty_htlc_sig, htlc_sig, preimage));
+						.get_signed_htlc_tx(&self.channel_transaction_parameters.as_holder_broadcastable(), *htlc_idx, &counterparty_htlc_sig, htlc_sig, preimage, &self.ldk_data_dir));
 				}
 			}
 		}
+		println!("COMPLETED GET_FULLY_SIGNED_HTLC_TX");
 		htlc_tx
 	}
 

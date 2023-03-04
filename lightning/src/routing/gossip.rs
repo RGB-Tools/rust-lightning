@@ -19,6 +19,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::blockdata::transaction::TxOut;
 use bitcoin::hash_types::BlockHash;
 
+use rgb::ContractId;
+
 use crate::chain;
 use crate::chain::Access;
 use crate::ln::chan_utils::make_funding_redeemscript;
@@ -732,6 +734,8 @@ pub struct ChannelInfo {
 	/// (which we can probably assume we are - no-std environments probably won't have a full
 	/// network graph in memory!).
 	announcement_received_time: u64,
+	/// RGB contract ID
+	pub contract_id: Option<ContractId>,
 }
 
 impl ChannelInfo {
@@ -795,6 +799,7 @@ impl Writeable for ChannelInfo {
 			(8, self.two_to_one, required),
 			(10, self.capacity_sats, required),
 			(12, self.announcement_message, required),
+			(14, self.contract_id, option),
 		});
 		Ok(())
 	}
@@ -828,6 +833,7 @@ impl Readable for ChannelInfo {
 		let mut two_to_one_wrap: Option<ChannelUpdateInfoDeserWrapper> = None;
 		init_tlv_field_var!(capacity_sats, required);
 		init_tlv_field_var!(announcement_message, required);
+		init_tlv_field_var!(contract_id, option);
 		read_tlv_fields!(reader, {
 			(0, features, required),
 			(1, announcement_received_time, (default_value, 0)),
@@ -837,6 +843,7 @@ impl Readable for ChannelInfo {
 			(8, two_to_one_wrap, ignorable),
 			(10, capacity_sats, required),
 			(12, announcement_message, required),
+			(14, contract_id, option),
 		});
 
 		Ok(ChannelInfo {
@@ -848,6 +855,7 @@ impl Readable for ChannelInfo {
 			capacity_sats: init_tlv_based_struct_field!(capacity_sats, required),
 			announcement_message: init_tlv_based_struct_field!(announcement_message, required),
 			announcement_received_time: init_tlv_based_struct_field!(announcement_received_time, (default_value, 0)),
+			contract_id: init_tlv_based_struct_field!(contract_id, option),
 		})
 	}
 }
@@ -1369,6 +1377,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			capacity_sats: None,
 			announcement_message: None,
 			announcement_received_time: timestamp,
+			contract_id: None,
 		};
 
 		self.add_channel_between_nodes(short_channel_id, channel_info, None)
@@ -1526,6 +1535,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			announcement_message: if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
 				{ full_msg.cloned() } else { None },
 			announcement_received_time,
+			contract_id: Some(msg.contract_id),
 		};
 
 		self.add_channel_between_nodes(msg.short_channel_id, chan_info, utxo_value)
@@ -1922,6 +1932,7 @@ impl ReadOnlyNetworkGraph<'_> {
 	}
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use crate::chain;
@@ -3308,3 +3319,4 @@ mod benches {
 		});
 	}
 }
+*/

@@ -57,6 +57,7 @@ use crate::util::events::{AnchorDescriptor, HTLCDescriptor, BumpTransactionEvent
 
 use crate::prelude::*;
 use core::{cmp, mem};
+use std::path::PathBuf;
 use crate::io::{self, Error};
 use core::convert::TryInto;
 use core::ops::Deref;
@@ -1104,7 +1105,7 @@ impl<Signer: Sign> ChannelMonitor<Signer> {
 	                  funding_redeemscript: Script, channel_value_satoshis: u64,
 	                  commitment_transaction_number_obscure_factor: u64,
 	                  initial_holder_commitment_tx: HolderCommitmentTransaction,
-	                  best_block: BestBlock, counterparty_node_id: PublicKey) -> ChannelMonitor<Signer> {
+	                  best_block: BestBlock, counterparty_node_id: PublicKey, ldk_data_dir: PathBuf) -> ChannelMonitor<Signer> {
 
 		assert!(commitment_transaction_number_obscure_factor <= (1 << 48));
 		let payment_key_hash = WPubkeyHash::hash(&keys.pubkeys().payment_point.serialize());
@@ -1140,7 +1141,7 @@ impl<Signer: Sign> ChannelMonitor<Signer> {
 
 		let onchain_tx_handler =
 			OnchainTxHandler::new(destination_script.clone(), keys,
-			channel_parameters.clone(), initial_holder_commitment_tx, secp_ctx.clone());
+			channel_parameters.clone(), initial_holder_commitment_tx, secp_ctx.clone(), ldk_data_dir);
 
 		let mut outputs_to_watch = HashMap::new();
 		outputs_to_watch.insert(funding_info.0.txid, vec![(funding_info.0.index as u32, funding_info.1.clone())]);
@@ -3770,9 +3771,10 @@ impl<'a, K: KeysInterface> ReadableArgs<&'a K>
 					let cltv_expiry: u32 = Readable::read(reader)?;
 					let payment_hash: PaymentHash = Readable::read(reader)?;
 					let transaction_output_index: Option<u32> = Readable::read(reader)?;
+					let amount_rgb: u64 = Readable::read(reader)?;
 
 					HTLCOutputInCommitment {
-						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index
+						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index, amount_rgb
 					}
 				}
 			}

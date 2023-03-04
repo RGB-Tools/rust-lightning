@@ -192,3 +192,5 @@ mod sync {
 
 #[cfg(not(feature = "std"))]
 mod sync;
+
+pub mod rgb_utils;

@@ -95,7 +95,7 @@ impl FilesystemPersister {
 				));
 			}
 
-			let index = filename.unwrap().split_at(65).1.parse();
+			let index: Result<u16, _> = filename.unwrap().split_at(65).1.parse();
 			if index.is_err() {
 				return Err(std::io::Error::new(
 					std::io::ErrorKind::InvalidData,

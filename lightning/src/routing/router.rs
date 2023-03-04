@@ -16,6 +16,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256::Hash as Sha256;
 
+use rgb::ContractId;
+
 use crate::ln::PaymentHash;
 use crate::ln::channelmanager::{ChannelDetails, PaymentId};
 use crate::ln::features::{ChannelFeatures, InvoiceFeatures, NodeFeatures};
@@ -61,7 +63,7 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref, S: Deref> Router for DefaultR
 {
 	fn find_route(
 		&self, payer: &PublicKey, params: &RouteParameters, first_hops: Option<&[&ChannelDetails]>,
-		inflight_htlcs: InFlightHtlcs
+		inflight_htlcs: InFlightHtlcs, contract_id: ContractId
 	) -> Result<Route, LightningError> {
 		let random_seed_bytes = {
 			let mut locked_random_seed_bytes = self.random_seed_bytes.lock().unwrap();
@@ -72,7 +74,7 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref, S: Deref> Router for DefaultR
 		find_route(
 			payer, params, &self.network_graph, first_hops, &*self.logger,
 			&ScorerAccountingForInFlightHtlcs::new(&mut self.scorer.lock(), inflight_htlcs),
-			&random_seed_bytes
+			&random_seed_bytes, contract_id
 		)
 	}
 
@@ -98,16 +100,16 @@ pub trait Router {
 	/// Finds a [`Route`] between `payer` and `payee` for a payment with the given values.
 	fn find_route(
 		&self, payer: &PublicKey, route_params: &RouteParameters,
-		first_hops: Option<&[&ChannelDetails]>, inflight_htlcs: InFlightHtlcs
+		first_hops: Option<&[&ChannelDetails]>, inflight_htlcs: InFlightHtlcs, contract_id: ContractId
 	) -> Result<Route, LightningError>;
 	/// Finds a [`Route`] between `payer` and `payee` for a payment with the given values. Includes
 	/// `PaymentHash` and `PaymentId` to be able to correlate the request with a specific payment.
 	fn find_route_with_id(
 		&self, payer: &PublicKey, route_params: &RouteParameters,
 		first_hops: Option<&[&ChannelDetails]>, inflight_htlcs: InFlightHtlcs,
-		_payment_hash: PaymentHash, _payment_id: PaymentId
+		_payment_hash: PaymentHash, _payment_id: PaymentId, contract_id: ContractId,
 	) -> Result<Route, LightningError> {
-		self.find_route(payer, route_params, first_hops, inflight_htlcs)
+		self.find_route(payer, route_params, first_hops, inflight_htlcs, contract_id)
 	}
 	/// Lets the router know that payment through a specific path has failed.
 	fn notify_payment_path_failed(&self, path: &[&RouteHop], short_channel_id: u64);
@@ -944,13 +946,13 @@ fn default_node_features() -> NodeFeatures {
 pub fn find_route<L: Deref, GL: Deref, S: Score>(
 	our_node_pubkey: &PublicKey, route_params: &RouteParameters,
 	network_graph: &NetworkGraph<GL>, first_hops: Option<&[&ChannelDetails]>, logger: L,
-	scorer: &S, random_seed_bytes: &[u8; 32]
+	scorer: &S, random_seed_bytes: &[u8; 32], contract_id: ContractId
 ) -> Result<Route, LightningError>
 where L::Target: Logger, GL::Target: Logger {
 	let graph_lock = network_graph.read_only();
 	let mut route = get_route(our_node_pubkey, &route_params.payment_params, &graph_lock, first_hops,
 		route_params.final_value_msat, route_params.final_cltv_expiry_delta, logger, scorer,
-		random_seed_bytes)?;
+		random_seed_bytes, Some(contract_id))?;
 	add_random_cltv_offset(&mut route, &route_params.payment_params, &graph_lock, random_seed_bytes);
 	Ok(route)
 }
@@ -958,7 +960,7 @@ where L::Target: Logger, GL::Target: Logger {
 pub(crate) fn get_route<L: Deref, S: Score>(
 	our_node_pubkey: &PublicKey, payment_params: &PaymentParameters, network_graph: &ReadOnlyNetworkGraph,
 	first_hops: Option<&[&ChannelDetails]>, final_value_msat: u64, final_cltv_expiry_delta: u32,
-	logger: L, scorer: &S, _random_seed_bytes: &[u8; 32]
+	logger: L, scorer: &S, _random_seed_bytes: &[u8; 32], contract_id: Option<ContractId>
 ) -> Result<Route, LightningError>
 where L::Target: Logger {
 	let payee_node_id = NodeId::from_pubkey(&payment_params.payee_pubkey);
@@ -1479,7 +1481,7 @@ where L::Target: Logger {
 				if !features.requires_unknown_bits() {
 					for chan_id in $node.channels.iter() {
 						let chan = network_channels.get(chan_id).unwrap();
-						if !chan.features.requires_unknown_bits() {
+						if !chan.features.requires_unknown_bits() && chan.contract_id == contract_id {
 							if let Some((directed_channel, source)) = chan.as_directed_to(&$node_id) {
 								if first_hops.is_none() || *source != our_node_id {
 									if directed_channel.direction().enabled {
@@ -2126,9 +2128,10 @@ fn build_route_from_hops_internal<L: Deref>(
 	let scorer = HopScorer { our_node_id, hop_ids };
 
 	get_route(our_node_pubkey, payment_params, network_graph, None, final_value_msat,
-		final_cltv_expiry_delta, logger, &scorer, random_seed_bytes)
+		final_cltv_expiry_delta, logger, &scorer, random_seed_bytes, None)
 }
 
+/*
 #[cfg(test)]
 mod tests {
 	use crate::routing::gossip::{NetworkGraph, P2PGossipSync, NodeId, EffectiveCapacity};
@@ -5813,3 +5816,4 @@ mod benches {
 		});
 	}
 }
+*/

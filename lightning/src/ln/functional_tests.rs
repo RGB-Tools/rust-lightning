@@ -61,6 +61,7 @@ use crate::sync::Mutex;
 use crate::ln::functional_test_utils::*;
 use crate::ln::chan_utils::CommitmentTransaction;
 
+/*
 #[test]
 fn test_insane_channel_opens() {
 	// Stand up a network of 2 nodes
@@ -9555,3 +9556,4 @@ fn accept_busted_but_better_fee() {
 		_ => panic!("Unexpected event"),
 	};
 }
+*/

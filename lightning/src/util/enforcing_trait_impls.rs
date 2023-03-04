@@ -14,6 +14,7 @@ use crate::chain::keysinterface::{Sign, InMemorySigner, BaseSign};
 
 use crate::prelude::*;
 use core::cmp;
+use std::path::PathBuf;
 use crate::sync::{Mutex, Arc};
 #[cfg(test)] use crate::sync::MutexGuard;
 
@@ -27,6 +28,8 @@ use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
 use crate::util::events::HTLCDescriptor;
 use crate::util::ser::{Writeable, Writer};
 use crate::io::Error;
+
+use rgb_rpc::client::Client;
 
 /// Initial value for revoked commitment downward counter
 pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
@@ -116,7 +119,7 @@ impl BaseSign for EnforcingSigner {
 	fn pubkeys(&self) -> &ChannelPublicKeys { self.inner.pubkeys() }
 	fn channel_keys_id(&self) -> [u8; 32] { self.inner.channel_keys_id() }
 
-	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
+	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>, ldk_data_dir: &PathBuf) -> Result<(Signature, Vec<Signature>), ()> {
 		self.verify_counterparty_commitment_tx(commitment_tx, secp_ctx);
 
 		{
@@ -132,7 +135,7 @@ impl BaseSign for EnforcingSigner {
 			state.last_counterparty_commitment = cmp::min(last_commitment_number, actual_commitment_number)
 		}
 
-		Ok(self.inner.sign_counterparty_commitment(commitment_tx, preimages, secp_ctx).unwrap())
+		Ok(self.inner.sign_counterparty_commitment(commitment_tx, preimages, secp_ctx, ldk_data_dir).unwrap())
 	}
 
 	fn validate_counterparty_revocation(&self, idx: u64, _secret: &SecretKey) -> Result<(), ()> {

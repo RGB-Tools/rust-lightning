@@ -32,6 +32,7 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 use bitcoin::{PackedLockTime, secp256k1, Sequence, Witness};
 
+use crate::rgb_utils::color_htlc;
 use crate::util::transaction_utils;
 use crate::util::crypto::{hkdf_extract_expand_twice, sign};
 use crate::util::ser::{Writeable, Writer, Readable, ReadableArgs};
@@ -47,6 +48,7 @@ use crate::ln::script::ShutdownScript;
 use crate::prelude::*;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
 use crate::io::{self, Error};
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
 use crate::util::invoice::construct_invoice_preimage;
@@ -556,6 +558,8 @@ pub struct InMemorySigner {
 	channel_value_satoshis: u64,
 	/// Key derivation parameters.
 	channel_keys_id: [u8; 32],
+	/// The LDK data directory
+	ldk_data_dir: PathBuf,
 }
 
 impl InMemorySigner {
@@ -571,6 +575,7 @@ impl InMemorySigner {
 		commitment_seed: [u8; 32],
 		channel_value_satoshis: u64,
 		channel_keys_id: [u8; 32],
+		ldk_data_dir: PathBuf,
 	) -> InMemorySigner {
 		let holder_channel_pubkeys =
 			InMemorySigner::make_holder_keys(secp_ctx, &funding_key, &revocation_base_key,
@@ -588,6 +593,7 @@ impl InMemorySigner {
 			holder_channel_pubkeys,
 			channel_parameters: None,
 			channel_keys_id,
+			ldk_data_dir,
 		}
 	}
 
@@ -746,7 +752,11 @@ impl BaseSign for InMemorySigner {
 		let mut htlc_sigs = Vec::with_capacity(commitment_tx.htlcs().len());
 		for htlc in commitment_tx.htlcs() {
 			let channel_parameters = self.get_channel_parameters();
-			let htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_tx.feerate_per_kw(), self.holder_selected_contest_delay(), htlc, self.opt_anchors(), channel_parameters.opt_non_zero_fee_anchors.is_some(), &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
+			let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_tx.feerate_per_kw(), self.holder_selected_contest_delay(), htlc, self.opt_anchors(), channel_parameters.opt_non_zero_fee_anchors.is_some(), &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
+			match color_htlc(&mut htlc_tx, &htlc, &self.ldk_data_dir) {
+				Err(_e) => return Err(()),
+				_ => {}
+			}
 			let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, self.opt_anchors(), &keys);
 			let htlc_sighashtype = if self.opt_anchors() { EcdsaSighashType::SinglePlusAnyoneCanPay } else { EcdsaSighashType::All };
 			let htlc_sighash = hash_to_message!(&sighash::SighashCache::new(&htlc_tx).segwit_signature_hash(0, &htlc_redeemscript, htlc.amount_msat / 1000, htlc_sighashtype).unwrap()[..]);
@@ -767,7 +777,7 @@ impl BaseSign for InMemorySigner {
 		let trusted_tx = commitment_tx.trust();
 		let sig = trusted_tx.built_transaction().sign(&self.funding_key, &funding_redeemscript, self.channel_value_satoshis, secp_ctx);
 		let channel_parameters = self.get_channel_parameters();
-		let htlc_sigs = trusted_tx.get_htlc_sigs(&self.htlc_base_key, &channel_parameters.as_holder_broadcastable(), secp_ctx)?;
+		let htlc_sigs = trusted_tx.get_htlc_sigs(&self.htlc_base_key, &channel_parameters.as_holder_broadcastable(), secp_ctx, &self.ldk_data_dir)?;
 		Ok((sig, htlc_sigs))
 	}
 
@@ -778,7 +788,7 @@ impl BaseSign for InMemorySigner {
 		let trusted_tx = commitment_tx.trust();
 		let sig = trusted_tx.built_transaction().sign(&self.funding_key, &funding_redeemscript, self.channel_value_satoshis, secp_ctx);
 		let channel_parameters = self.get_channel_parameters();
-		let htlc_sigs = trusted_tx.get_htlc_sigs(&self.htlc_base_key, &channel_parameters.as_holder_broadcastable(), secp_ctx)?;
+		let htlc_sigs = trusted_tx.get_htlc_sigs(&self.htlc_base_key, &channel_parameters.as_holder_broadcastable(), secp_ctx, &self.ldk_data_dir)?;
 		Ok((sig, htlc_sigs))
 	}
 
@@ -890,6 +900,8 @@ impl Writeable for InMemorySigner {
 		self.channel_parameters.write(writer)?;
 		self.channel_value_satoshis.write(writer)?;
 		self.channel_keys_id.write(writer)?;
+		self.channel_keys_id.write(writer)?;
+		self.ldk_data_dir.write(writer)?;
 
 		write_tlv_fields!(writer, {});
 
@@ -914,6 +926,7 @@ impl ReadableArgs<SecretKey> for InMemorySigner {
 			InMemorySigner::make_holder_keys(&secp_ctx, &funding_key, &revocation_base_key,
 				 &payment_key, &delayed_payment_base_key, &htlc_base_key);
 		let keys_id = Readable::read(reader)?;
+		let ldk_data_dir = Readable::read(reader)?;
 
 		read_tlv_fields!(reader, {});
 
@@ -929,6 +942,7 @@ impl ReadableArgs<SecretKey> for InMemorySigner {
 			holder_channel_pubkeys,
 			channel_parameters: counterparty_channel_data,
 			channel_keys_id: keys_id,
+			ldk_data_dir,
 		})
 	}
 }
@@ -951,7 +965,8 @@ pub struct KeysManager {
 	node_secret: SecretKey,
 	node_id: PublicKey,
 	inbound_payment_key: KeyMaterial,
-	destination_script: Script,
+	/// Destination script
+	pub destination_script: Script,
 	shutdown_pubkey: PublicKey,
 	channel_master_key: ExtendedPrivKey,
 	channel_child_index: AtomicUsize,
@@ -960,9 +975,12 @@ pub struct KeysManager {
 	rand_bytes_child_index: AtomicUsize,
 	rand_bytes_unique_start: Sha256State,
 
+	/// Master key
+	pub master_key: ExtendedPrivKey,
 	seed: [u8; 32],
 	starting_time_secs: u64,
 	starting_time_nanos: u32,
+	ldk_data_dir: PathBuf,
 }
 
 impl KeysManager {
@@ -983,7 +1001,7 @@ impl KeysManager {
 	/// for any channel, and some on-chain during-closing funds.
 	///
 	/// [`ChannelMonitor`]: crate::chain::channelmonitor::ChannelMonitor
-	pub fn new(seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32) -> Self {
+	pub fn new(seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32, ldk_data_dir: PathBuf) -> Self {
 		let secp_ctx = Secp256k1::new();
 		// Note that when we aren't serializing the key, network doesn't matter
 		match ExtendedPrivKey::new_master(Network::Testnet, seed) {
@@ -1030,9 +1048,11 @@ impl KeysManager {
 					rand_bytes_child_index: AtomicUsize::new(0),
 					rand_bytes_unique_start,
 
+					master_key,
 					seed: *seed,
 					starting_time_secs,
 					starting_time_nanos,
+					ldk_data_dir,
 				};
 				let secp_seed = res.get_secure_random_bytes();
 				res.secp_ctx.seeded_randomize(&secp_seed);
@@ -1088,6 +1108,7 @@ impl KeysManager {
 			commitment_seed,
 			channel_value_satoshis,
 			params.clone(),
+			self.ldk_data_dir.clone(),
 		)
 	}
 
@@ -1399,8 +1420,8 @@ impl PhantomKeysManager {
 	/// same across restarts, or else inbound payments may fail.
 	///
 	/// [phantom node payments]: PhantomKeysManager
-	pub fn new(seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32, cross_node_seed: &[u8; 32]) -> Self {
-		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos);
+	pub fn new(seed: &[u8; 32], starting_time_secs: u64, starting_time_nanos: u32, cross_node_seed: &[u8; 32], ldk_data_dir: PathBuf) -> Self {
+		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos, ldk_data_dir);
 		let (inbound_key, phantom_key) = hkdf_extract_expand_twice(b"LDK Inbound and Phantom Payment Key Expansion", cross_node_seed);
 		let phantom_secret = SecretKey::from_slice(&phantom_key).unwrap();
 		let phantom_node_id = PublicKey::from_secret_key(&inner.secp_ctx, &phantom_secret);
