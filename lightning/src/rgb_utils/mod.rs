@@ -2,7 +2,6 @@
 
 pub mod proxy;
 
-use crate::bitcoin::hashes::Hash;
 use crate::chain::transaction::OutPoint;
 use crate::ln::PaymentHash;
 use crate::ln::chan_utils::{BuiltCommitmentTransaction, ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment};
@@ -15,10 +14,9 @@ use bitcoin::blockdata::transaction::Transaction;
 use invoice::ConsignmentEndpoint;
 use psbt::{Psbt, PsbtVersion};
 
-use bitcoin::BlockHash;
 use bp::seals::txout::CloseMethod;
 use internet2::addr::ServiceAddr;
-use lnpbp::chain::{Chain, GENESIS_HASH_REGTEST};
+use lnpbp::chain::Chain;
 use rgb20::Asset as Rgb20Asset;
 use rgb::prelude::EndpointValueMap;
 use rgb::psbt::{RgbExt, RgbInExt};
@@ -62,12 +60,30 @@ pub struct RgbPaymentInfo {
 	pub remote_rgb_amount: u64,
 }
 
+/// RGB UTXO
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RgbUtxo {
+	/// Outpoint
+	pub outpoint: BtcOutPoint,
+	/// Whether the UTXO is colored
+	pub colored: bool,
+}
+
+/// RGB UTXO list
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RgbUtxos {
+	/// The list of RGB UTXOs
+	pub utxos: Vec<RgbUtxo>,
+}
+
+
 pub(crate) fn get_rgb_node_client(ldk_data_dir: &PathBuf) -> Client {
 	let port_str = fs::read_to_string(ldk_data_dir.join("rgb_node_port")).expect("able to read");
 	let port = port_str.parse::<u16>().unwrap();
+	let rgb_network_str = fs::read_to_string(ldk_data_dir.join("rgb_node_network")).expect("able to read");
+	let rgb_network = Chain::from_str(&rgb_network_str).unwrap();
 	let ip = Ipv4Addr::new(127, 0, 0, 1);
 	let rgb_node_endpoint = ServiceAddr::Tcp(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-	let rgb_network = Chain::Regtest(BlockHash::from_slice(GENESIS_HASH_REGTEST).expect("valid bloch hash"));
 	Client::with(rgb_node_endpoint, "rgb-ln-node".to_string(), rgb_network)
 		.expect("Error initializing client")
 }
@@ -409,11 +425,20 @@ pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 	fs::write(path, serialized_info).expect("able to write")
 }
 
-/// Rename RgbInfo file to channel_id
-pub(crate) fn rename_rgbinfo_file(channel_id: &[u8; 32], temporary_channel_id: &[u8; 32], ldk_data_dir: &PathBuf) {
-	let temporary_channel_id_path = ldk_data_dir.join(hex::encode(temporary_channel_id));
-	let channel_id_path = ldk_data_dir.join(hex::encode(channel_id));
+/// Rename RGB files from temporary to final channel ID
+pub(crate) fn rename_rgb_files(channel_id: &[u8; 32], temporary_channel_id: &[u8; 32], ldk_data_dir: &PathBuf) {
+	let temp_chan_id = hex::encode(temporary_channel_id);
+	let chan_id = hex::encode(channel_id);
+
+	let temporary_channel_id_path = ldk_data_dir.join(&temp_chan_id);
+	let channel_id_path = ldk_data_dir.join(&chan_id);
 	fs::rename(temporary_channel_id_path, channel_id_path).expect("rename ok");
+
+	let funding_consignment_tmp = ldk_data_dir.join(format!("consignment_{}", temp_chan_id));
+	if funding_consignment_tmp.exists() {
+		let funding_consignment = ldk_data_dir.join(format!("consignment_{}", chan_id));
+		fs::rename(funding_consignment_tmp, funding_consignment).expect("rename ok");
+	}
 }
 
 /// Handle funding on the receiver side
@@ -437,7 +462,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 		blinding_factor: 777,
 		outpoint,
 		close_method: CloseMethod::OpretFirst,
-		witness_vout: false,
+		witness_vout: true,
 	});
 
 	let mut rgb_client = get_rgb_node_client(&ldk_data_dir);

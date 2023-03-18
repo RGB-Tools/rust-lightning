@@ -38,7 +38,7 @@ use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBounde
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::keysinterface::{Sign, KeysInterface, BaseSign};
-use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info, rename_rgbinfo_file, update_rgb_channel_amount};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount};
 use crate::util::events::ClosureReason;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, VecWriter};
 use crate::util::logger::Logger;
@@ -2315,7 +2315,7 @@ impl<Signer: Sign> Channel<Signer> {
 		self.channel_state = ChannelState::FundingSent as u32;
 		let temporary_channel_id = self.channel_id;
 		self.channel_id = funding_txo.to_channel_id();
-		rename_rgbinfo_file(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
+		rename_rgb_files(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
 		self.cur_counterparty_commitment_transaction_number -= 1;
 		self.cur_holder_commitment_transaction_number -= 1;
 
@@ -5364,7 +5364,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		self.channel_state = ChannelState::FundingCreated as u32;
 		self.channel_id = funding_txo.to_channel_id();
-		rename_rgbinfo_file(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
+		rename_rgb_files(&self.channel_id, &temporary_channel_id, &ldk_data_dir);
 		self.funding_transaction = Some(funding_transaction);
 
 		Ok(msgs::FundingCreated {
