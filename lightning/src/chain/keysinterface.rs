@@ -900,7 +900,6 @@ impl Writeable for InMemorySigner {
 		self.channel_parameters.write(writer)?;
 		self.channel_value_satoshis.write(writer)?;
 		self.channel_keys_id.write(writer)?;
-		self.channel_keys_id.write(writer)?;
 		self.ldk_data_dir.write(writer)?;
 
 		write_tlv_fields!(writer, {});
