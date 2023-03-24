@@ -7,7 +7,7 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-#![crate_name = "lightning"]
+#![crate_name = "rgb_lightning"]
 
 //! Rust-Lightning, not Rusty's Lightning!
 //!
