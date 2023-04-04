@@ -17,6 +17,7 @@ use lightning::ln::inbound_payment::{create, create_from_hash, ExpandedKey};
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{InFlightHtlcs, Route, RouteHint, RouteHintHop};
 use lightning::util::logger::Logger;
+use rgb::ContractId;
 use secp256k1::PublicKey;
 use core::ops::Deref;
 use core::time::Duration;
@@ -234,7 +235,7 @@ where
 /// in excess of the current time.
 pub fn create_invoice_from_channelmanager<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
-	network: Currency, amt_msat: Option<u64>, description: String, invoice_expiry_delta_secs: u32
+	network: Currency, amt_msat: Option<u64>, description: String, invoice_expiry_delta_secs: u32, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 where
 	M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -248,7 +249,7 @@ where
 		.expect("for the foreseeable future this shouldn't happen");
 	create_invoice_from_channelmanager_and_duration_since_epoch(
 		channelmanager, keys_manager, logger, network, amt_msat, description, duration,
-		invoice_expiry_delta_secs
+		invoice_expiry_delta_secs, contract_id, amt_rgb
 	)
 }
 
@@ -265,7 +266,7 @@ where
 pub fn create_invoice_from_channelmanager_with_description_hash<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description_hash: Sha256,
-	invoice_expiry_delta_secs: u32
+	invoice_expiry_delta_secs: u32, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 where
 	M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -282,7 +283,7 @@ where
 
 	create_invoice_from_channelmanager_with_description_hash_and_duration_since_epoch(
 		channelmanager, keys_manager, logger, network, amt_msat,
-		description_hash, duration, invoice_expiry_delta_secs
+		description_hash, duration, invoice_expiry_delta_secs, contract_id, amt_rgb
 	)
 }
 
@@ -292,7 +293,7 @@ where
 pub fn create_invoice_from_channelmanager_with_description_hash_and_duration_since_epoch<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description_hash: Sha256,
-	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32
+	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 		where
 			M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -304,7 +305,7 @@ pub fn create_invoice_from_channelmanager_with_description_hash_and_duration_sin
 	_create_invoice_from_channelmanager_and_duration_since_epoch(
 		channelmanager, keys_manager, logger, network, amt_msat,
 		InvoiceDescription::Hash(&description_hash),
-		duration_since_epoch, invoice_expiry_delta_secs
+		duration_since_epoch, invoice_expiry_delta_secs, contract_id, amt_rgb
 	)
 }
 
@@ -314,7 +315,7 @@ pub fn create_invoice_from_channelmanager_with_description_hash_and_duration_sin
 pub fn create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description: String, duration_since_epoch: Duration,
-	invoice_expiry_delta_secs: u32
+	invoice_expiry_delta_secs: u32, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 		where
 			M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -328,14 +329,14 @@ pub fn create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: 
 		InvoiceDescription::Direct(
 			&Description::new(description).map_err(SignOrCreationError::CreationError)?,
 		),
-		duration_since_epoch, invoice_expiry_delta_secs
+		duration_since_epoch, invoice_expiry_delta_secs, contract_id, amt_rgb
 	)
 }
 
 fn _create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description: InvoiceDescription,
-	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32
+	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 		where
 			M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -350,7 +351,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: Der
 		.create_inbound_payment(amt_msat, invoice_expiry_delta_secs)
 		.map_err(|()| SignOrCreationError::CreationError(CreationError::InvalidAmount))?;
 	_create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash(
-		channelmanager, keys_manager, logger, network, amt_msat, description, duration_since_epoch, invoice_expiry_delta_secs, payment_hash, payment_secret)
+		channelmanager, keys_manager, logger, network, amt_msat, description, duration_since_epoch, invoice_expiry_delta_secs, payment_hash, payment_secret, contract_id, amt_rgb)
 }
 
 /// See [`create_invoice_from_channelmanager_and_duration_since_epoch`]
@@ -360,7 +361,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: Der
 pub fn create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description: String, duration_since_epoch: Duration,
-	invoice_expiry_delta_secs: u32, payment_hash: PaymentHash
+	invoice_expiry_delta_secs: u32, payment_hash: PaymentHash, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 	where
 		M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -377,14 +378,14 @@ pub fn create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_
 		InvoiceDescription::Direct(
 			&Description::new(description).map_err(SignOrCreationError::CreationError)?,
 		),
-		duration_since_epoch, invoice_expiry_delta_secs, payment_hash, payment_secret
+		duration_since_epoch, invoice_expiry_delta_secs, payment_hash, payment_secret, contract_id, amt_rgb
 	)
 }
 
 fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash<M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(
 	channelmanager: &ChannelManager<M, T, K, F, L>, keys_manager: K, logger: L,
 	network: Currency, amt_msat: Option<u64>, description: InvoiceDescription, duration_since_epoch: Duration,
-	invoice_expiry_delta_secs: u32, payment_hash: PaymentHash, payment_secret: PaymentSecret
+	invoice_expiry_delta_secs: u32, payment_hash: PaymentHash, payment_secret: PaymentSecret, contract_id: Option<ContractId>, amt_rgb: Option<u64>
 ) -> Result<Invoice, SignOrCreationError<()>>
 	where
 		M::Target: chain::Watch<<K::Target as KeysInterface>::Signer>,
@@ -415,6 +416,12 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 		.expiry_time(Duration::from_secs(invoice_expiry_delta_secs.into()));
 	if let Some(amt) = amt_msat {
 		invoice = invoice.amount_milli_satoshis(amt);
+	}
+	if let Some(cid) = contract_id {
+		invoice = invoice.rgb_contract_id(cid);
+	}
+	if let Some(amt) = amt_rgb {
+		invoice = invoice.rgb_amount(amt);
 	}
 
 	let route_hints = filter_channels(channels, amt_msat, &logger);

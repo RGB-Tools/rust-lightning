@@ -425,6 +425,7 @@ where
 			hash_map::Entry::Occupied(_) => return Err(PaymentError::Invoice("payment pending")),
 			hash_map::Entry::Vacant(entry) => entry.insert(PaymentAttempts::new()),
 		};
+		write_rgb_payment_info_file(&self.ldk_data_dir, &payment_hash, invoice.rgb_contract_id().unwrap(), invoice.rgb_amount().unwrap());
 
 		let payment_secret = Some(invoice.payment_secret().clone());
 		let mut payment_params = PaymentParameters::from_node_id(invoice.recover_payee_pub_key())

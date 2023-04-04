@@ -4,7 +4,7 @@ use bech32::{ToBase32, u5, WriteBase32, Base32Len};
 use crate::prelude::*;
 
 use super::{Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiry, Fallback, PayeePubKey, InvoiceSignature, PositiveTimestamp,
-	PrivateRoute, Description, RawTaggedField, Currency, RawHrp, SiPrefix, constants, SignedRawInvoice, RawDataPart};
+	PrivateRoute, Description, RawTaggedField, Currency, RawHrp, SiPrefix, constants, SignedRawInvoice, RawDataPart, RgbAmount, RgbContractId};
 
 /// Converts a stream of bytes written to it to base32. On finalization the according padding will
 /// be applied. That means the results of writing two data blocks with one or two `BytesToBase32`
@@ -399,6 +399,30 @@ impl Base32Len for PrivateRoute {
 	}
 }
 
+impl ToBase32 for RgbAmount {
+	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
+		writer.write(&encode_int_be_base32(self.0))
+	}
+}
+
+impl Base32Len for RgbAmount {
+	fn base32_len(&self) -> usize {
+		encoded_int_be_base32_size(self.0)
+	}
+}
+
+impl ToBase32 for RgbContractId {
+	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
+		self.0.to_string().as_bytes().write_base32(writer)
+	}
+}
+
+impl Base32Len for RgbContractId {
+	fn base32_len(&self) -> usize {
+		self.0.to_string().as_bytes().base32_len()
+	}
+}
+
 impl ToBase32 for TaggedField {
 	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
 		/// Writes a tagged field: tag, length and data. `tag` should be in `0..32` otherwise the
@@ -448,6 +472,12 @@ impl ToBase32 for TaggedField {
 			},
 			TaggedField::Features(ref features) => {
 				write_tagged_field(writer, constants::TAG_FEATURES, features)
+			},
+			TaggedField::RgbAmount(ref rgb_amount) => {
+				write_tagged_field(writer, constants::TAG_RGB_AMOUNT, rgb_amount)
+			},
+			TaggedField::RgbContractId(ref rgb_contract_id) => {
+				write_tagged_field(writer, constants::TAG_RGB_CONTRACT_ID, rgb_contract_id)
 			},
 		}
 	}

@@ -11,6 +11,7 @@ use bech32::{u5, FromBase32};
 
 use bitcoin_hashes::Hash;
 use bitcoin_hashes::sha256;
+use rgb::ContractId;
 use crate::prelude::*;
 use lightning::ln::PaymentSecret;
 use lightning::routing::gossip::RoutingFees;
@@ -24,7 +25,7 @@ use secp256k1::PublicKey;
 
 use super::{Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiry, Fallback, PayeePubKey, InvoiceSignature, PositiveTimestamp,
 	SemanticError, PrivateRoute, ParseError, ParseOrSemanticError, Description, RawTaggedField, Currency, RawHrp, SiPrefix, RawInvoice,
-	constants, SignedRawInvoice, RawDataPart, InvoiceFeatures};
+	constants, SignedRawInvoice, RawDataPart, InvoiceFeatures, RgbAmount, RgbContractId};
 
 use self::hrp_sm::parse_hrp;
 
@@ -461,6 +462,10 @@ impl FromBase32 for TaggedField {
 				Ok(TaggedField::PaymentSecret(PaymentSecret::from_base32(field_data)?)),
 			constants::TAG_FEATURES =>
 				Ok(TaggedField::Features(InvoiceFeatures::from_base32(field_data)?)),
+			constants::TAG_RGB_AMOUNT =>
+				Ok(TaggedField::RgbAmount(RgbAmount::from_base32(field_data)?)),
+			constants::TAG_RGB_CONTRACT_ID =>
+				Ok(TaggedField::RgbContractId(RgbContractId::from_base32(field_data)?)),
 			_ => {
 				// "A reader MUST skip over unknown fields"
 				Err(ParseError::Skip)
@@ -619,6 +624,32 @@ impl FromBase32 for PrivateRoute {
 	}
 }
 
+impl FromBase32 for RgbAmount {
+	type Err = ParseError;
+
+	fn from_base32(field_data: &[u5]) -> Result<RgbAmount, ParseError> {
+		let rgb_amount = parse_int_be::<u64, u5>(field_data, 32);
+		if let Some(rgb_amount) = rgb_amount {
+			Ok(RgbAmount(rgb_amount))
+		} else {
+			Err(ParseError::IntegerOverflowError)
+		}
+	}
+}
+
+impl FromBase32 for RgbContractId {
+	type Err = ParseError;
+
+	fn from_base32(field_data: &[u5]) -> Result<RgbContractId, ParseError> {
+		let bytes = Vec::<u8>::from_base32(field_data)?;
+		let rgb_contract_id_str = String::from(str::from_utf8(&bytes)?);
+		match ContractId::from_str(&rgb_contract_id_str) {
+			Ok(cid) => Ok(RgbContractId(cid)),
+			Err(_) => Err(ParseError::InvalidContractId),
+		}
+	}
+}
+
 impl Display for ParseError {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		match *self {
@@ -666,6 +697,9 @@ impl Display for ParseError {
 			},
 			ParseError::Skip => {
 				f.write_str("the tagged field has to be skipped because of an unexpected, but allowed property")
+			},
+			ParseError::InvalidContractId => {
+				f.write_str("invalid RGB contract ID")
 			},
 		}
 	}
