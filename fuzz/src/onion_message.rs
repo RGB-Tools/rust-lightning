@@ -1,11 +1,11 @@
 // Imports that need to be added manually
 use bitcoin::bech32::u5;
 use bitcoin::blockdata::script::Script;
-use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 
-use lightning::chain::keysinterface::{Recipient, KeyMaterial, KeysInterface};
+use lightning::chain::keysinterface::{Recipient, KeyMaterial, EntropySource, NodeSigner, SignerProvider};
 use lightning::ln::msgs::{self, DecodeError, OnionMessageHandler};
 use lightning::ln::script::ShutdownScript;
 use lightning::util::enforcing_trait_impls::EnforcingSigner;
@@ -30,7 +30,7 @@ pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
 			counter: AtomicU64::new(0),
 		};
 		let custom_msg_handler = TestCustomMessageHandler {};
-		let onion_messenger = OnionMessenger::new(&keys_manager, logger, &custom_msg_handler);
+		let onion_messenger = OnionMessenger::new(&keys_manager, &keys_manager, logger, &custom_msg_handler);
 		let mut pk = [2; 33]; pk[1] = 0xff;
 		let peer_node_id_not_used = PublicKey::from_slice(&pk).unwrap();
 		onion_messenger.handle_onion_message(&peer_node_id_not_used, &msg);
@@ -90,15 +90,29 @@ struct KeyProvider {
 	node_secret: SecretKey,
 	counter: AtomicU64,
 }
-impl KeysInterface for KeyProvider {
-	type Signer = EnforcingSigner;
 
-	fn get_node_secret(&self, _recipient: Recipient) -> Result<SecretKey, ()> {
-		Ok(self.node_secret.clone())
+impl EntropySource for KeyProvider {
+	fn get_secure_random_bytes(&self) -> [u8; 32] {
+		let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
+		[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			(ctr >> 8*7) as u8, (ctr >> 8*6) as u8, (ctr >> 8*5) as u8, (ctr >> 8*4) as u8, (ctr >> 8*3) as u8, (ctr >> 8*2) as u8, (ctr >> 8*1) as u8, 14, (ctr >> 8*0) as u8]
+	}
+}
+
+impl NodeSigner for KeyProvider {
+	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
+		let node_secret = match recipient {
+			Recipient::Node => Ok(&self.node_secret),
+			Recipient::PhantomNode => Err(())
+		}?;
+		Ok(PublicKey::from_secret_key(&Secp256k1::signing_only(), node_secret))
 	}
 
 	fn ecdh(&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>) -> Result<SharedSecret, ()> {
-		let mut node_secret = self.get_node_secret(recipient)?;
+		let mut node_secret = match recipient {
+			Recipient::Node => Ok(self.node_secret.clone()),
+			Recipient::PhantomNode => Err(())
+		}?;
 		if let Some(tweak) = tweak {
 			node_secret = node_secret.mul_tweak(tweak).map_err(|_| ())?;
 		}
@@ -107,9 +121,17 @@ impl KeysInterface for KeyProvider {
 
 	fn get_inbound_payment_key_material(&self) -> KeyMaterial { unreachable!() }
 
-	fn get_destination_script(&self) -> Script { unreachable!() }
+	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
+		unreachable!()
+	}
 
-	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript { unreachable!() }
+	fn sign_gossip_message(&self, _msg: lightning::ln::msgs::UnsignedGossipMessage) -> Result<bitcoin::secp256k1::ecdsa::Signature, ()> {
+		unreachable!()
+	}
+}
+
+impl SignerProvider for KeyProvider {
+	type Signer = EnforcingSigner;
 
 	fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] { unreachable!() }
 
@@ -117,17 +139,11 @@ impl KeysInterface for KeyProvider {
 		unreachable!()
 	}
 
-	fn get_secure_random_bytes(&self) -> [u8; 32] {
-		let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
-		[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		(ctr >> 8*7) as u8, (ctr >> 8*6) as u8, (ctr >> 8*5) as u8, (ctr >> 8*4) as u8, (ctr >> 8*3) as u8, (ctr >> 8*2) as u8, (ctr >> 8*1) as u8, 14, (ctr >> 8*0) as u8]
-	}
-
 	fn read_chan_signer(&self, _data: &[u8]) -> Result<EnforcingSigner, DecodeError> { unreachable!() }
 
-	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
-		unreachable!()
-	}
+	fn get_destination_script(&self) -> Script { unreachable!() }
+
+	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript { unreachable!() }
 }
 
 #[cfg(test)]

@@ -26,7 +26,6 @@
 compile_error!("at least one of the `std` or `no-std` features must be enabled");
 
 pub mod payment;
-pub mod rgb_utils;
 pub mod utils;
 
 pub(crate) mod time_utils;
@@ -157,11 +156,11 @@ pub const DEFAULT_EXPIRY_TIME: u64 = 3600;
 /// Default minimum final CLTV expiry as defined by [BOLT 11].
 ///
 /// Note that this is *not* the same value as rust-lightning's minimum CLTV expiry, which is
-/// provided in [`MIN_FINAL_CLTV_EXPIRY`].
+/// provided in [`MIN_FINAL_CLTV_EXPIRY_DELTA`].
 ///
 /// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
-/// [`MIN_FINAL_CLTV_EXPIRY`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY
-pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY: u64 = 18;
+/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
+pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA: u64 = 18;
 
 /// Builder for `Invoice`s. It's the most convenient and advised way to use this library. It ensures
 /// that only a semantically and syntactically correct Invoice can be built using it.
@@ -202,7 +201,7 @@ pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY: u64 = 18;
 /// 	.payment_hash(payment_hash)
 /// 	.payment_secret(payment_secret)
 /// 	.current_timestamp()
-/// 	.min_final_cltv_expiry(144)
+/// 	.min_final_cltv_expiry_delta(144)
 /// 	.build_signed(|hash| {
 /// 		Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key)
 /// 	})
@@ -300,7 +299,7 @@ pub struct RawInvoice {
 
 /// Data of the `RawInvoice` that is encoded in the human readable part
 ///
-/// (C-not exported) As we don't yet support Option<Enum>
+/// (C-not exported) As we don't yet support `Option<Enum>`
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct RawHrp {
 	/// The currency deferred from the 3rd and 4th character of the bech32 transaction
@@ -413,7 +412,7 @@ pub enum TaggedField {
 	PayeePubKey(PayeePubKey),
 	DescriptionHash(Sha256),
 	ExpiryTime(ExpiryTime),
-	MinFinalCltvExpiry(MinFinalCltvExpiry),
+	MinFinalCltvExpiryDelta(MinFinalCltvExpiryDelta),
 	Fallback(Fallback),
 	PrivateRoute(PrivateRoute),
 	PaymentSecret(PaymentSecret),
@@ -443,9 +442,9 @@ pub struct PayeePubKey(pub PublicKey);
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct ExpiryTime(Duration);
 
-/// `min_final_cltv_expiry` to use for the last HTLC in the route
+/// `min_final_cltv_expiry_delta` to use for the last HTLC in the route
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub struct MinFinalCltvExpiry(pub u64);
+pub struct MinFinalCltvExpiryDelta(pub u64);
 
 /// Requested amount for the RGB asset
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -488,7 +487,7 @@ pub mod constants {
 	pub const TAG_PAYEE_PUB_KEY: u8 = 19;
 	pub const TAG_DESCRIPTION_HASH: u8 = 23;
 	pub const TAG_EXPIRY_TIME: u8 = 6;
-	pub const TAG_MIN_FINAL_CLTV_EXPIRY: u8 = 24;
+	pub const TAG_MIN_FINAL_CLTV_EXPIRY_DELTA: u8 = 24;
 	pub const TAG_FALLBACK: u8 = 9;
 	pub const TAG_PRIVATE_ROUTE: u8 = 3;
 	pub const TAG_PAYMENT_SECRET: u8 = 16;
@@ -681,9 +680,9 @@ impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb
 }
 
 impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, T, tb::False, S> {
-	/// Sets `min_final_cltv_expiry`.
-	pub fn min_final_cltv_expiry(mut self, min_final_cltv_expiry: u64) -> InvoiceBuilder<D, H, T, tb::True, S> {
-		self.tagged_fields.push(TaggedField::MinFinalCltvExpiry(MinFinalCltvExpiry(min_final_cltv_expiry)));
+	/// Sets `min_final_cltv_expiry_delta`.
+	pub fn min_final_cltv_expiry_delta(mut self, min_final_cltv_expiry_delta: u64) -> InvoiceBuilder<D, H, T, tb::True, S> {
+		self.tagged_fields.push(TaggedField::MinFinalCltvExpiryDelta(MinFinalCltvExpiryDelta(min_final_cltv_expiry_delta)));
 		self.set_flags()
 	}
 }
@@ -833,6 +832,7 @@ impl SignedRawInvoice {
 ///
 /// The following example would extract the first B.
 ///
+/// ```ignore
 /// enum Enum {
 /// 	A(u8),
 /// 	B(u16)
@@ -841,6 +841,7 @@ impl SignedRawInvoice {
 /// let elements = vec![Enum::A(1), Enum::A(2), Enum::B(3), Enum::A(4)];
 ///
 /// assert_eq!(find_extract!(elements.iter(), Enum::B(x), x), Some(3u16));
+/// ```
 macro_rules! find_extract {
 	($iter:expr, $enm:pat, $enm_var:ident) => {
 		find_all_extract!($iter, $enm, $enm_var).next()
@@ -852,6 +853,7 @@ macro_rules! find_extract {
 ///
 /// The following example would extract all A.
 ///
+/// ```ignore
 /// enum Enum {
 /// 	A(u8),
 /// 	B(u16)
@@ -863,6 +865,7 @@ macro_rules! find_extract {
 /// 	find_all_extract!(elements.iter(), Enum::A(x), x).collect::<Vec<u8>>(),
 /// 	vec![1u8, 2u8, 4u8]
 /// );
+/// ```
 macro_rules! find_all_extract {
 	($iter:expr, $enm:pat, $enm_var:ident) => {
 		$iter.filter_map(|tf| match *tf {
@@ -952,8 +955,8 @@ impl RawInvoice {
 		find_extract!(self.known_tagged_fields(), TaggedField::ExpiryTime(ref x), x)
 	}
 
-	pub fn min_final_cltv_expiry(&self) -> Option<&MinFinalCltvExpiry> {
-		find_extract!(self.known_tagged_fields(), TaggedField::MinFinalCltvExpiry(ref x), x)
+	pub fn min_final_cltv_expiry_delta(&self) -> Option<&MinFinalCltvExpiryDelta> {
+		find_extract!(self.known_tagged_fields(), TaggedField::MinFinalCltvExpiryDelta(ref x), x)
 	}
 
 	pub fn payment_secret(&self) -> Option<&PaymentSecret> {
@@ -1274,12 +1277,12 @@ impl Invoice {
 			.unwrap_or_else(|| Duration::new(u64::max_value(), 1_000_000_000 - 1)) < at_time
 	}
 
-	/// Returns the invoice's `min_final_cltv_expiry` time, if present, otherwise
-	/// [`DEFAULT_MIN_FINAL_CLTV_EXPIRY`].
-	pub fn min_final_cltv_expiry(&self) -> u64 {
-		self.signed_invoice.min_final_cltv_expiry()
+	/// Returns the invoice's `min_final_cltv_expiry_delta` time, if present, otherwise
+	/// [`DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA`].
+	pub fn min_final_cltv_expiry_delta(&self) -> u64 {
+		self.signed_invoice.min_final_cltv_expiry_delta()
 			.map(|x| x.0)
-			.unwrap_or(DEFAULT_MIN_FINAL_CLTV_EXPIRY)
+			.unwrap_or(DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA)
 	}
 
 	/// Returns a list of all fallback addresses
@@ -1311,7 +1314,7 @@ impl Invoice {
 		self.signed_invoice.amount_pico_btc().map(|v| v / 10)
 	}
 
-	/// Returns the amount if specified in the invoice as pico <currency>.
+	/// Returns the amount if specified in the invoice as pico BTC.
 	fn amount_pico_btc(&self) -> Option<u64> {
 		self.signed_invoice.amount_pico_btc()
 	}
@@ -1344,7 +1347,7 @@ impl TaggedField {
 			TaggedField::PayeePubKey(_) => constants::TAG_PAYEE_PUB_KEY,
 			TaggedField::DescriptionHash(_) => constants::TAG_DESCRIPTION_HASH,
 			TaggedField::ExpiryTime(_) => constants::TAG_EXPIRY_TIME,
-			TaggedField::MinFinalCltvExpiry(_) => constants::TAG_MIN_FINAL_CLTV_EXPIRY,
+			TaggedField::MinFinalCltvExpiryDelta(_) => constants::TAG_MIN_FINAL_CLTV_EXPIRY_DELTA,
 			TaggedField::Fallback(_) => constants::TAG_FALLBACK,
 			TaggedField::PrivateRoute(_) => constants::TAG_PRIVATE_ROUTE,
 			TaggedField::PaymentSecret(_) => constants::TAG_PAYMENT_SECRET,
@@ -1493,6 +1496,11 @@ pub enum CreationError {
 	///
 	/// [phantom invoices]: crate::utils::create_phantom_invoice
 	MissingRouteHints,
+
+	/// The provided `min_final_cltv_expiry_delta` was less than [`MIN_FINAL_CLTV_EXPIRY_DELTA`].
+	///
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
+	MinFinalCltvExpiryDeltaTooShort,
 }
 
 impl Display for CreationError {
@@ -1503,6 +1511,8 @@ impl Display for CreationError {
 			CreationError::TimestampOutOfBounds => f.write_str("The Unix timestamp of the supplied date is less than zero or greater than 35-bits"),
 			CreationError::InvalidAmount => f.write_str("The supplied millisatoshi amount was greater than the total bitcoin supply"),
 			CreationError::MissingRouteHints => f.write_str("The invoice required route hints and they weren't provided"),
+			CreationError::MinFinalCltvExpiryDeltaTooShort => f.write_str(
+				"The supplied final CLTV expiry delta was less than LDK's `MIN_FINAL_CLTV_EXPIRY_DELTA`"),
 		}
 	}
 }
@@ -1849,7 +1859,7 @@ mod test {
 		let builder = InvoiceBuilder::new(Currency::Bitcoin)
 			.payment_hash(sha256::Hash::from_slice(&[0;32][..]).unwrap())
 			.duration_since_epoch(Duration::from_secs(1234567))
-			.min_final_cltv_expiry(144);
+			.min_final_cltv_expiry_delta(144);
 
 		let too_long_string = String::from_iter(
 			(0..1024).map(|_| '?')
@@ -1967,7 +1977,7 @@ mod test {
 			.duration_since_epoch(Duration::from_secs(1234567))
 			.payee_pub_key(public_key.clone())
 			.expiry_time(Duration::from_secs(54321))
-			.min_final_cltv_expiry(144)
+			.min_final_cltv_expiry_delta(144)
 			.fallback(Fallback::PubKeyHash([0;20]))
 			.private_route(route_1.clone())
 			.private_route(route_2.clone())
@@ -1993,7 +2003,7 @@ mod test {
 		);
 		assert_eq!(invoice.payee_pub_key(), Some(&public_key));
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(54321));
-		assert_eq!(invoice.min_final_cltv_expiry(), 144);
+		assert_eq!(invoice.min_final_cltv_expiry_delta(), 144);
 		assert_eq!(invoice.fallbacks(), vec![&Fallback::PubKeyHash([0;20])]);
 		assert_eq!(invoice.private_routes(), vec![&PrivateRoute(route_1), &PrivateRoute(route_2)]);
 		assert_eq!(
@@ -2034,7 +2044,7 @@ mod test {
 			.unwrap();
 		let invoice = Invoice::from_signed(signed_invoice).unwrap();
 
-		assert_eq!(invoice.min_final_cltv_expiry(), DEFAULT_MIN_FINAL_CLTV_EXPIRY);
+		assert_eq!(invoice.min_final_cltv_expiry_delta(), DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA);
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(DEFAULT_EXPIRY_TIME));
 		assert!(!invoice.would_expire(Duration::from_secs(1234568)));
 	}

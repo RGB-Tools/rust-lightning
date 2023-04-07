@@ -21,10 +21,10 @@ use crate::ln::channelmanager::{InterceptId, PaymentId};
 use crate::ln::channel::FUNDING_CONF_DEADLINE_BLOCKS;
 use crate::ln::features::ChannelTypeFeatures;
 use crate::ln::msgs;
-use crate::ln::msgs::DecodeError;
 use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
 use crate::routing::gossip::NetworkUpdate;
-use crate::util::ser::{BigSize, FixedLengthReader, Writeable, Writer, MaybeReadable, Readable, WithoutLength, OptionDeserWrapper};
+use crate::util::errors::APIError;
+use crate::util::ser::{BigSize, FixedLengthReader, Writeable, Writer, MaybeReadable, Readable, RequiredWrapper, UpgradableRequired, WithoutLength};
 use crate::routing::router::{RouteHop, RouteParameters};
 
 use bitcoin::{PackedLockTime, Transaction};
@@ -46,7 +46,7 @@ use crate::sync::Arc;
 
 /// Some information provided on receipt of payment depends on whether the payment received is a
 /// spontaneous payment or a "conventional" lightning payment that's paying an invoice.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaymentPurpose {
 	/// Information for receiving a payment that we generated an invoice for.
 	InvoicePayment {
@@ -80,6 +80,39 @@ impl_writeable_tlv_based_enum!(PaymentPurpose,
 		(2, payment_secret, required),
 	};
 	(2, SpontaneousPayment)
+);
+
+/// When the payment path failure took place and extra details about it. [`PathFailure::OnPath`] may
+/// contain a [`NetworkUpdate`] that needs to be applied to the [`NetworkGraph`].
+///
+/// [`NetworkUpdate`]: crate::routing::gossip::NetworkUpdate
+/// [`NetworkGraph`]: crate::routing::gossip::NetworkGraph
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathFailure {
+	/// We failed to initially send the payment and no HTLC was committed to. Contains the relevant
+	/// error.
+	InitialSend {
+		/// The error surfaced from initial send.
+		err: APIError,
+	},
+	/// A hop on the path failed to forward our payment.
+	OnPath {
+		/// If present, this [`NetworkUpdate`] should be applied to the [`NetworkGraph`] so that routing
+		/// decisions can take into account the update.
+		///
+		/// [`NetworkUpdate`]: crate::routing::gossip::NetworkUpdate
+		/// [`NetworkGraph`]: crate::routing::gossip::NetworkGraph
+		network_update: Option<NetworkUpdate>,
+	},
+}
+
+impl_writeable_tlv_based_enum_upgradable!(PathFailure,
+	(0, OnPath) => {
+		(0, network_update, upgradable_option),
+	},
+	(2, InitialSend) => {
+		(0, err, upgradable_required),
+	},
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,10 +290,10 @@ pub struct HTLCDescriptor {
 	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
 	pub channel_value_satoshis: u64,
 	/// The necessary channel parameters that need to be provided to the re-derived
-	/// [`InMemorySigner`] through [`BaseSign::ready_channel`].
+	/// [`InMemorySigner`] through [`BaseSign::provide_channel_parameters`].
 	///
 	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	/// [`BaseSign::ready_channel`]: crate::chain::keysinterface::BaseSign::ready_channel
+	/// [`BaseSign::provide_channel_parameters`]: crate::chain::keysinterface::BaseSign::provide_channel_parameters
 	pub channel_parameters: ChannelTransactionParameters,
 	/// The txid of the commitment transaction in which the HTLC output lives.
 	pub commitment_txid: Txid,
@@ -455,7 +488,7 @@ impl_writeable_tlv_based_enum!(InterceptNextHop,
 /// Note that while Writeable and Readable are implemented for Event, you probably shouldn't use
 /// them directly as they don't round-trip exactly (for example FundingGenerationReady is never
 /// written as it makes no sense to respond to it after reconnecting to peers).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
 	/// Used to indicate that the client should generate a funding transaction with the given
 	/// parameters and then call [`ChannelManager::funding_transaction_generated`].
@@ -491,10 +524,10 @@ pub enum Event {
 	/// [`ChannelManager::claim_funds`] with the preimage given in [`PaymentPurpose`].
 	///
 	/// Note that if the preimage is not known, you should call
-	/// [`ChannelManager::fail_htlc_backwards`] to free up resources for this HTLC and avoid
-	/// network congestion.
-	/// If you fail to call either [`ChannelManager::claim_funds`] or
-	/// [`ChannelManager::fail_htlc_backwards`] within the HTLC's timeout, the HTLC will be
+	/// [`ChannelManager::fail_htlc_backwards`] or [`ChannelManager::fail_htlc_backwards_with_reason`]
+	/// to free up resources for this HTLC and avoid network congestion.
+	/// If you fail to call either [`ChannelManager::claim_funds`], [`ChannelManager::fail_htlc_backwards`],
+	/// or [`ChannelManager::fail_htlc_backwards_with_reason`] within the HTLC's timeout, the HTLC will be
 	/// automatically failed.
 	///
 	/// # Note
@@ -506,6 +539,7 @@ pub enum Event {
 	///
 	/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
 	/// [`ChannelManager::fail_htlc_backwards`]: crate::ln::channelmanager::ChannelManager::fail_htlc_backwards
+	/// [`ChannelManager::fail_htlc_backwards_with_reason`]: crate::ln::channelmanager::ChannelManager::fail_htlc_backwards_with_reason
 	PaymentClaimable {
 		/// The node that will receive the payment after it has been claimed.
 		/// This is useful to identify payments received via [phantom nodes].
@@ -564,11 +598,9 @@ pub enum Event {
 	/// Note for MPP payments: in rare cases, this event may be preceded by a `PaymentPathFailed`
 	/// event. In this situation, you SHOULD treat this payment as having succeeded.
 	PaymentSent {
-		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::retry_payment`].
+		/// The id returned by [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
-		/// [`ChannelManager::retry_payment`]: crate::ln::channelmanager::ChannelManager::retry_payment
 		payment_id: Option<PaymentId>,
 		/// The preimage to the hash given to ChannelManager::send_payment.
 		/// Note that this serves as a payment receipt, if you wish to have such a thing, you must
@@ -590,19 +622,19 @@ pub enum Event {
 		fee_paid_msat: Option<u64>,
 	},
 	/// Indicates an outbound payment failed. Individual [`Event::PaymentPathFailed`] events
-	/// provide failure information for each MPP part in the payment.
+	/// provide failure information for each path attempt in the payment, including retries.
 	///
 	/// This event is provided once there are no further pending HTLCs for the payment and the
-	/// payment is no longer retryable due to [`ChannelManager::abandon_payment`] having been
-	/// called for the corresponding payment.
+	/// payment is no longer retryable, due either to the [`Retry`] provided or
+	/// [`ChannelManager::abandon_payment`] having been called for the corresponding payment.
 	///
+	/// [`Retry`]: crate::ln::channelmanager::Retry
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 	PaymentFailed {
 		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::retry_payment`] and [`ChannelManager::abandon_payment`].
+		/// [`ChannelManager::abandon_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
-		/// [`ChannelManager::retry_payment`]: crate::ln::channelmanager::ChannelManager::retry_payment
 		/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 		payment_id: PaymentId,
 		/// The hash that was given to [`ChannelManager::send_payment`].
@@ -615,11 +647,9 @@ pub enum Event {
 	/// Always generated after [`Event::PaymentSent`] and thus useful for scoring channels. See
 	/// [`Event::PaymentSent`] for obtaining the payment preimage.
 	PaymentPathSuccessful {
-		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::retry_payment`].
+		/// The id returned by [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
-		/// [`ChannelManager::retry_payment`]: crate::ln::channelmanager::ChannelManager::retry_payment
 		payment_id: PaymentId,
 		/// The hash that was given to [`ChannelManager::send_payment`].
 		///
@@ -630,24 +660,21 @@ pub enum Event {
 		/// May contain a closed channel if the HTLC sent along the path was fulfilled on chain.
 		path: Vec<RouteHop>,
 	},
-	/// Indicates an outbound HTLC we sent failed. Probably some intermediary node dropped
-	/// something. You may wish to retry with a different route.
-	///
-	/// If you have given up retrying this payment and wish to fail it, you MUST call
-	/// [`ChannelManager::abandon_payment`] at least once for a given [`PaymentId`] or memory
-	/// related to payment tracking will leak.
+	/// Indicates an outbound HTLC we sent failed, likely due to an intermediary node being unable to
+	/// handle the HTLC.
 	///
 	/// Note that this does *not* indicate that all paths for an MPP payment have failed, see
-	/// [`Event::PaymentFailed`] and [`all_paths_failed`].
+	/// [`Event::PaymentFailed`].
+	///
+	/// See [`ChannelManager::abandon_payment`] for giving up on this payment before its retries have
+	/// been exhausted.
 	///
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
-	/// [`all_paths_failed`]: Self::PaymentPathFailed::all_paths_failed
 	PaymentPathFailed {
 		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::retry_payment`] and [`ChannelManager::abandon_payment`].
+		/// [`ChannelManager::abandon_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
-		/// [`ChannelManager::retry_payment`]: crate::ln::channelmanager::ChannelManager::retry_payment
 		/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 		payment_id: Option<PaymentId>,
 		/// The hash that was given to [`ChannelManager::send_payment`].
@@ -655,35 +682,14 @@ pub enum Event {
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
 		payment_hash: PaymentHash,
 		/// Indicates the payment was rejected for some reason by the recipient. This implies that
-		/// the payment has failed, not just the route in question. If this is not set, you may
-		/// retry the payment via a different route.
+		/// the payment has failed, not just the route in question. If this is not set, the payment may
+		/// be retried via a different route.
 		payment_failed_permanently: bool,
-		/// Any failure information conveyed via the Onion return packet by a node along the failed
-		/// payment route.
-		///
-		/// Should be applied to the [`NetworkGraph`] so that routing decisions can take into
-		/// account the update.
+		/// Extra error details based on the failure type. May contain an update that needs to be
+		/// applied to the [`NetworkGraph`].
 		///
 		/// [`NetworkGraph`]: crate::routing::gossip::NetworkGraph
-		network_update: Option<NetworkUpdate>,
-		/// For both single-path and multi-path payments, this is set if all paths of the payment have
-		/// failed. This will be set to false if (1) this is an MPP payment and (2) other parts of the
-		/// larger MPP payment were still in flight when this event was generated.
-		///
-		/// Note that if you are retrying individual MPP parts, using this value to determine if a
-		/// payment has fully failed is race-y. Because multiple failures can happen prior to events
-		/// being processed, you may retry in response to a first failure, with a second failure
-		/// (with `all_paths_failed` set) still pending. Then, when the second failure is processed
-		/// you will see `all_paths_failed` set even though the retry of the first failure still
-		/// has an associated in-flight HTLC. See (1) for an example of such a failure.
-		///
-		/// If you wish to retry individual MPP parts and learn when a payment has failed, you must
-		/// call [`ChannelManager::abandon_payment`] and wait for a [`Event::PaymentFailed`] event.
-		///
-		/// (1) <https://github.com/lightningdevkit/rust-lightning/issues/1164>
-		///
-		/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
-		all_paths_failed: bool,
+		failure: PathFailure,
 		/// The payment path that failed.
 		path: Vec<RouteHop>,
 		/// The channel responsible for the failed payment path.
@@ -695,12 +701,9 @@ pub enum Event {
 		/// If this is `Some`, then the corresponding channel should be avoided when the payment is
 		/// retried. May be `None` for older [`Event`] serializations.
 		short_channel_id: Option<u64>,
-		/// Parameters needed to compute a new [`Route`] when retrying the failed payment path.
-		///
-		/// See [`find_route`] for details.
+		/// Parameters used by LDK to compute a new [`Route`] when retrying the failed payment path.
 		///
 		/// [`Route`]: crate::routing::router::Route
-		/// [`find_route`]: crate::routing::router::find_route
 		retry: Option<RouteParameters>,
 #[cfg(test)]
 		error_code: Option<u16>,
@@ -988,8 +991,8 @@ impl Writeable for Event {
 				});
 			},
 			&Event::PaymentPathFailed {
-				ref payment_id, ref payment_hash, ref payment_failed_permanently, ref network_update,
-				ref all_paths_failed, ref path, ref short_channel_id, ref retry,
+				ref payment_id, ref payment_hash, ref payment_failed_permanently, ref failure,
+				ref path, ref short_channel_id, ref retry,
 				#[cfg(test)]
 				ref error_code,
 				#[cfg(test)]
@@ -1002,13 +1005,14 @@ impl Writeable for Event {
 				error_data.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, payment_hash, required),
-					(1, network_update, option),
+					(1, None::<NetworkUpdate>, option), // network_update in LDK versions prior to 0.0.114
 					(2, payment_failed_permanently, required),
-					(3, all_paths_failed, required),
+					(3, false, required), // all_paths_failed in LDK versions prior to 0.0.114
 					(5, *path, vec_type),
 					(7, short_channel_id, option),
 					(9, retry, option),
 					(11, payment_id, option),
+					(13, failure, required),
 				});
 			},
 			&Event::PendingHTLCsForwardable { time_forwardable: _ } => {
@@ -1221,27 +1225,27 @@ impl MaybeReadable for Event {
 					let mut payment_hash = PaymentHash([0; 32]);
 					let mut payment_failed_permanently = false;
 					let mut network_update = None;
-					let mut all_paths_failed = Some(true);
 					let mut path: Option<Vec<RouteHop>> = Some(vec![]);
 					let mut short_channel_id = None;
 					let mut retry = None;
 					let mut payment_id = None;
+					let mut failure_opt = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
-						(1, network_update, ignorable),
+						(1, network_update, upgradable_option),
 						(2, payment_failed_permanently, required),
-						(3, all_paths_failed, option),
 						(5, path, vec_type),
 						(7, short_channel_id, option),
 						(9, retry, option),
 						(11, payment_id, option),
+						(13, failure_opt, upgradable_option),
 					});
+					let failure = failure_opt.unwrap_or_else(|| PathFailure::OnPath { network_update });
 					Ok(Some(Event::PaymentPathFailed {
 						payment_id,
 						payment_hash,
 						payment_failed_permanently,
-						network_update,
-						all_paths_failed: all_paths_failed.unwrap(),
+						failure,
 						path: path.unwrap(),
 						short_channel_id,
 						retry,
@@ -1307,16 +1311,15 @@ impl MaybeReadable for Event {
 			9u8 => {
 				let f = || {
 					let mut channel_id = [0; 32];
-					let mut reason = None;
+					let mut reason = UpgradableRequired(None);
 					let mut user_channel_id_low_opt: Option<u64> = None;
 					let mut user_channel_id_high_opt: Option<u64> = None;
 					read_tlv_fields!(reader, {
 						(0, channel_id, required),
 						(1, user_channel_id_low_opt, option),
-						(2, reason, ignorable),
+						(2, reason, upgradable_required),
 						(3, user_channel_id_high_opt, option),
 					});
-					if reason.is_none() { return Ok(None); }
 
 					// `user_channel_id` used to be a single u64 value. In order to remain
 					// backwards compatible with versions prior to 0.0.113, the u128 is serialized
@@ -1324,7 +1327,7 @@ impl MaybeReadable for Event {
 					let user_channel_id = (user_channel_id_low_opt.unwrap_or(0) as u128) +
 						((user_channel_id_high_opt.unwrap_or(0) as u128) << 64);
 
-					Ok(Some(Event::ChannelClosed { channel_id, user_channel_id, reason: reason.unwrap() }))
+					Ok(Some(Event::ChannelClosed { channel_id, user_channel_id, reason: _init_tlv_based_struct_field!(reason, upgradable_required) }))
 				};
 				f()
 			},
@@ -1380,20 +1383,19 @@ impl MaybeReadable for Event {
 			19u8 => {
 				let f = || {
 					let mut payment_hash = PaymentHash([0; 32]);
-					let mut purpose = None;
+					let mut purpose = UpgradableRequired(None);
 					let mut amount_msat = 0;
 					let mut receiver_node_id = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
-						(2, purpose, ignorable),
+						(2, purpose, upgradable_required),
 						(4, amount_msat, required),
 					});
-					if purpose.is_none() { return Ok(None); }
 					Ok(Some(Event::PaymentClaimed {
 						receiver_node_id,
 						payment_hash,
-						purpose: purpose.unwrap(),
+						purpose: _init_tlv_based_struct_field!(purpose, upgradable_required),
 						amount_msat,
 					}))
 				};
@@ -1441,22 +1443,15 @@ impl MaybeReadable for Event {
 			25u8 => {
 				let f = || {
 					let mut prev_channel_id = [0; 32];
-					let mut failed_next_destination_opt = None;
+					let mut failed_next_destination_opt = UpgradableRequired(None);
 					read_tlv_fields!(reader, {
 						(0, prev_channel_id, required),
-						(2, failed_next_destination_opt, ignorable),
+						(2, failed_next_destination_opt, upgradable_required),
 					});
-					if let Some(failed_next_destination) = failed_next_destination_opt {
-						Ok(Some(Event::HTLCHandlingFailed {
-							prev_channel_id,
-							failed_next_destination,
-						}))
-					} else {
-						// If we fail to read a `failed_next_destination` assume it's because
-						// `MaybeReadable::read` returned `Ok(None)`, though it's also possible we
-						// were simply missing the field.
-						Ok(None)
-					}
+					Ok(Some(Event::HTLCHandlingFailed {
+						prev_channel_id,
+						failed_next_destination: _init_tlv_based_struct_field!(failed_next_destination_opt, upgradable_required),
+					}))
 				};
 				f()
 			},
@@ -1465,8 +1460,8 @@ impl MaybeReadable for Event {
 				let f = || {
 					let mut channel_id = [0; 32];
 					let mut user_channel_id: u128 = 0;
-					let mut counterparty_node_id = OptionDeserWrapper(None);
-					let mut channel_type = OptionDeserWrapper(None);
+					let mut counterparty_node_id = RequiredWrapper(None);
+					let mut channel_type = RequiredWrapper(None);
 					read_tlv_fields!(reader, {
 						(0, channel_id, required),
 						(2, user_channel_id, required),
@@ -1611,12 +1606,17 @@ pub enum MessageSendEvent {
 		/// The channel_announcement which should be sent.
 		msg: msgs::ChannelAnnouncement,
 		/// The followup channel_update which should be sent.
-		update_msg: msgs::ChannelUpdate,
+		update_msg: Option<msgs::ChannelUpdate>,
 	},
 	/// Used to indicate that a channel_update should be broadcast to all peers.
 	BroadcastChannelUpdate {
 		/// The channel_update which should be sent.
 		msg: msgs::ChannelUpdate,
+	},
+	/// Used to indicate that a node_announcement should be broadcast to all peers.
+	BroadcastNodeAnnouncement {
+		/// The node_announcement which should be sent.
+		msg: msgs::NodeAnnouncement,
 	},
 	/// Used to indicate that a channel_update should be sent to a single peer.
 	/// In contrast to [`Self::BroadcastChannelUpdate`], this is used when the channel is a

@@ -14,6 +14,8 @@ use std::sync::Condvar as StdCondvar;
 
 use crate::prelude::HashMap;
 
+use super::{LockTestExt, LockHeldState};
+
 #[cfg(feature = "backtrace")]
 use {crate::prelude::hash_map, backtrace::Backtrace, std::sync::Once};
 
@@ -73,24 +75,18 @@ struct LockDep {
 }
 
 #[cfg(feature = "backtrace")]
-fn get_construction_location(backtrace: &Backtrace) -> String {
+fn get_construction_location(backtrace: &Backtrace) -> (String, Option<u32>) {
 	// Find the first frame that is after `debug_sync` (or that is in our tests) and use
 	// that as the mutex construction site. Note that the first few frames may be in
 	// the `backtrace` crate, so we have to ignore those.
-	let sync_mutex_constr_regex = regex::Regex::new(r"lightning.*debug_sync.*new").unwrap();
+	let sync_mutex_constr_regex = regex::Regex::new(r"lightning.*debug_sync").unwrap();
 	let mut found_debug_sync = false;
 	for frame in backtrace.frames() {
 		for symbol in frame.symbols() {
 			let symbol_name = symbol.name().unwrap().as_str().unwrap();
 			if !sync_mutex_constr_regex.is_match(symbol_name) {
 				if found_debug_sync {
-					if let Some(col) = symbol.colno() {
-						return format!("{}:{}:{}", symbol.filename().unwrap().display(), symbol.lineno().unwrap(), col);
-					} else {
-						// Windows debug symbols don't support column numbers, so fall back to
-						// line numbers only if no `colno` is available
-						return format!("{}:{}", symbol.filename().unwrap().display(), symbol.lineno().unwrap());
-					}
+					return (format!("{}:{}", symbol.filename().unwrap().display(), symbol.lineno().unwrap()), symbol.colno());
 				}
 			} else { found_debug_sync = true; }
 		}
@@ -111,42 +107,51 @@ impl LockMetadata {
 
 		#[cfg(feature = "backtrace")]
 		{
-			let lock_constr_location = get_construction_location(&res._lock_construction_bt);
+			let (lock_constr_location, lock_constr_colno) =
+				get_construction_location(&res._lock_construction_bt);
 			LOCKS_INIT.call_once(|| { unsafe { LOCKS = Some(StdMutex::new(HashMap::new())); } });
 			let mut locks = unsafe { LOCKS.as_ref() }.unwrap().lock().unwrap();
 			match locks.entry(lock_constr_location) {
-				hash_map::Entry::Occupied(e) => return Arc::clone(e.get()),
+				hash_map::Entry::Occupied(e) => {
+					assert_eq!(lock_constr_colno,
+						get_construction_location(&e.get()._lock_construction_bt).1,
+						"Because Windows doesn't support column number results in backtraces, we cannot construct two mutexes on the same line or we risk lockorder detection false positives.");
+					return Arc::clone(e.get())
+				},
 				hash_map::Entry::Vacant(e) => { e.insert(Arc::clone(&res)); },
 			}
 		}
 		res
 	}
 
-	// Returns whether we were a recursive lock (only relevant for read)
-	fn _pre_lock(this: &Arc<LockMetadata>, read: bool) -> bool {
-		let mut inserted = false;
+	fn pre_lock(this: &Arc<LockMetadata>, _double_lock_self_allowed: bool) {
 		LOCKS_HELD.with(|held| {
 			// For each lock which is currently locked, check that no lock's locked-before
 			// set includes the lock we're about to lock, which would imply a lockorder
 			// inversion.
 			for (locked_idx, _locked) in held.borrow().iter() {
-				if read && *locked_idx == this.lock_idx {
-					// Recursive read locks are explicitly allowed
-					return;
+				if *locked_idx == this.lock_idx {
+					// Note that with `feature = "backtrace"` set, we may be looking at different
+					// instances of the same lock. Still, doing so is quite risky, a total order
+					// must be maintained, and doing so across a set of otherwise-identical mutexes
+					// is fraught with issues.
+					#[cfg(feature = "backtrace")]
+					debug_assert!(_double_lock_self_allowed,
+						"Tried to acquire a lock while it was held!\nLock constructed at {}",
+						get_construction_location(&this._lock_construction_bt).0);
+					#[cfg(not(feature = "backtrace"))]
+					panic!("Tried to acquire a lock while it was held!");
 				}
 			}
-			for (locked_idx, locked) in held.borrow().iter() {
-				if !read && *locked_idx == this.lock_idx {
-					// With `feature = "backtrace"` set, we may be looking at different instances
-					// of the same lock.
-					debug_assert!(cfg!(feature = "backtrace"), "Tried to acquire a lock while it was held!");
-				}
+			for (_locked_idx, locked) in held.borrow().iter() {
 				for (locked_dep_idx, _locked_dep) in locked.locked_before.lock().unwrap().iter() {
 					if *locked_dep_idx == this.lock_idx && *locked_dep_idx != locked.lock_idx {
 						#[cfg(feature = "backtrace")]
 						panic!("Tried to violate existing lockorder.\nMutex that should be locked after the current lock was created at the following backtrace.\nNote that to get a backtrace for the lockorder violation, you should set RUST_BACKTRACE=1\nLock being taken constructed at: {} ({}):\n{:?}\nLock constructed at: {} ({})\n{:?}\n\nLock dep created at:\n{:?}\n\n",
-							get_construction_location(&this._lock_construction_bt), this.lock_idx, this._lock_construction_bt,
-							get_construction_location(&locked._lock_construction_bt), locked.lock_idx, locked._lock_construction_bt,
+							get_construction_location(&this._lock_construction_bt).0,
+							this.lock_idx, this._lock_construction_bt,
+							get_construction_location(&locked._lock_construction_bt).0,
+							locked.lock_idx, locked._lock_construction_bt,
 							_locked_dep._lockdep_trace);
 						#[cfg(not(feature = "backtrace"))]
 						panic!("Tried to violate existing lockorder. Build with the backtrace feature for more info.");
@@ -160,13 +165,20 @@ impl LockMetadata {
 				}
 			}
 			held.borrow_mut().insert(this.lock_idx, Arc::clone(this));
-			inserted = true;
 		});
-		inserted
 	}
 
-	fn pre_lock(this: &Arc<LockMetadata>) { Self::_pre_lock(this, false); }
-	fn pre_read_lock(this: &Arc<LockMetadata>) -> bool { Self::_pre_lock(this, true) }
+	fn held_by_thread(this: &Arc<LockMetadata>) -> LockHeldState {
+		let mut res = LockHeldState::NotHeldByThread;
+		LOCKS_HELD.with(|held| {
+			for (locked_idx, _locked) in held.borrow().iter() {
+				if *locked_idx == this.lock_idx {
+					res = LockHeldState::HeldByThread;
+				}
+			}
+		});
+		res
+	}
 
 	fn try_locked(this: &Arc<LockMetadata>) {
 		LOCKS_HELD.with(|held| {
@@ -188,6 +200,11 @@ impl LockMetadata {
 pub struct Mutex<T: Sized> {
 	inner: StdMutex<T>,
 	deps: Arc<LockMetadata>,
+}
+impl<T: Sized> Mutex<T> {
+	pub(crate) fn into_inner(self) -> LockResult<T> {
+		self.inner.into_inner().map_err(|_| ())
+	}
 }
 
 #[must_use = "if unused the Mutex will immediately unlock"]
@@ -235,7 +252,7 @@ impl<T> Mutex<T> {
 	}
 
 	pub fn lock<'a>(&'a self) -> LockResult<MutexGuard<'a, T>> {
-		LockMetadata::pre_lock(&self.deps);
+		LockMetadata::pre_lock(&self.deps, false);
 		self.inner.lock().map(|lock| MutexGuard { mutex: self, lock }).map_err(|_| ())
 	}
 
@@ -248,6 +265,19 @@ impl<T> Mutex<T> {
 	}
 }
 
+impl<'a, T: 'a> LockTestExt<'a> for Mutex<T> {
+	#[inline]
+	fn held_by_thread(&self) -> LockHeldState {
+		LockMetadata::held_by_thread(&self.deps)
+	}
+	type ExclLock = MutexGuard<'a, T>;
+	#[inline]
+	fn unsafe_well_ordered_double_lock_self(&'a self) -> MutexGuard<T> {
+		LockMetadata::pre_lock(&self.deps, true);
+		self.inner.lock().map(|lock| MutexGuard { mutex: self, lock }).unwrap()
+	}
+}
+
 pub struct RwLock<T: Sized> {
 	inner: StdRwLock<T>,
 	deps: Arc<LockMetadata>,
@@ -255,7 +285,6 @@ pub struct RwLock<T: Sized> {
 
 pub struct RwLockReadGuard<'a, T: Sized + 'a> {
 	lock: &'a RwLock<T>,
-	first_lock: bool,
 	guard: StdRwLockReadGuard<'a, T>,
 }
 
@@ -274,12 +303,6 @@ impl<T: Sized> Deref for RwLockReadGuard<'_, T> {
 
 impl<T: Sized> Drop for RwLockReadGuard<'_, T> {
 	fn drop(&mut self) {
-		if !self.first_lock {
-			// Note that its not strictly true that the first taken read lock will get unlocked
-			// last, but in practice our locks are always taken as RAII, so it should basically
-			// always be true.
-			return;
-		}
 		LOCKS_HELD.with(|held| {
 			held.borrow_mut().remove(&self.lock.deps.lock_idx);
 		});
@@ -314,12 +337,16 @@ impl<T> RwLock<T> {
 	}
 
 	pub fn read<'a>(&'a self) -> LockResult<RwLockReadGuard<'a, T>> {
-		let first_lock = LockMetadata::pre_read_lock(&self.deps);
-		self.inner.read().map(|guard| RwLockReadGuard { lock: self, guard, first_lock }).map_err(|_| ())
+		// Note that while we could be taking a recursive read lock here, Rust's `RwLock` may
+		// deadlock trying to take a second read lock if another thread is waiting on the write
+		// lock. This behavior is platform dependent, but our in-tree `FairRwLock` guarantees
+		// such a deadlock.
+		LockMetadata::pre_lock(&self.deps, false);
+		self.inner.read().map(|guard| RwLockReadGuard { lock: self, guard }).map_err(|_| ())
 	}
 
 	pub fn write<'a>(&'a self) -> LockResult<RwLockWriteGuard<'a, T>> {
-		LockMetadata::pre_lock(&self.deps);
+		LockMetadata::pre_lock(&self.deps, false);
 		self.inner.write().map(|guard| RwLockWriteGuard { lock: self, guard }).map_err(|_| ())
 	}
 
@@ -332,101 +359,17 @@ impl<T> RwLock<T> {
 	}
 }
 
-pub type FairRwLock<T> = RwLock<T>;
-
-mod tests {
-	use super::{RwLock, Mutex};
-
-	#[test]
-	#[should_panic]
-	#[cfg(not(feature = "backtrace"))]
-	fn recursive_lock_fail() {
-		let mutex = Mutex::new(());
-		let _a = mutex.lock().unwrap();
-		let _b = mutex.lock().unwrap();
+impl<'a, T: 'a> LockTestExt<'a> for RwLock<T> {
+	#[inline]
+	fn held_by_thread(&self) -> LockHeldState {
+		LockMetadata::held_by_thread(&self.deps)
 	}
-
-	#[test]
-	fn recursive_read() {
-		let lock = RwLock::new(());
-		let _a = lock.read().unwrap();
-		let _b = lock.read().unwrap();
-	}
-
-	#[test]
-	#[should_panic]
-	fn lockorder_fail() {
-		let a = Mutex::new(());
-		let b = Mutex::new(());
-		{
-			let _a = a.lock().unwrap();
-			let _b = b.lock().unwrap();
-		}
-		{
-			let _b = b.lock().unwrap();
-			let _a = a.lock().unwrap();
-		}
-	}
-
-	#[test]
-	#[should_panic]
-	fn write_lockorder_fail() {
-		let a = RwLock::new(());
-		let b = RwLock::new(());
-		{
-			let _a = a.write().unwrap();
-			let _b = b.write().unwrap();
-		}
-		{
-			let _b = b.write().unwrap();
-			let _a = a.write().unwrap();
-		}
-	}
-
-	#[test]
-	#[should_panic]
-	fn read_lockorder_fail() {
-		let a = RwLock::new(());
-		let b = RwLock::new(());
-		{
-			let _a = a.read().unwrap();
-			let _b = b.read().unwrap();
-		}
-		{
-			let _b = b.read().unwrap();
-			let _a = a.read().unwrap();
-		}
-	}
-
-	#[test]
-	fn read_recursive_no_lockorder() {
-		// Like the above, but note that no lockorder is implied when we recursively read-lock a
-		// RwLock, causing this to pass just fine.
-		let a = RwLock::new(());
-		let b = RwLock::new(());
-		let _outer = a.read().unwrap();
-		{
-			let _a = a.read().unwrap();
-			let _b = b.read().unwrap();
-		}
-		{
-			let _b = b.read().unwrap();
-			let _a = a.read().unwrap();
-		}
-	}
-
-	#[test]
-	#[should_panic]
-	fn read_write_lockorder_fail() {
-		let a = RwLock::new(());
-		let b = RwLock::new(());
-		{
-			let _a = a.write().unwrap();
-			let _b = b.read().unwrap();
-		}
-		{
-			let _b = b.read().unwrap();
-			let _a = a.write().unwrap();
-		}
+	type ExclLock = RwLockWriteGuard<'a, T>;
+	#[inline]
+	fn unsafe_well_ordered_double_lock_self(&'a self) -> RwLockWriteGuard<'a, T> {
+		LockMetadata::pre_lock(&self.deps, true);
+		self.inner.write().map(|guard| RwLockWriteGuard { lock: self, guard }).unwrap()
 	}
 }
+
+pub type FairRwLock<T> = RwLock<T>;

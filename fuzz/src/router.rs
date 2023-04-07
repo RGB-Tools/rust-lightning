@@ -11,24 +11,24 @@ use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::TxOut;
 use bitcoin::hash_types::BlockHash;
 
-use lightning::chain;
 use lightning::chain::transaction::OutPoint;
 use lightning::ln::channelmanager::{self, ChannelDetails, ChannelCounterparty};
 use lightning::ln::msgs;
 use lightning::routing::gossip::{NetworkGraph, RoutingFees};
+use lightning::routing::utxo::{UtxoFuture, UtxoLookup, UtxoLookupError, UtxoResult};
 use lightning::routing::router::{find_route, PaymentParameters, RouteHint, RouteHintHop, RouteParameters};
-use lightning::routing::scoring::FixedPenaltyScorer;
+use lightning::routing::scoring::ProbabilisticScorer;
+use lightning::util::config::UserConfig;
 use lightning::util::ser::Readable;
 
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::network::constants::Network;
-use bitcoin::blockdata::constants::genesis_block;
 
 use crate::utils::test_logger;
 
 use std::convert::TryInto;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -80,17 +80,36 @@ impl InputData {
 	}
 }
 
-struct FuzzChainSource {
+struct FuzzChainSource<'a, 'b, Out: test_logger::Output> {
 	input: Arc<InputData>,
+	net_graph: &'a NetworkGraph<&'b test_logger::TestLogger<Out>>,
 }
-impl chain::Access for FuzzChainSource {
-	fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> Result<TxOut, chain::AccessError> {
-		match self.input.get_slice(2) {
-			Some(&[0, _]) => Err(chain::AccessError::UnknownChain),
-			Some(&[1, _]) => Err(chain::AccessError::UnknownTx),
-			Some(&[_, x]) => Ok(TxOut { value: 0, script_pubkey: Builder::new().push_int(x as i64).into_script().to_v0_p2wsh() }),
-			None => Err(chain::AccessError::UnknownTx),
-			_ => unreachable!(),
+impl<Out: test_logger::Output> UtxoLookup for FuzzChainSource<'_, '_, Out> {
+	fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
+		let input_slice = self.input.get_slice(2);
+		if input_slice.is_none() { return UtxoResult::Sync(Err(UtxoLookupError::UnknownTx)); }
+		let input_slice = input_slice.unwrap();
+		let txo_res = TxOut {
+			value: if input_slice[0] % 2 == 0 { 1_000_000 } else { 1_000 },
+			script_pubkey: Builder::new().push_int(input_slice[1] as i64).into_script().to_v0_p2wsh(),
+		};
+		match input_slice {
+			&[0, _] => UtxoResult::Sync(Err(UtxoLookupError::UnknownChain)),
+			&[1, _] => UtxoResult::Sync(Err(UtxoLookupError::UnknownTx)),
+			&[2, _] => {
+				let future = UtxoFuture::new();
+				future.resolve_without_forwarding(self.net_graph, Ok(txo_res));
+				UtxoResult::Async(future.clone())
+			},
+			&[3, _] => {
+				let future = UtxoFuture::new();
+				future.resolve_without_forwarding(self.net_graph, Err(UtxoLookupError::UnknownTx));
+				UtxoResult::Async(future.clone())
+			},
+			&[4, _] => {
+				UtxoResult::Async(UtxoFuture::new()) // the future will never resolve
+			},
+			&[..] => UtxoResult::Sync(Ok(txo_res)),
 		}
 	}
 }
@@ -148,6 +167,15 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 		}
 	}
 
+	macro_rules! get_pubkey_from_node_id {
+		($node_id: expr ) => {
+			match PublicKey::from_slice($node_id.as_slice()) {
+				Ok(pk) => pk,
+				Err(_) => return,
+			}
+		}
+	}
+
 	macro_rules! get_pubkey {
 		() => {
 			match PublicKey::from_slice(get_slice!(33)) {
@@ -160,7 +188,11 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 	let logger = test_logger::TestLogger::new("".to_owned(), out);
 
 	let our_pubkey = get_pubkey!();
-	let net_graph = NetworkGraph::new(genesis_block(Network::Bitcoin).header.block_hash(), &logger);
+	let net_graph = NetworkGraph::new(Network::Bitcoin, &logger);
+	let chain_source = FuzzChainSource {
+		input: Arc::clone(&input),
+		net_graph: &net_graph,
+	};
 
 	let mut node_pks = HashSet::new();
 	let mut scid = 42;
@@ -174,20 +206,21 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 					return;
 				}
 				let msg = decode_msg_with_len16!(msgs::UnsignedNodeAnnouncement, 288);
-				node_pks.insert(msg.node_id);
+				node_pks.insert(get_pubkey_from_node_id!(msg.node_id));
 				let _ = net_graph.update_node_from_unsigned_announcement(&msg);
 			},
 			1 => {
 				let msg = decode_msg_with_len16!(msgs::UnsignedChannelAnnouncement, 32+8+33*4);
-				node_pks.insert(msg.node_id_1);
-				node_pks.insert(msg.node_id_2);
-				let _ = net_graph.update_channel_from_unsigned_announcement::<&FuzzChainSource>(&msg, &None);
+				node_pks.insert(get_pubkey_from_node_id!(msg.node_id_1));
+				node_pks.insert(get_pubkey_from_node_id!(msg.node_id_2));
+				let _ = net_graph.update_channel_from_unsigned_announcement::
+					<&FuzzChainSource<'_, '_, Out>>(&msg, &None);
 			},
 			2 => {
 				let msg = decode_msg_with_len16!(msgs::UnsignedChannelAnnouncement, 32+8+33*4);
-				node_pks.insert(msg.node_id_1);
-				node_pks.insert(msg.node_id_2);
-				let _ = net_graph.update_channel_from_unsigned_announcement(&msg, &Some(&FuzzChainSource { input: Arc::clone(&input) }));
+				node_pks.insert(get_pubkey_from_node_id!(msg.node_id_1));
+				node_pks.insert(get_pubkey_from_node_id!(msg.node_id_2));
+				let _ = net_graph.update_channel_from_unsigned_announcement(&msg, &Some(&chain_source));
 			},
 			3 => {
 				let _ = net_graph.update_channel_unsigned(&decode_msg!(msgs::UnsignedChannelUpdate, 72));
@@ -210,7 +243,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 								channel_id: [0; 32],
 								counterparty: ChannelCounterparty {
 									node_id: *rnid,
-									features: channelmanager::provided_init_features(),
+									features: channelmanager::provided_init_features(&UserConfig::default()),
 									unspendable_punishment_reserve: 0,
 									forwarding_info: None,
 									outbound_htlc_minimum_msat: None,
@@ -259,13 +292,15 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 						}]));
 					}
 				}
-				let scorer = FixedPenaltyScorer::with_penalty(0);
+				let scorer = ProbabilisticScorer::new(Default::default(), &net_graph, &logger);
 				let random_seed_bytes: [u8; 32] = [get_slice!(1)[0]; 32];
 				for target in node_pks.iter() {
+					let final_value_msat = slice_to_be64(get_slice!(8));
+					let final_cltv_expiry_delta = slice_to_be32(get_slice!(4));
 					let route_params = RouteParameters {
-						payment_params: PaymentParameters::from_node_id(*target).with_route_hints(last_hops.clone()),
-						final_value_msat: slice_to_be64(get_slice!(8)),
-						final_cltv_expiry_delta: slice_to_be32(get_slice!(4)),
+						payment_params: PaymentParameters::from_node_id(*target, final_cltv_expiry_delta)
+							.with_route_hints(last_hops.clone()),
+						final_value_msat,
 					};
 					let _ = find_route(&our_pubkey, &route_params, &net_graph,
 						first_hops.map(|c| c.iter().collect::<Vec<_>>()).as_ref().map(|a| a.as_slice()),

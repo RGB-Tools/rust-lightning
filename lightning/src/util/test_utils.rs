@@ -20,8 +20,13 @@ use crate::chain::keysinterface;
 use crate::ln::channelmanager;
 use crate::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use crate::ln::{msgs, wire};
+use crate::ln::msgs::LightningError;
 use crate::ln::script::ShutdownScript;
-use crate::routing::scoring::FixedPenaltyScorer;
+use crate::routing::gossip::{EffectiveCapacity, NetworkGraph, NodeId};
+use crate::routing::utxo::{UtxoLookup, UtxoLookupError, UtxoResult};
+use crate::routing::router::{find_route, InFlightHtlcs, Route, RouteHop, RouteParameters, Router, ScorerAccountingForInFlightHtlcs};
+use crate::routing::scoring::{ChannelUsage, Score};
+use crate::util::config::UserConfig;
 use crate::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
 use crate::util::events;
 use crate::util::logger::{Logger, Level, Record};
@@ -43,12 +48,13 @@ use regex;
 
 use crate::io;
 use crate::prelude::*;
+use core::cell::RefCell;
 use core::time::Duration;
 use crate::sync::{Mutex, Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::mem;
 use bitcoin::bech32::u5;
-use crate::chain::keysinterface::{InMemorySigner, Recipient, KeyMaterial};
+use crate::chain::keysinterface::{InMemorySigner, Recipient, EntropySource, NodeSigner, SignerProvider};
 
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,22 +77,91 @@ impl chaininterface::FeeEstimator for TestFeeEstimator {
 	}
 }
 
+pub struct TestRouter<'a> {
+	pub network_graph: Arc<NetworkGraph<&'a TestLogger>>,
+	pub next_routes: Mutex<VecDeque<(RouteParameters, Result<Route, LightningError>)>>,
+	pub scorer: &'a Mutex<TestScorer>,
+}
+
+impl<'a> TestRouter<'a> {
+	pub fn new(network_graph: Arc<NetworkGraph<&'a TestLogger>>, scorer: &'a Mutex<TestScorer>) -> Self {
+		Self { network_graph, next_routes: Mutex::new(VecDeque::new()), scorer }
+	}
+
+	pub fn expect_find_route(&self, query: RouteParameters, result: Result<Route, LightningError>) {
+		let mut expected_routes = self.next_routes.lock().unwrap();
+		expected_routes.push_back((query, result));
+	}
+}
+
+impl<'a> Router for TestRouter<'a> {
+	fn find_route(
+		&self, payer: &PublicKey, params: &RouteParameters, first_hops: Option<&[&channelmanager::ChannelDetails]>,
+		inflight_htlcs: &InFlightHtlcs
+	) -> Result<Route, msgs::LightningError> {
+		if let Some((find_route_query, find_route_res)) = self.next_routes.lock().unwrap().pop_front() {
+			assert_eq!(find_route_query, *params);
+			if let Ok(ref route) = find_route_res {
+				let locked_scorer = self.scorer.lock().unwrap();
+				let scorer = ScorerAccountingForInFlightHtlcs::new(locked_scorer, inflight_htlcs);
+				for path in &route.paths {
+					let mut aggregate_msat = 0u64;
+					for (idx, hop) in path.iter().rev().enumerate() {
+						aggregate_msat += hop.fee_msat;
+						let usage = ChannelUsage {
+							amount_msat: aggregate_msat,
+							inflight_htlc_msat: 0,
+							effective_capacity: EffectiveCapacity::Unknown,
+						};
+
+						// Since the path is reversed, the last element in our iteration is the first
+						// hop.
+						if idx == path.len() - 1 {
+							scorer.channel_penalty_msat(hop.short_channel_id, &NodeId::from_pubkey(payer), &NodeId::from_pubkey(&hop.pubkey), usage);
+						} else {
+							let curr_hop_path_idx = path.len() - 1 - idx;
+							scorer.channel_penalty_msat(hop.short_channel_id, &NodeId::from_pubkey(&path[curr_hop_path_idx - 1].pubkey), &NodeId::from_pubkey(&hop.pubkey), usage);
+						}
+					}
+				}
+			}
+			return find_route_res;
+		}
+		let logger = TestLogger::new();
+		let scorer = self.scorer.lock().unwrap();
+		find_route(
+			payer, params, &self.network_graph, first_hops, &logger,
+			&ScorerAccountingForInFlightHtlcs::new(scorer, &inflight_htlcs),
+			&[42; 32]
+		)
+	}
+}
+
+impl<'a> Drop for TestRouter<'a> {
+	fn drop(&mut self) {
+		#[cfg(feature = "std")] {
+			if std::thread::panicking() {
+				return;
+			}
+		}
+		assert!(self.next_routes.lock().unwrap().is_empty());
+	}
+}
+
 pub struct OnlyReadsKeysInterface {}
-impl keysinterface::KeysInterface for OnlyReadsKeysInterface {
+
+impl EntropySource for OnlyReadsKeysInterface {
+	fn get_secure_random_bytes(&self) -> [u8; 32] { [0; 32] }}
+
+impl SignerProvider for OnlyReadsKeysInterface {
 	type Signer = EnforcingSigner;
 
-	fn get_node_secret(&self, _recipient: Recipient) -> Result<SecretKey, ()> { unreachable!(); }
-	fn ecdh(&self, _recipient: Recipient, _other_key: &PublicKey, _tweak: Option<&Scalar>) -> Result<SharedSecret, ()> { unreachable!(); }
-	fn get_inbound_payment_key_material(&self) -> KeyMaterial { unreachable!(); }
-	fn get_destination_script(&self) -> Script { unreachable!(); }
-	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript { unreachable!(); }
 	fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] { unreachable!(); }
+
 	fn derive_channel_signer(&self, _channel_value_satoshis: u64, _channel_keys_id: [u8; 32]) -> Self::Signer { unreachable!(); }
-	fn get_secure_random_bytes(&self) -> [u8; 32] { [0; 32] }
 
 	fn read_chan_signer(&self, mut reader: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
-		let dummy_sk = SecretKey::from_slice(&[42; 32]).unwrap();
-		let inner: InMemorySigner = ReadableArgs::read(&mut reader, dummy_sk)?;
+		let inner: InMemorySigner = Readable::read(&mut reader)?;
 		let state = Arc::new(Mutex::new(EnforcementState::new()));
 
 		Ok(EnforcingSigner::new_with_revoked(
@@ -95,7 +170,9 @@ impl keysinterface::KeysInterface for OnlyReadsKeysInterface {
 			false
 		))
 	}
-	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> { unreachable!(); }
+
+	fn get_destination_script(&self) -> Script { unreachable!(); }
+	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript { unreachable!(); }
 }
 
 pub struct TestChainMonitor<'a> {
@@ -133,7 +210,7 @@ impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
 		let mut w = TestVecWriter(Vec::new());
 		monitor.write(&mut w).unwrap();
 		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
-			&mut io::Cursor::new(&w.0), self.keys_manager).unwrap().1;
+			&mut io::Cursor::new(&w.0), (self.keys_manager, self.keys_manager)).unwrap().1;
 		assert!(new_monitor == monitor);
 		self.latest_monitor_update_id.lock().unwrap().insert(funding_txo.to_channel_id(),
 			(funding_txo, monitor.get_latest_update_id(), MonitorUpdateId::from_new_monitor(&monitor)));
@@ -141,12 +218,12 @@ impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
 		self.chain_monitor.watch_channel(funding_txo, new_monitor)
 	}
 
-	fn update_channel(&self, funding_txo: OutPoint, update: channelmonitor::ChannelMonitorUpdate) -> chain::ChannelMonitorUpdateStatus {
+	fn update_channel(&self, funding_txo: OutPoint, update: &channelmonitor::ChannelMonitorUpdate) -> chain::ChannelMonitorUpdateStatus {
 		// Every monitor update should survive roundtrip
 		let mut w = TestVecWriter(Vec::new());
 		update.write(&mut w).unwrap();
 		assert!(channelmonitor::ChannelMonitorUpdate::read(
-				&mut io::Cursor::new(&w.0)).unwrap() == update);
+				&mut io::Cursor::new(&w.0)).unwrap() == *update);
 
 		self.monitor_updates.lock().unwrap().entry(funding_txo.to_channel_id()).or_insert(Vec::new()).push(update.clone());
 
@@ -159,7 +236,7 @@ impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
 		}
 
 		self.latest_monitor_update_id.lock().unwrap().insert(funding_txo.to_channel_id(),
-			(funding_txo, update.update_id, MonitorUpdateId::from_monitor_update(&update)));
+			(funding_txo, update.update_id, MonitorUpdateId::from_monitor_update(update)));
 		let update_res = self.chain_monitor.update_channel(funding_txo, update);
 		// At every point where we get a monitor update, we should be able to send a useful monitor
 		// to a watchtower and disk...
@@ -167,7 +244,7 @@ impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
 		w.0.clear();
 		monitor.write(&mut w).unwrap();
 		let new_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::read(
-			&mut io::Cursor::new(&w.0), self.keys_manager).unwrap().1;
+			&mut io::Cursor::new(&w.0), (self.keys_manager, self.keys_manager)).unwrap().1;
 		assert!(new_monitor == *monitor);
 		self.added_monitors.lock().unwrap().push((funding_txo, new_monitor));
 		update_res
@@ -179,10 +256,9 @@ impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
 }
 
 pub struct TestPersister {
-	pub update_ret: Mutex<chain::ChannelMonitorUpdateStatus>,
-	/// If this is set to Some(), after the next return, we'll always return this until update_ret
-	/// is changed:
-	pub next_update_ret: Mutex<Option<chain::ChannelMonitorUpdateStatus>>,
+	/// The queue of update statuses we'll return. If none are queued, ::Completed will always be
+	/// returned.
+	pub update_rets: Mutex<VecDeque<chain::ChannelMonitorUpdateStatus>>,
 	/// When we get an update_persisted_channel call with no ChannelMonitorUpdate, we insert the
 	/// MonitorUpdateId here.
 	pub chain_sync_monitor_persistences: Mutex<HashMap<OutPoint, HashSet<MonitorUpdateId>>>,
@@ -193,34 +269,29 @@ pub struct TestPersister {
 impl TestPersister {
 	pub fn new() -> Self {
 		Self {
-			update_ret: Mutex::new(chain::ChannelMonitorUpdateStatus::Completed),
-			next_update_ret: Mutex::new(None),
+			update_rets: Mutex::new(VecDeque::new()),
 			chain_sync_monitor_persistences: Mutex::new(HashMap::new()),
 			offchain_monitor_updates: Mutex::new(HashMap::new()),
 		}
 	}
 
-	pub fn set_update_ret(&self, ret: chain::ChannelMonitorUpdateStatus) {
-		*self.update_ret.lock().unwrap() = ret;
-	}
-
-	pub fn set_next_update_ret(&self, next_ret: Option<chain::ChannelMonitorUpdateStatus>) {
-		*self.next_update_ret.lock().unwrap() = next_ret;
+	/// Queue an update status to return.
+	pub fn set_update_ret(&self, next_ret: chain::ChannelMonitorUpdateStatus) {
+		self.update_rets.lock().unwrap().push_back(next_ret);
 	}
 }
-impl<Signer: keysinterface::Sign> chainmonitor::Persist<Signer> for TestPersister {
+impl<Signer: keysinterface::WriteableEcdsaChannelSigner> chainmonitor::Persist<Signer> for TestPersister {
 	fn persist_new_channel(&self, _funding_txo: OutPoint, _data: &channelmonitor::ChannelMonitor<Signer>, _id: MonitorUpdateId) -> chain::ChannelMonitorUpdateStatus {
-		let ret = self.update_ret.lock().unwrap().clone();
-		if let Some(next_ret) = self.next_update_ret.lock().unwrap().take() {
-			*self.update_ret.lock().unwrap() = next_ret;
+		if let Some(update_ret) = self.update_rets.lock().unwrap().pop_front() {
+			return update_ret
 		}
-		ret
+		chain::ChannelMonitorUpdateStatus::Completed
 	}
 
-	fn update_persisted_channel(&self, funding_txo: OutPoint, update: &Option<channelmonitor::ChannelMonitorUpdate>, _data: &channelmonitor::ChannelMonitor<Signer>, update_id: MonitorUpdateId) -> chain::ChannelMonitorUpdateStatus {
-		let ret = self.update_ret.lock().unwrap().clone();
-		if let Some(next_ret) = self.next_update_ret.lock().unwrap().take() {
-			*self.update_ret.lock().unwrap() = next_ret;
+	fn update_persisted_channel(&self, funding_txo: OutPoint, update: Option<&channelmonitor::ChannelMonitorUpdate>, _data: &channelmonitor::ChannelMonitor<Signer>, update_id: MonitorUpdateId) -> chain::ChannelMonitorUpdateStatus {
+		let mut ret = chain::ChannelMonitorUpdateStatus::Completed;
+		if let Some(update_ret) = self.update_rets.lock().unwrap().pop_front() {
+			ret = update_ret;
 		}
 		if update.is_none() {
 			self.chain_sync_monitor_persistences.lock().unwrap().entry(funding_txo).or_insert(HashSet::new()).insert(update_id);
@@ -260,6 +331,7 @@ impl chaininterface::BroadcasterInterface for TestBroadcaster {
 pub struct TestChannelMessageHandler {
 	pub pending_events: Mutex<Vec<events::MessageSendEvent>>,
 	expected_recv_msgs: Mutex<Option<Vec<wire::Message<()>>>>,
+	connected_peers: Mutex<HashSet<PublicKey>>,
 }
 
 impl TestChannelMessageHandler {
@@ -267,6 +339,7 @@ impl TestChannelMessageHandler {
 		TestChannelMessageHandler {
 			pending_events: Mutex::new(Vec::new()),
 			expected_recv_msgs: Mutex::new(None),
+			connected_peers: Mutex::new(HashSet::new()),
 		}
 	}
 
@@ -300,10 +373,10 @@ impl Drop for TestChannelMessageHandler {
 }
 
 impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
-	fn handle_open_channel(&self, _their_node_id: &PublicKey, _their_features: InitFeatures, msg: &msgs::OpenChannel) {
+	fn handle_open_channel(&self, _their_node_id: &PublicKey, msg: &msgs::OpenChannel) {
 		self.received_msg(wire::Message::OpenChannel(msg.clone()));
 	}
-	fn handle_accept_channel(&self, _their_node_id: &PublicKey, _their_features: InitFeatures, msg: &msgs::AcceptChannel) {
+	fn handle_accept_channel(&self, _their_node_id: &PublicKey, msg: &msgs::AcceptChannel) {
 		self.received_msg(wire::Message::AcceptChannel(msg.clone()));
 	}
 	fn handle_funding_created(&self, _their_node_id: &PublicKey, msg: &msgs::FundingCreated) {
@@ -315,7 +388,7 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_channel_ready(&self, _their_node_id: &PublicKey, msg: &msgs::ChannelReady) {
 		self.received_msg(wire::Message::ChannelReady(msg.clone()));
 	}
-	fn handle_shutdown(&self, _their_node_id: &PublicKey, _their_features: &InitFeatures, msg: &msgs::Shutdown) {
+	fn handle_shutdown(&self, _their_node_id: &PublicKey, msg: &msgs::Shutdown) {
 		self.received_msg(wire::Message::Shutdown(msg.clone()));
 	}
 	fn handle_closing_signed(&self, _their_node_id: &PublicKey, msg: &msgs::ClosingSigned) {
@@ -351,8 +424,11 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_channel_reestablish(&self, _their_node_id: &PublicKey, msg: &msgs::ChannelReestablish) {
 		self.received_msg(wire::Message::ChannelReestablish(msg.clone()));
 	}
-	fn peer_disconnected(&self, _their_node_id: &PublicKey, _no_connection_possible: bool) {}
-	fn peer_connected(&self, _their_node_id: &PublicKey, _msg: &msgs::Init) -> Result<(), ()> {
+	fn peer_disconnected(&self, their_node_id: &PublicKey) {
+		assert!(self.connected_peers.lock().unwrap().remove(their_node_id));
+	}
+	fn peer_connected(&self, their_node_id: &PublicKey, _msg: &msgs::Init, _inbound: bool) -> Result<(), ()> {
+		assert!(self.connected_peers.lock().unwrap().insert(their_node_id.clone()));
 		// Don't bother with `received_msg` for Init as its auto-generated and we don't want to
 		// bother re-generating the expected Init message in all tests.
 		Ok(())
@@ -361,10 +437,10 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 		self.received_msg(wire::Message::Error(msg.clone()));
 	}
 	fn provided_node_features(&self) -> NodeFeatures {
-		channelmanager::provided_node_features()
+		channelmanager::provided_node_features(&UserConfig::default())
 	}
 	fn provided_init_features(&self, _their_init_features: &PublicKey) -> InitFeatures {
-		channelmanager::provided_init_features()
+		channelmanager::provided_init_features(&UserConfig::default())
 	}
 }
 
@@ -389,10 +465,10 @@ fn get_dummy_channel_announcement(short_chan_id: u64) -> msgs::ChannelAnnounceme
 		features: ChannelFeatures::empty(),
 		chain_hash: genesis_block(network).header.block_hash(),
 		short_channel_id: short_chan_id,
-		node_id_1: PublicKey::from_secret_key(&secp_ctx, &node_1_privkey),
-		node_id_2: PublicKey::from_secret_key(&secp_ctx, &node_2_privkey),
-		bitcoin_key_1: PublicKey::from_secret_key(&secp_ctx, &node_1_btckey),
-		bitcoin_key_2: PublicKey::from_secret_key(&secp_ctx, &node_2_btckey),
+		node_id_1: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_1_privkey)),
+		node_id_2: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_2_privkey)),
+		bitcoin_key_1: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_1_btckey)),
+		bitcoin_key_2: NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_2_btckey)),
 		excess_data: Vec::new(),
 	};
 
@@ -464,11 +540,11 @@ impl msgs::RoutingMessageHandler for TestRoutingMessageHandler {
 		Some((chan_ann, Some(chan_upd_1), Some(chan_upd_2)))
 	}
 
-	fn get_next_node_announcement(&self, _starting_point: Option<&PublicKey>) -> Option<msgs::NodeAnnouncement> {
+	fn get_next_node_announcement(&self, _starting_point: Option<&NodeId>) -> Option<msgs::NodeAnnouncement> {
 		None
 	}
 
-	fn peer_connected(&self, their_node_id: &PublicKey, init_msg: &msgs::Init) -> Result<(), ()> {
+	fn peer_connected(&self, their_node_id: &PublicKey, init_msg: &msgs::Init, _inbound: bool) -> Result<(), ()> {
 		if !init_msg.features.supports_gossip_queries() {
 			return Ok(());
 		}
@@ -524,6 +600,8 @@ impl msgs::RoutingMessageHandler for TestRoutingMessageHandler {
 		features.set_gossip_queries_optional();
 		features
 	}
+
+	fn processing_queue_high(&self) -> bool { false }
 }
 
 impl events::MessageSendEventsProvider for TestRoutingMessageHandler {
@@ -595,6 +673,49 @@ impl Logger for TestLogger {
 	}
 }
 
+pub struct TestNodeSigner {
+	node_secret: SecretKey,
+}
+
+impl TestNodeSigner {
+	pub fn new(node_secret: SecretKey) -> Self {
+		Self { node_secret }
+	}
+}
+
+impl NodeSigner for TestNodeSigner {
+	fn get_inbound_payment_key_material(&self) -> crate::chain::keysinterface::KeyMaterial {
+		unreachable!()
+	}
+
+	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
+		let node_secret = match recipient {
+			Recipient::Node => Ok(&self.node_secret),
+			Recipient::PhantomNode => Err(())
+		}?;
+		Ok(PublicKey::from_secret_key(&Secp256k1::signing_only(), node_secret))
+	}
+
+	fn ecdh(&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&bitcoin::secp256k1::Scalar>) -> Result<SharedSecret, ()> {
+		let mut node_secret = match recipient {
+			Recipient::Node => Ok(self.node_secret.clone()),
+			Recipient::PhantomNode => Err(())
+		}?;
+		if let Some(tweak) = tweak {
+			node_secret = node_secret.mul_tweak(tweak).map_err(|_| ())?;
+		}
+		Ok(SharedSecret::new(other_key, &node_secret))
+	}
+
+	fn sign_invoice(&self, _: &[u8], _: &[bitcoin::bech32::u5], _: Recipient) -> Result<bitcoin::secp256k1::ecdsa::RecoverableSignature, ()> {
+		unreachable!()
+	}
+
+	fn sign_gossip_message(&self, _msg: msgs::UnsignedGossipMessage) -> Result<Signature, ()> {
+		unreachable!()
+	}
+}
+
 pub struct TestKeysInterface {
 	pub backing: keysinterface::PhantomKeysManager,
 	pub override_random_bytes: Mutex<Option<[u8; 32]>>,
@@ -603,32 +724,40 @@ pub struct TestKeysInterface {
 	expectations: Mutex<Option<VecDeque<OnGetShutdownScriptpubkey>>>,
 }
 
-impl keysinterface::KeysInterface for TestKeysInterface {
-	type Signer = EnforcingSigner;
-
-	fn get_node_secret(&self, recipient: Recipient) -> Result<SecretKey, ()> {
-		self.backing.get_node_secret(recipient)
+impl EntropySource for TestKeysInterface {
+	fn get_secure_random_bytes(&self) -> [u8; 32] {
+		let override_random_bytes = self.override_random_bytes.lock().unwrap();
+		if let Some(bytes) = &*override_random_bytes {
+			return *bytes;
+		}
+		self.backing.get_secure_random_bytes()
 	}
+}
+
+impl NodeSigner for TestKeysInterface {
 	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
 		self.backing.get_node_id(recipient)
 	}
+
 	fn ecdh(&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>) -> Result<SharedSecret, ()> {
 		self.backing.ecdh(recipient, other_key, tweak)
 	}
+
 	fn get_inbound_payment_key_material(&self) -> keysinterface::KeyMaterial {
 		self.backing.get_inbound_payment_key_material()
 	}
-	fn get_destination_script(&self) -> Script { self.backing.get_destination_script() }
 
-	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript {
-		match &mut *self.expectations.lock().unwrap() {
-			None => self.backing.get_shutdown_scriptpubkey(),
-			Some(expectations) => match expectations.pop_front() {
-				None => panic!("Unexpected get_shutdown_scriptpubkey"),
-				Some(expectation) => expectation.returns,
-			},
-		}
+	fn sign_invoice(&self, hrp_bytes: &[u8], invoice_data: &[u5], recipient: Recipient) -> Result<RecoverableSignature, ()> {
+		self.backing.sign_invoice(hrp_bytes, invoice_data, recipient)
 	}
+
+	fn sign_gossip_message(&self, msg: msgs::UnsignedGossipMessage) -> Result<Signature, ()> {
+		self.backing.sign_gossip_message(msg)
+	}
+}
+
+impl SignerProvider for TestKeysInterface {
+	type Signer = EnforcingSigner;
 
 	fn generate_channel_keys_id(&self, inbound: bool, channel_value_satoshis: u64, user_channel_id: u128) -> [u8; 32] {
 		self.backing.generate_channel_keys_id(inbound, channel_value_satoshis, user_channel_id)
@@ -640,18 +769,10 @@ impl keysinterface::KeysInterface for TestKeysInterface {
 		EnforcingSigner::new_with_revoked(keys, state, self.disable_revocation_policy_check)
 	}
 
-	fn get_secure_random_bytes(&self) -> [u8; 32] {
-		let override_random_bytes = self.override_random_bytes.lock().unwrap();
-		if let Some(bytes) = &*override_random_bytes {
-			return *bytes;
-		}
-		self.backing.get_secure_random_bytes()
-	}
-
 	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
 		let mut reader = io::Cursor::new(buffer);
 
-		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self.get_node_secret(Recipient::Node).unwrap())?;
+		let inner: InMemorySigner = Readable::read(&mut reader)?;
 		let state = self.make_enforcement_state_cell(inner.commitment_seed);
 
 		Ok(EnforcingSigner::new_with_revoked(
@@ -661,8 +782,16 @@ impl keysinterface::KeysInterface for TestKeysInterface {
 		))
 	}
 
-	fn sign_invoice(&self, hrp_bytes: &[u8], invoice_data: &[u5], recipient: Recipient) -> Result<RecoverableSignature, ()> {
-		self.backing.sign_invoice(hrp_bytes, invoice_data, recipient)
+	fn get_destination_script(&self) -> Script { self.backing.get_destination_script() }
+
+	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript {
+		match &mut *self.expectations.lock().unwrap() {
+			None => self.backing.get_shutdown_scriptpubkey(),
+			Some(expectations) => match expectations.pop_front() {
+				None => panic!("Unexpected get_shutdown_scriptpubkey"),
+				Some(expectation) => expectation.returns,
+			},
+		}
 	}
 }
 
@@ -678,7 +807,7 @@ impl TestKeysInterface {
 		}
 	}
 
-	/// Sets an expectation that [`keysinterface::KeysInterface::get_shutdown_scriptpubkey`] is
+	/// Sets an expectation that [`keysinterface::SignerProvider::get_shutdown_scriptpubkey`] is
 	/// called.
 	pub fn expect(&self, expectation: OnGetShutdownScriptpubkey) -> &Self {
 		self.expectations.lock().unwrap()
@@ -726,7 +855,7 @@ impl Drop for TestKeysInterface {
 	}
 }
 
-/// An expectation that [`keysinterface::KeysInterface::get_shutdown_scriptpubkey`] was called and
+/// An expectation that [`keysinterface::SignerProvider::get_shutdown_scriptpubkey`] was called and
 /// returns a [`ShutdownScript`].
 pub struct OnGetShutdownScriptpubkey {
 	/// A shutdown script used to close a channel.
@@ -741,7 +870,8 @@ impl core::fmt::Debug for OnGetShutdownScriptpubkey {
 
 pub struct TestChainSource {
 	pub genesis_hash: BlockHash,
-	pub utxo_ret: Mutex<Result<TxOut, chain::AccessError>>,
+	pub utxo_ret: Mutex<UtxoResult>,
+	pub get_utxo_call_count: AtomicUsize,
 	pub watched_txn: Mutex<HashSet<(Txid, Script)>>,
 	pub watched_outputs: Mutex<HashSet<(OutPoint, Script)>>,
 }
@@ -751,17 +881,19 @@ impl TestChainSource {
 		let script_pubkey = Builder::new().push_opcode(opcodes::OP_TRUE).into_script();
 		Self {
 			genesis_hash: genesis_block(network).block_hash(),
-			utxo_ret: Mutex::new(Ok(TxOut { value: u64::max_value(), script_pubkey })),
+			utxo_ret: Mutex::new(UtxoResult::Sync(Ok(TxOut { value: u64::max_value(), script_pubkey }))),
+			get_utxo_call_count: AtomicUsize::new(0),
 			watched_txn: Mutex::new(HashSet::new()),
 			watched_outputs: Mutex::new(HashSet::new()),
 		}
 	}
 }
 
-impl chain::Access for TestChainSource {
-	fn get_utxo(&self, genesis_hash: &BlockHash, _short_channel_id: u64) -> Result<TxOut, chain::AccessError> {
+impl UtxoLookup for TestChainSource {
+	fn get_utxo(&self, genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
+		self.get_utxo_call_count.fetch_add(1, Ordering::Relaxed);
 		if self.genesis_hash != *genesis_hash {
-			return Err(chain::AccessError::UnknownChain);
+			return UtxoResult::Sync(Err(UtxoLookupError::UnknownChain));
 		}
 
 		self.utxo_ret.lock().unwrap().clone()
@@ -786,5 +918,65 @@ impl Drop for TestChainSource {
 	}
 }
 
-/// A scorer useful in testing, when the passage of time isn't a concern.
-pub type TestScorer = FixedPenaltyScorer;
+pub struct TestScorer {
+	/// Stores a tuple of (scid, ChannelUsage)
+	scorer_expectations: RefCell<Option<VecDeque<(u64, ChannelUsage)>>>,
+}
+
+impl TestScorer {
+	pub fn new() -> Self {
+		Self {
+			scorer_expectations: RefCell::new(None),
+		}
+	}
+
+	pub fn expect_usage(&self, scid: u64, expectation: ChannelUsage) {
+		self.scorer_expectations.borrow_mut().get_or_insert_with(|| VecDeque::new()).push_back((scid, expectation));
+	}
+}
+
+#[cfg(c_bindings)]
+impl crate::util::ser::Writeable for TestScorer {
+	fn write<W: crate::util::ser::Writer>(&self, _: &mut W) -> Result<(), crate::io::Error> { unreachable!(); }
+}
+
+impl Score for TestScorer {
+	fn channel_penalty_msat(
+		&self, short_channel_id: u64, _source: &NodeId, _target: &NodeId, usage: ChannelUsage
+	) -> u64 {
+		if let Some(scorer_expectations) = self.scorer_expectations.borrow_mut().as_mut() {
+			match scorer_expectations.pop_front() {
+				Some((scid, expectation)) => {
+					assert_eq!(expectation, usage);
+					assert_eq!(scid, short_channel_id);
+				},
+				None => {},
+			}
+		}
+		0
+	}
+
+	fn payment_path_failed(&mut self, _actual_path: &[&RouteHop], _actual_short_channel_id: u64) {}
+
+	fn payment_path_successful(&mut self, _actual_path: &[&RouteHop]) {}
+
+	fn probe_failed(&mut self, _actual_path: &[&RouteHop], _: u64) {}
+
+	fn probe_successful(&mut self, _actual_path: &[&RouteHop]) {}
+}
+
+impl Drop for TestScorer {
+	fn drop(&mut self) {
+		#[cfg(feature = "std")] {
+			if std::thread::panicking() {
+				return;
+			}
+		}
+
+		if let Some(scorer_expectations) = self.scorer_expectations.borrow().as_ref() {
+			if !scorer_expectations.is_empty() {
+				panic!("Unsatisfied scorer expectations: {:?}", scorer_expectations)
+			}
+		}
+	}
+}

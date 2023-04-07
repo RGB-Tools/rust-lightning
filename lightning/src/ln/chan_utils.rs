@@ -665,13 +665,17 @@ pub fn make_funding_redeemscript(broadcaster: &PublicKey, countersignatory: &Pub
 	let broadcaster_funding_key = broadcaster.serialize();
 	let countersignatory_funding_key = countersignatory.serialize();
 
+	make_funding_redeemscript_from_slices(&broadcaster_funding_key, &countersignatory_funding_key)
+}
+
+pub(crate) fn make_funding_redeemscript_from_slices(broadcaster_funding_key: &[u8], countersignatory_funding_key: &[u8]) -> Script {
 	let builder = Builder::new().push_opcode(opcodes::all::OP_PUSHNUM_2);
 	if broadcaster_funding_key[..] < countersignatory_funding_key[..] {
-		builder.push_slice(&broadcaster_funding_key)
-			.push_slice(&countersignatory_funding_key)
+		builder.push_slice(broadcaster_funding_key)
+			.push_slice(countersignatory_funding_key)
 	} else {
-		builder.push_slice(&countersignatory_funding_key)
-			.push_slice(&broadcaster_funding_key)
+		builder.push_slice(countersignatory_funding_key)
+			.push_slice(broadcaster_funding_key)
 	}.push_opcode(opcodes::all::OP_PUSHNUM_2).push_opcode(opcodes::all::OP_CHECKMULTISIG).into_script()
 }
 
@@ -1646,7 +1650,7 @@ mod tests {
 	use crate::ln::chan_utils::{get_htlc_redeemscript, get_to_countersignatory_with_anchors_redeemscript, CommitmentTransaction, TxCreationKeys, ChannelTransactionParameters, CounterpartyChannelTransactionParameters, HTLCOutputInCommitment};
 	use bitcoin::secp256k1::{PublicKey, SecretKey, Secp256k1};
 	use crate::util::test_utils;
-	use crate::chain::keysinterface::{KeysInterface, BaseSign};
+	use crate::chain::keysinterface::{ChannelSigner, SignerProvider};
 	use bitcoin::{Network, Txid};
 	use bitcoin::hashes::Hash;
 	use crate::ln::PaymentHash;

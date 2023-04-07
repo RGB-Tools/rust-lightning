@@ -26,6 +26,7 @@ use bitcoin::network::constants::Network;
 use bitcoin::hashes::Hash as TraitImport;
 use bitcoin::hashes::HashEngine as TraitImportEngine;
 use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hash_types::{Txid, BlockHash, WPubkeyHash};
 
 use lightning::chain;
@@ -33,32 +34,32 @@ use lightning::chain::{BestBlock, ChannelMonitorUpdateStatus, Confirm, Listen};
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
 use lightning::chain::chainmonitor;
 use lightning::chain::transaction::OutPoint;
-use lightning::chain::keysinterface::{InMemorySigner, Recipient, KeyMaterial, KeysInterface};
+use lightning::chain::keysinterface::{InMemorySigner, Recipient, KeyMaterial, EntropySource, NodeSigner, SignerProvider};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::ln::channelmanager::{ChainParameters, ChannelManager, PaymentId};
+use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentId};
 use lightning::ln::peer_handler::{MessageHandler,PeerManager,SocketDescriptor,IgnoringMessageHandler};
-use lightning::ln::msgs::DecodeError;
+use lightning::ln::msgs::{self, DecodeError};
 use lightning::ln::script::ShutdownScript;
 use lightning::routing::gossip::{P2PGossipSync, NetworkGraph};
-use lightning::routing::router::{find_route, PaymentParameters, RouteParameters};
+use lightning::routing::utxo::UtxoLookup;
+use lightning::routing::router::{find_route, InFlightHtlcs, PaymentParameters, Route, RouteParameters, Router};
 use lightning::routing::scoring::FixedPenaltyScorer;
 use lightning::util::config::UserConfig;
 use lightning::util::errors::APIError;
 use lightning::util::events::Event;
 use lightning::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
 use lightning::util::logger::Logger;
-use lightning::util::ser::ReadableArgs;
+use lightning::util::ser::{Readable, Writeable};
 
 use crate::utils::test_logger;
 use crate::utils::test_persister::TestPersister;
 
-use bitcoin::secp256k1::{PublicKey, SecretKey, Scalar};
+use bitcoin::secp256k1::{Message, PublicKey, SecretKey, Scalar, Secp256k1};
 use bitcoin::secp256k1::ecdh::SharedSecret;
-use bitcoin::secp256k1::ecdsa::RecoverableSignature;
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 
 use std::cell::RefCell;
-use std::collections::{HashMap, hash_map};
+use hashbrown::{HashMap, hash_map};
 use std::convert::TryInto;
 use std::cmp;
 use std::sync::{Arc, Mutex};
@@ -127,6 +128,20 @@ impl FeeEstimator for FuzzEstimator {
 	}
 }
 
+struct FuzzRouter {}
+
+impl Router for FuzzRouter {
+	fn find_route(
+		&self, _payer: &PublicKey, _params: &RouteParameters, _first_hops: Option<&[&ChannelDetails]>,
+		_inflight_htlcs: &InFlightHtlcs
+	) -> Result<Route, msgs::LightningError> {
+		Err(msgs::LightningError {
+			err: String::from("Not implemented"),
+			action: msgs::ErrorAction::IgnoreError
+		})
+	}
+}
+
 struct TestBroadcaster {
 	txn_broadcasted: Mutex<Vec<Transaction>>,
 }
@@ -162,13 +177,13 @@ impl<'a> std::hash::Hash for Peer<'a> {
 	}
 }
 
-type ChannelMan = ChannelManager<
+type ChannelMan<'a> = ChannelManager<
 	Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
-	Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>, Arc<dyn Logger>>;
-type PeerMan<'a> = PeerManager<Peer<'a>, Arc<ChannelMan>, Arc<P2PGossipSync<Arc<NetworkGraph<Arc<dyn Logger>>>, Arc<dyn chain::Access>, Arc<dyn Logger>>>, IgnoringMessageHandler, Arc<dyn Logger>, IgnoringMessageHandler>;
+	Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<FuzzEstimator>, &'a FuzzRouter, Arc<dyn Logger>>;
+type PeerMan<'a> = PeerManager<Peer<'a>, Arc<ChannelMan<'a>>, Arc<P2PGossipSync<Arc<NetworkGraph<Arc<dyn Logger>>>, Arc<dyn UtxoLookup>, Arc<dyn Logger>>>, IgnoringMessageHandler, Arc<dyn Logger>, IgnoringMessageHandler, Arc<KeyProvider>>;
 
 struct MoneyLossDetector<'a> {
-	manager: Arc<ChannelMan>,
+	manager: Arc<ChannelMan<'a>>,
 	monitor: Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	handler: PeerMan<'a>,
 
@@ -182,7 +197,7 @@ struct MoneyLossDetector<'a> {
 }
 impl<'a> MoneyLossDetector<'a> {
 	pub fn new(peers: &'a RefCell<[bool; 256]>,
-	           manager: Arc<ChannelMan>,
+	           manager: Arc<ChannelMan<'a>>,
 	           monitor: Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	           handler: PeerMan<'a>) -> Self {
 		MoneyLossDetector {
@@ -265,23 +280,99 @@ struct KeyProvider {
 	counter: AtomicU64,
 	signer_state: RefCell<HashMap<u8, (bool, Arc<Mutex<EnforcementState>>)>>
 }
-impl KeysInterface for KeyProvider {
-	type Signer = EnforcingSigner;
 
-	fn get_node_secret(&self, _recipient: Recipient) -> Result<SecretKey, ()> {
-		Ok(self.node_secret.clone())
+impl EntropySource for KeyProvider {
+	fn get_secure_random_bytes(&self) -> [u8; 32] {
+		let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
+		[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			(ctr >> 8*7) as u8, (ctr >> 8*6) as u8, (ctr >> 8*5) as u8, (ctr >> 8*4) as u8, (ctr >> 8*3) as u8, (ctr >> 8*2) as u8, (ctr >> 8*1) as u8, 14, (ctr >> 8*0) as u8]
+	}
+}
+
+impl NodeSigner for KeyProvider {
+	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
+		let node_secret = match recipient {
+			Recipient::Node => Ok(&self.node_secret),
+			Recipient::PhantomNode => Err(())
+		}?;
+		Ok(PublicKey::from_secret_key(&Secp256k1::signing_only(), node_secret))
 	}
 
 	fn ecdh(&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>) -> Result<SharedSecret, ()> {
-		let mut node_secret = self.get_node_secret(recipient)?;
+		let mut node_secret = match recipient {
+			Recipient::Node => Ok(self.node_secret.clone()),
+			Recipient::PhantomNode => Err(())
+		}?;
 		if let Some(tweak) = tweak {
-			node_secret = node_secret.mul_tweak(tweak).unwrap();
+			node_secret = node_secret.mul_tweak(tweak).map_err(|_| ())?;
 		}
 		Ok(SharedSecret::new(other_key, &node_secret))
 	}
 
 	fn get_inbound_payment_key_material(&self) -> KeyMaterial {
 		self.inbound_payment_key.clone()
+	}
+
+	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
+		unreachable!()
+	}
+
+	fn sign_gossip_message(&self, msg: lightning::ln::msgs::UnsignedGossipMessage) -> Result<Signature, ()> {
+		let msg_hash = Message::from_slice(&Sha256dHash::hash(&msg.encode()[..])[..]).map_err(|_| ())?;
+		let secp_ctx = Secp256k1::signing_only();
+		Ok(secp_ctx.sign_ecdsa(&msg_hash, &self.node_secret))
+	}
+}
+
+impl SignerProvider for KeyProvider {
+	type Signer = EnforcingSigner;
+
+	fn generate_channel_keys_id(&self, inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
+		let ctr = self.counter.fetch_add(1, Ordering::Relaxed) as u8;
+		self.signer_state.borrow_mut().insert(ctr, (inbound, Arc::new(Mutex::new(EnforcementState::new()))));
+		[ctr; 32]
+	}
+
+	fn derive_channel_signer(&self, channel_value_satoshis: u64, channel_keys_id: [u8; 32]) -> Self::Signer {
+		let secp_ctx = Secp256k1::signing_only();
+		let ctr = channel_keys_id[0];
+		let (inbound, state) = self.signer_state.borrow().get(&ctr).unwrap().clone();
+		EnforcingSigner::new_with_revoked(if inbound {
+			InMemorySigner::new(
+				&secp_ctx,
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, ctr]).unwrap(),
+				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, ctr],
+				channel_value_satoshis,
+				channel_keys_id,
+			)
+		} else {
+			InMemorySigner::new(
+				&secp_ctx,
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, ctr]).unwrap(),
+				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, ctr]).unwrap(),
+				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, ctr],
+				channel_value_satoshis,
+				channel_keys_id,
+			)
+		}, state, false)
+	}
+
+	fn read_chan_signer(&self, mut data: &[u8]) -> Result<EnforcingSigner, DecodeError> {
+		let inner: InMemorySigner = Readable::read(&mut data)?;
+		let state = Arc::new(Mutex::new(EnforcementState::new()));
+
+		Ok(EnforcingSigner::new_with_revoked(
+			inner,
+			state,
+			false
+		))
 	}
 
 	fn get_destination_script(&self) -> Script {
@@ -297,66 +388,6 @@ impl KeysInterface for KeyProvider {
 		let pubkey_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &secret_key).serialize());
 		ShutdownScript::new_p2wpkh(&pubkey_hash)
 	}
-
-	fn generate_channel_keys_id(&self, inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
-		let ctr = self.counter.fetch_add(1, Ordering::Relaxed) as u8;
-		self.signer_state.borrow_mut().insert(ctr, (inbound, Arc::new(Mutex::new(EnforcementState::new()))));
-		[ctr; 32]
-	}
-
-	fn derive_channel_signer(&self, channel_value_satoshis: u64, channel_keys_id: [u8; 32]) -> Self::Signer {
-		let secp_ctx = Secp256k1::signing_only();
-		let ctr = channel_keys_id[0];
-		let (inbound, state) = self.signer_state.borrow().get(&ctr).unwrap().clone();
-		EnforcingSigner::new_with_revoked(if inbound {
-			InMemorySigner::new(
-				&secp_ctx,
-				self.node_secret.clone(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, ctr]).unwrap(),
-				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, ctr],
-				channel_value_satoshis,
-				channel_keys_id,
-			)
-		} else {
-			InMemorySigner::new(
-				&secp_ctx,
-				self.node_secret.clone(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, ctr]).unwrap(),
-				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, ctr]).unwrap(),
-				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, ctr],
-				channel_value_satoshis,
-				channel_keys_id,
-			)
-		}, state, false)
-	}
-
-	fn get_secure_random_bytes(&self) -> [u8; 32] {
-		let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
-		[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		(ctr >> 8*7) as u8, (ctr >> 8*6) as u8, (ctr >> 8*5) as u8, (ctr >> 8*4) as u8, (ctr >> 8*3) as u8, (ctr >> 8*2) as u8, (ctr >> 8*1) as u8, 14, (ctr >> 8*0) as u8]
-	}
-
-	fn read_chan_signer(&self, mut data: &[u8]) -> Result<EnforcingSigner, DecodeError> {
-		let inner: InMemorySigner = ReadableArgs::read(&mut data, self.node_secret.clone())?;
-		let state = Arc::new(Mutex::new(EnforcementState::new()));
-
-		Ok(EnforcingSigner::new_with_revoked(
-			inner,
-			state,
-			false
-		))
-	}
-
-	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
-		unreachable!()
-	}
 }
 
 #[inline]
@@ -368,6 +399,7 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 	let fee_est = Arc::new(FuzzEstimator {
 		input: input.clone(),
 	});
+	let router = FuzzRouter {};
 
 	macro_rules! get_slice {
 		($len: expr) => {
@@ -410,15 +442,15 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 	let network = Network::Bitcoin;
 	let params = ChainParameters {
 		network,
-		best_block: BestBlock::from_genesis(network),
+		best_block: BestBlock::from_network(network),
 	};
-	let channelmanager = Arc::new(ChannelManager::new(fee_est.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, params));
-	// Adding new calls to `KeysInterface::get_secure_random_bytes` during startup can change all the
+	let channelmanager = Arc::new(ChannelManager::new(fee_est.clone(), monitor.clone(), broadcast.clone(), &router, Arc::clone(&logger), keys_manager.clone(), keys_manager.clone(), keys_manager.clone(), config, params));
+	// Adding new calls to `EntropySource::get_secure_random_bytes` during startup can change all the
 	// keys subsequently generated in this test. Rather than regenerating all the messages manually,
 	// it's easier to just increment the counter here so the keys don't change.
 	keys_manager.counter.fetch_sub(3, Ordering::AcqRel);
-	let our_id = PublicKey::from_secret_key(&Secp256k1::signing_only(), &keys_manager.get_node_secret(Recipient::Node).unwrap());
-	let network_graph = Arc::new(NetworkGraph::new(genesis_block(network).block_hash(), Arc::clone(&logger)));
+	let our_id = &keys_manager.get_node_id(Recipient::Node).unwrap();
+	let network_graph = Arc::new(NetworkGraph::new(network, Arc::clone(&logger)));
 	let gossip_sync = Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
 	let scorer = FixedPenaltyScorer::with_penalty(0);
 
@@ -427,7 +459,7 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 		chan_handler: channelmanager.clone(),
 		route_handler: gossip_sync.clone(),
 		onion_message_handler: IgnoringMessageHandler {},
-	}, our_network_key, 0, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0], Arc::clone(&logger), IgnoringMessageHandler{}));
+	}, 0, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0], Arc::clone(&logger), IgnoringMessageHandler{}, keys_manager.clone()));
 
 	let mut should_forward = false;
 	let mut payments_received: Vec<PaymentHash> = Vec::new();
@@ -477,11 +509,10 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 			},
 			4 => {
 				let final_value_msat = slice_to_be24(get_slice!(3)) as u64;
-				let payment_params = PaymentParameters::from_node_id(get_pubkey!());
+				let payment_params = PaymentParameters::from_node_id(get_pubkey!(), 42);
 				let params = RouteParameters {
 					payment_params,
 					final_value_msat,
-					final_cltv_expiry_delta: 42,
 				};
 				let random_seed_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
 				let route = match find_route(&our_id, &params, &network_graph, None, Arc::clone(&logger), &scorer, &random_seed_bytes) {
@@ -501,11 +532,10 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 			},
 			15 => {
 				let final_value_msat = slice_to_be24(get_slice!(3)) as u64;
-				let payment_params = PaymentParameters::from_node_id(get_pubkey!());
+				let payment_params = PaymentParameters::from_node_id(get_pubkey!(), 42);
 				let params = RouteParameters {
 					payment_params,
 					final_value_msat,
-					final_cltv_expiry_delta: 42,
 				};
 				let random_seed_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
 				let mut route = match find_route(&our_id, &params, &network_graph, None, Arc::clone(&logger), &scorer, &random_seed_bytes) {
@@ -570,7 +600,7 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 				let payment_hash = PaymentHash(Sha256::from_engine(sha).into_inner());
 				// Note that this may fail - our hashes may collide and we'll end up trying to
 				// double-register the same payment_hash.
-				let _ = channelmanager.create_inbound_payment_for_hash(payment_hash, None, 1);
+				let _ = channelmanager.create_inbound_payment_for_hash(payment_hash, None, 1, None);
 			},
 			9 => {
 				for payment in payments_received.drain(..) {
@@ -602,9 +632,7 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 					if let Err(e) = channelmanager.funding_transaction_generated(&funding_generation.0, &funding_generation.1, tx.clone()) {
 						// It's possible the channel has been closed in the mean time, but any other
 						// failure may be a bug.
-						if let APIError::ChannelUnavailable { err } = e {
-							assert_eq!(err, "No such channel");
-						} else { panic!(); }
+						if let APIError::ChannelUnavailable { .. } = e { } else { panic!(); }
 					}
 					pending_funding_signatures.insert(funding_output, tx);
 				}

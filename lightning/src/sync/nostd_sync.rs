@@ -2,6 +2,7 @@ pub use ::alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
 use core::time::Duration;
 use core::cell::{RefCell, Ref, RefMut};
+use super::{LockTestExt, LockHeldState};
 
 pub type LockResult<Guard> = Result<Guard, ()>;
 
@@ -59,6 +60,21 @@ impl<T> Mutex<T> {
 	pub fn try_lock<'a>(&'a self) -> LockResult<MutexGuard<'a, T>> {
 		Ok(MutexGuard { lock: self.inner.borrow_mut() })
 	}
+
+	pub fn into_inner(self) -> LockResult<T> {
+		Ok(self.inner.into_inner())
+	}
+}
+
+impl<'a, T: 'a> LockTestExt<'a> for Mutex<T> {
+	#[inline]
+	fn held_by_thread(&self) -> LockHeldState {
+		if self.lock().is_err() { return LockHeldState::HeldByThread; }
+		else { return LockHeldState::NotHeldByThread; }
+	}
+	type ExclLock = MutexGuard<'a, T>;
+	#[inline]
+	fn unsafe_well_ordered_double_lock_self(&'a self) -> MutexGuard<T> { self.lock().unwrap() }
 }
 
 pub struct RwLock<T: ?Sized> {
@@ -109,9 +125,22 @@ impl<T> RwLock<T> {
 	}
 
 	pub fn try_write<'a>(&'a self) -> LockResult<RwLockWriteGuard<'a, T>> {
-		// There is no try, grasshopper - only used for tests and expected to fail
-		Err(())
+		match self.inner.try_borrow_mut() {
+			Ok(lock) => Ok(RwLockWriteGuard { lock }),
+			Err(_) => Err(())
+		}
 	}
+}
+
+impl<'a, T: 'a> LockTestExt<'a> for RwLock<T> {
+	#[inline]
+	fn held_by_thread(&self) -> LockHeldState {
+		if self.write().is_err() { return LockHeldState::HeldByThread; }
+		else { return LockHeldState::NotHeldByThread; }
+	}
+	type ExclLock = RwLockWriteGuard<'a, T>;
+	#[inline]
+	fn unsafe_well_ordered_double_lock_self(&'a self) -> RwLockWriteGuard<T> { self.write().unwrap() }
 }
 
 pub type FairRwLock<T> = RwLock<T>;

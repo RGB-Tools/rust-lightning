@@ -12,10 +12,10 @@
 //! returned errors decode to the correct thing.
 
 use crate::chain::channelmonitor::{CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS};
-use crate::chain::keysinterface::{KeysInterface, Recipient};
+use crate::chain::keysinterface::{EntropySource, NodeSigner, Recipient};
 use crate::ln::{PaymentHash, PaymentSecret};
 use crate::ln::channel::EXPIRE_PREV_CONFIG_TICKS;
-use crate::ln::channelmanager::{self, HTLCForwardInfo, CLTV_FAR_FAR_AWAY, MIN_CLTV_EXPIRY_DELTA, PendingAddHTLCInfo, PendingHTLCInfo, PendingHTLCRouting, PaymentId};
+use crate::ln::channelmanager::{HTLCForwardInfo, FailureCode, CLTV_FAR_FAR_AWAY, MIN_CLTV_EXPIRY_DELTA, PendingAddHTLCInfo, PendingHTLCInfo, PendingHTLCRouting, PaymentId};
 use crate::ln::onion_utils;
 use crate::routing::gossip::{NetworkUpdate, RoutingFees};
 use crate::routing::router::{get_route, PaymentParameters, Route, RouteHint, RouteHintHop};
@@ -23,7 +23,7 @@ use crate::ln::features::{InitFeatures, InvoiceFeatures};
 use crate::ln::msgs;
 use crate::ln::msgs::{ChannelMessageHandler, ChannelUpdate};
 use crate::ln::wire::Encode;
-use crate::util::events::{Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
+use crate::util::events::{Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider, PathFailure};
 use crate::util::ser::{Writeable, Writer};
 use crate::util::test_utils;
 use crate::util::config::{UserConfig, ChannelConfig};
@@ -35,8 +35,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256::Hash as Sha256;
 
 use bitcoin::secp256k1;
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin::secp256k1::{Secp256k1, SecretKey};
 
 use crate::io;
 use crate::prelude::*;
@@ -167,10 +166,9 @@ fn run_onion_failure_test_with_fail_intercept<F1,F2,F3>(_name: &str, test_case: 
 	commitment_signed_dance!(nodes[0], nodes[1], update_1_0.commitment_signed, false, true);
 
 	let events = nodes[0].node.get_and_clear_pending_events();
-	assert_eq!(events.len(), 1);
-	if let &Event::PaymentPathFailed { ref payment_failed_permanently, ref network_update, ref all_paths_failed, ref short_channel_id, ref error_code, .. } = &events[0] {
+	assert_eq!(events.len(), 2);
+	if let &Event::PaymentPathFailed { ref payment_failed_permanently, ref short_channel_id, ref error_code, failure: PathFailure::OnPath { ref network_update }, .. } = &events[0] {
 		assert_eq!(*payment_failed_permanently, !expected_retryable);
-		assert_eq!(*all_paths_failed, true);
 		assert_eq!(*error_code, expected_error_code);
 		if expected_channel_update.is_some() {
 			match network_update {
@@ -213,10 +211,7 @@ fn run_onion_failure_test_with_fail_intercept<F1,F2,F3>(_name: &str, test_case: 
 	} else {
 		panic!("Unexpected event");
 	}
-	nodes[0].node.abandon_payment(payment_id);
-	let events = nodes[0].node.get_and_clear_pending_events();
-	assert_eq!(events.len(), 1);
-	match events[0] {
+	match events[1] {
 		Event::PaymentFailed { payment_hash: ev_payment_hash, payment_id: ev_payment_id } => {
 			assert_eq!(*payment_hash, ev_payment_hash);
 			assert_eq!(payment_id, ev_payment_id);
@@ -281,7 +276,7 @@ fn test_fee_failures() {
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[Some(config), Some(config), Some(config)]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
-	let channels = [create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features()), create_announced_chan_between_nodes(&nodes, 1, 2, channelmanager::provided_init_features(), channelmanager::provided_init_features())];
+	let channels = [create_announced_chan_between_nodes(&nodes, 0, 1), create_announced_chan_between_nodes(&nodes, 1, 2)];
 
 	// positive case
 	let (route, payment_hash_success, payment_preimage_success, payment_secret_success) = get_route_and_payment_hash!(nodes[0], nodes[2], 40_000);
@@ -333,7 +328,7 @@ fn test_onion_failure() {
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[Some(config), Some(config), Some(node_2_cfg)]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
-	let channels = [create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features()), create_announced_chan_between_nodes(&nodes, 1, 2, channelmanager::provided_init_features(), channelmanager::provided_init_features())];
+	let channels = [create_announced_chan_between_nodes(&nodes, 0, 1), create_announced_chan_between_nodes(&nodes, 1, 2)];
 	for node in nodes.iter() {
 		*node.keys_manager.override_random_bytes.lock().unwrap() = Some([3; 32]);
 	}
@@ -503,7 +498,9 @@ fn test_onion_failure() {
 	  Some(NetworkUpdate::ChannelFailure{short_channel_id, is_permanent:true}), Some(short_channel_id));
 
 	let short_channel_id = channels[1].0.contents.short_channel_id;
-	let amt_to_forward = nodes[1].node.channel_state.lock().unwrap().by_id.get(&channels[1].2).unwrap().get_counterparty_htlc_minimum_msat() - 1;
+	let amt_to_forward = nodes[1].node.per_peer_state.read().unwrap().get(&nodes[2].node.get_our_node_id())
+		.unwrap().lock().unwrap().channel_by_id.get(&channels[1].2).unwrap()
+		.get_counterparty_htlc_minimum_msat() - 1;
 	let mut bogus_route = route.clone();
 	let route_len = bogus_route.paths[0].len();
 	bogus_route.paths[0][route_len-1].fee_msat = amt_to_forward;
@@ -578,8 +575,8 @@ fn test_onion_failure() {
 	let short_channel_id = channels[1].0.contents.short_channel_id;
 	run_onion_failure_test("channel_disabled", 0, &nodes, &route, &payment_hash, &payment_secret, |_| {}, || {
 		// disconnect event to the channel between nodes[1] ~ nodes[2]
-		nodes[1].node.peer_disconnected(&nodes[2].node.get_our_node_id(), false);
-		nodes[2].node.peer_disconnected(&nodes[1].node.get_our_node_id(), false);
+		nodes[1].node.peer_disconnected(&nodes[2].node.get_our_node_id());
+		nodes[2].node.peer_disconnected(&nodes[1].node.get_our_node_id());
 	}, true, Some(UPDATE|20), Some(NetworkUpdate::ChannelUpdateMessage{msg: ChannelUpdate::dummy(short_channel_id)}), Some(short_channel_id));
 	reconnect_nodes(&nodes[1], &nodes[2], (false, false), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (false, false));
 
@@ -621,16 +618,16 @@ fn do_test_onion_failure_stale_channel_update(announced_channel: bool) {
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
 	let other_channel = create_chan_between_nodes(
-		&nodes[0], &nodes[1], channelmanager::provided_init_features(), channelmanager::provided_init_features(),
+		&nodes[0], &nodes[1],
 	);
 	let channel_to_update = if announced_channel {
 		let channel = create_announced_chan_between_nodes(
-			&nodes, 1, 2, channelmanager::provided_init_features(), channelmanager::provided_init_features(),
+			&nodes, 1, 2,
 		);
 		(channel.2, channel.0.contents.short_channel_id)
 	} else {
 		let channel = create_unannounced_chan_between_nodes_with_value(
-			&nodes, 1, 2, 100000, 10001, channelmanager::provided_init_features(), channelmanager::provided_init_features(),
+			&nodes, 1, 2, 100000, 10001,
 		);
 		(channel.0.channel_id, channel.0.short_channel_id_alias.unwrap())
 	};
@@ -654,8 +651,8 @@ fn do_test_onion_failure_stale_channel_update(announced_channel: bool) {
 			htlc_maximum_msat: None,
 			htlc_minimum_msat: None,
 		}])];
-		let payment_params = PaymentParameters::from_node_id(*channel_to_update_counterparty)
-			.with_features(channelmanager::provided_invoice_features())
+		let payment_params = PaymentParameters::from_node_id(*channel_to_update_counterparty, TEST_FINAL_CLTV)
+			.with_features(nodes[2].node.invoice_features())
 			.with_route_hints(hop_hints);
 		get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, PAYMENT_AMT, TEST_FINAL_CLTV)
 	};
@@ -789,20 +786,19 @@ fn test_always_create_tlv_format_onion_payloads() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let mut node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 
-	// Set `node[1]`'s config features to features which return `false` for
+	// Set `node[1]`'s init features to features which return `false` for
 	// `supports_variable_length_onion()`
 	let mut no_variable_length_onion_features = InitFeatures::empty();
 	no_variable_length_onion_features.set_static_remote_key_required();
-	let mut node_1_cfg = &mut node_cfgs[1];
-	node_1_cfg.features = no_variable_length_onion_features;
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(no_variable_length_onion_features);
 
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::empty(), InitFeatures::empty());
-	create_announced_chan_between_nodes(&nodes, 1, 2, InitFeatures::empty(), InitFeatures::empty());
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
 
-	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
+	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), TEST_FINAL_CLTV)
 		.with_features(InvoiceFeatures::empty());
 	let (route, _payment_hash, _payment_preimage, _payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 40000, TEST_FINAL_CLTV);
 
@@ -831,14 +827,79 @@ fn test_always_create_tlv_format_onion_payloads() {
 	}
 }
 
+fn do_test_fail_htlc_backwards_with_reason(failure_code: FailureCode) {
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	let payment_amount = 100_000;
+	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], payment_amount);
+	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	check_added_monitors!(nodes[0], 1);
+
+	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
+	let mut payment_event = SendEvent::from_event(events.pop().unwrap());
+	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &payment_event.msgs[0]);
+	commitment_signed_dance!(nodes[1], nodes[0], payment_event.commitment_msg, false);
+
+	expect_pending_htlcs_forwardable!(nodes[1]);
+	expect_payment_claimable!(nodes[1], payment_hash, payment_secret, payment_amount);
+	nodes[1].node.fail_htlc_backwards_with_reason(&payment_hash, failure_code);
+
+	expect_pending_htlcs_forwardable_and_htlc_handling_failed!(nodes[1], vec![HTLCDestination::FailedPayment { payment_hash: payment_hash }]);
+	check_added_monitors!(nodes[1], 1);
+
+	let events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	let (update_fail_htlc, commitment_signed) = match events[0] {
+		MessageSendEvent::UpdateHTLCs { node_id: _ , updates: msgs::CommitmentUpdate { ref update_add_htlcs, ref update_fulfill_htlcs, ref update_fail_htlcs, ref update_fail_malformed_htlcs, ref update_fee, ref commitment_signed } } => {
+			assert!(update_add_htlcs.is_empty());
+			assert!(update_fulfill_htlcs.is_empty());
+			assert_eq!(update_fail_htlcs.len(), 1);
+			assert!(update_fail_malformed_htlcs.is_empty());
+			assert!(update_fee.is_none());
+			(update_fail_htlcs[0].clone(), commitment_signed)
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	nodes[0].node.handle_update_fail_htlc(&nodes[1].node.get_our_node_id(), &update_fail_htlc);
+	commitment_signed_dance!(nodes[0], nodes[1], commitment_signed, false, true);
+
+	let failure_data = match failure_code {
+		FailureCode::TemporaryNodeFailure => vec![],
+		FailureCode::RequiredNodeFeatureMissing => vec![],
+		FailureCode::IncorrectOrUnknownPaymentDetails => {
+			let mut htlc_msat_height_data = (payment_amount as u64).to_be_bytes().to_vec();
+			htlc_msat_height_data.extend_from_slice(&CHAN_CONFIRM_DEPTH.to_be_bytes());
+			htlc_msat_height_data
+		}
+	};
+
+	let failure_code = failure_code as u16;
+	let permanent_flag = 0x4000;
+	let permanent_fail = (failure_code & permanent_flag) != 0;
+	expect_payment_failed!(nodes[0], payment_hash, permanent_fail, failure_code, failure_data);
+
+}
+
+#[test]
+fn test_fail_htlc_backwards_with_reason() {
+	do_test_fail_htlc_backwards_with_reason(FailureCode::TemporaryNodeFailure);
+	do_test_fail_htlc_backwards_with_reason(FailureCode::RequiredNodeFeatureMissing);
+	do_test_fail_htlc_backwards_with_reason(FailureCode::IncorrectOrUnknownPaymentDetails);
+}
+
 macro_rules! get_phantom_route {
 	($nodes: expr, $amt: expr, $channel: expr) => {{
-		let secp_ctx = Secp256k1::new();
-		let phantom_secret = $nodes[1].keys_manager.get_node_secret(Recipient::PhantomNode).unwrap();
-		let phantom_pubkey = PublicKey::from_secret_key(&secp_ctx, &phantom_secret);
+		let phantom_pubkey = $nodes[1].keys_manager.get_node_id(Recipient::PhantomNode).unwrap();
 		let phantom_route_hint = $nodes[1].node.get_phantom_route_hints();
-		let payment_params = PaymentParameters::from_node_id(phantom_pubkey)
-			.with_features(channelmanager::provided_invoice_features())
+		let payment_params = PaymentParameters::from_node_id(phantom_pubkey, TEST_FINAL_CLTV)
+			.with_features($nodes[1].node.invoice_features())
 			.with_route_hints(vec![RouteHint(vec![
 					RouteHintHop {
 						src_node_id: $nodes[0].node.get_our_node_id(),
@@ -863,7 +924,7 @@ macro_rules! get_phantom_route {
 						htlc_maximum_msat: None,
 					}
 		])]);
-		let scorer = test_utils::TestScorer::with_penalty(0);
+		let scorer = test_utils::TestScorer::new();
 		let network_graph = $nodes[0].network_graph.read_only();
 		(get_route(
 			&$nodes[0].node.get_our_node_id(), &payment_params, &network_graph,
@@ -880,7 +941,7 @@ fn test_phantom_onion_hmac_failure() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -939,7 +1000,7 @@ fn test_phantom_invalid_onion_payload() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -1012,7 +1073,7 @@ fn test_phantom_final_incorrect_cltv_expiry() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -1068,7 +1129,7 @@ fn test_phantom_failure_too_low_cltv() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -1118,7 +1179,7 @@ fn test_phantom_failure_modified_cltv() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -1159,7 +1220,7 @@ fn test_phantom_failure_expires_too_soon() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route.
 	let recv_value_msat = 10_000;
@@ -1196,7 +1257,7 @@ fn test_phantom_failure_too_low_recv_amt() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route with a too-low amount.
 	let recv_amt_msat = 10_000;
@@ -1248,7 +1309,7 @@ fn test_phantom_dust_exposure_failure() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(receiver_config)]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route with an amount exceeding the dust exposure threshold of nodes[1].
 	let (_, payment_hash, payment_secret) = get_payment_preimage_hash!(nodes[1], Some(max_dust_exposure + 1));
@@ -1290,7 +1351,7 @@ fn test_phantom_failure_reject_payment() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let channel = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 	// Get the route with a too-low amount.
 	let recv_amt_msat = 10_000;

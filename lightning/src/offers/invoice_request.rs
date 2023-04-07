@@ -9,15 +9,17 @@
 
 //! Data structures and encoding for `invoice_request` messages.
 //!
-//! An [`InvoiceRequest`] can be either built from a parsed [`Offer`] as an "offer to be paid" or
-//! built directly as an "offer for money" (e.g., refund, ATM withdrawal). In the former case, it is
+//! An [`InvoiceRequest`] can be built from a parsed [`Offer`] as an "offer to be paid". It is
 //! typically constructed by a customer and sent to the merchant who had published the corresponding
-//! offer. In the latter case, an offer doesn't exist as a precursor to the request. Rather the
-//! merchant would typically construct the invoice request and present it to the customer.
+//! offer. The recipient of the request responds with an [`Invoice`].
 //!
-//! The recipient of the request responds with an `Invoice`.
+//! For an "offer for money" (e.g., refund, ATM withdrawal), where an offer doesn't exist as a
+//! precursor, see [`Refund`].
 //!
-//! ```ignore
+//! [`Invoice`]: crate::offers::invoice::Invoice
+//! [`Refund`]: crate::offers::refund::Refund
+//!
+//! ```
 //! extern crate bitcoin;
 //! extern crate lightning;
 //!
@@ -34,7 +36,6 @@
 //! let pubkey = PublicKey::from(keys);
 //! let mut buffer = Vec::new();
 //!
-//! // "offer to be paid" flow
 //! "lno1qcp4256ypq"
 //!     .parse::<Offer>()?
 //!     .request_invoice(vec![42; 64], pubkey)?
@@ -57,12 +58,15 @@ use bitcoin::secp256k1::{Message, PublicKey};
 use bitcoin::secp256k1::schnorr::Signature;
 use core::convert::TryFrom;
 use crate::io;
+use crate::ln::PaymentHash;
 use crate::ln::features::InvoiceRequestFeatures;
 use crate::ln::msgs::DecodeError;
+use crate::offers::invoice::{BlindedPayInfo, InvoiceBuilder};
 use crate::offers::merkle::{SignError, SignatureTlvStream, SignatureTlvStreamRef, self};
 use crate::offers::offer::{Offer, OfferContents, OfferTlvStream, OfferTlvStreamRef};
 use crate::offers::parse::{ParseError, ParsedMessage, SemanticError};
 use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
+use crate::onion_message::BlindedPath;
 use crate::util::ser::{HighZeroBytesDroppedBigSize, SeekReadable, WithoutLength, Writeable, Writer};
 use crate::util::string::PrintableString;
 
@@ -223,11 +227,11 @@ impl<'a> UnsignedInvoiceRequest<'a> {
 		unsigned_tlv_stream.write(&mut bytes).unwrap();
 
 		let pubkey = self.invoice_request.payer_id;
-		let signature = Some(merkle::sign_message(sign, SIGNATURE_TAG, &bytes, pubkey)?);
+		let signature = merkle::sign_message(sign, SIGNATURE_TAG, &bytes, pubkey)?;
 
 		// Append the signature TLV record to the bytes.
 		let signature_tlv_stream = SignatureTlvStreamRef {
-			signature: signature.as_ref(),
+			signature: Some(&signature),
 		};
 		signature_tlv_stream.write(&mut bytes).unwrap();
 
@@ -239,24 +243,27 @@ impl<'a> UnsignedInvoiceRequest<'a> {
 	}
 }
 
-/// An `InvoiceRequest` is a request for an `Invoice` formulated from an [`Offer`].
+/// An `InvoiceRequest` is a request for an [`Invoice`] formulated from an [`Offer`].
 ///
 /// An offer may provide choices such as quantity, amount, chain, features, etc. An invoice request
 /// specifies these such that its recipient can send an invoice for payment.
 ///
+/// [`Invoice`]: crate::offers::invoice::Invoice
 /// [`Offer`]: crate::offers::offer::Offer
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InvoiceRequest {
 	pub(super) bytes: Vec<u8>,
-	contents: InvoiceRequestContents,
-	signature: Option<Signature>,
+	pub(super) contents: InvoiceRequestContents,
+	signature: Signature,
 }
 
-/// The contents of an [`InvoiceRequest`], which may be shared with an `Invoice`.
-#[derive(Clone, Debug)]
+/// The contents of an [`InvoiceRequest`], which may be shared with an [`Invoice`].
+///
+/// [`Invoice`]: crate::offers::invoice::Invoice
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct InvoiceRequestContents {
 	payer: PayerContents,
-	offer: OfferContents,
+	pub(super) offer: OfferContents,
 	chain: Option<ChainHash>,
 	amount_msats: Option<u64>,
 	features: InvoiceRequestFeatures,
@@ -287,7 +294,7 @@ impl InvoiceRequest {
 		self.contents.amount_msats
 	}
 
-	/// Features for paying the invoice.
+	/// Features pertaining to requesting an invoice.
 	pub fn features(&self) -> &InvoiceRequestFeatures {
 		&self.contents.features
 	}
@@ -311,8 +318,56 @@ impl InvoiceRequest {
 	/// Signature of the invoice request using [`payer_id`].
 	///
 	/// [`payer_id`]: Self::payer_id
-	pub fn signature(&self) -> Option<Signature> {
+	pub fn signature(&self) -> Signature {
 		self.signature
+	}
+
+	/// Creates an [`Invoice`] for the request with the given required fields and using the
+	/// [`Duration`] since [`std::time::SystemTime::UNIX_EPOCH`] as the creation time.
+	///
+	/// See [`InvoiceRequest::respond_with_no_std`] for further details where the aforementioned
+	/// creation time is used for the `created_at` parameter.
+	///
+	/// [`Invoice`]: crate::offers::invoice::Invoice
+	/// [`Duration`]: core::time::Duration
+	#[cfg(feature = "std")]
+	pub fn respond_with(
+		&self, payment_paths: Vec<(BlindedPath, BlindedPayInfo)>, payment_hash: PaymentHash
+	) -> Result<InvoiceBuilder, SemanticError> {
+		let created_at = std::time::SystemTime::now()
+			.duration_since(std::time::SystemTime::UNIX_EPOCH)
+			.expect("SystemTime::now() should come after SystemTime::UNIX_EPOCH");
+
+		self.respond_with_no_std(payment_paths, payment_hash, created_at)
+	}
+
+	/// Creates an [`Invoice`] for the request with the given required fields.
+	///
+	/// Unless [`InvoiceBuilder::relative_expiry`] is set, the invoice will expire two hours after
+	/// `created_at`, which is used to set [`Invoice::created_at`]. Useful for `no-std` builds where
+	/// [`std::time::SystemTime`] is not available.
+	///
+	/// The caller is expected to remember the preimage of `payment_hash` in order to claim a payment
+	/// for the invoice.
+	///
+	/// The `payment_paths` parameter is useful for maintaining the payment recipient's privacy. It
+	/// must contain one or more elements ordered from most-preferred to least-preferred, if there's
+	/// a preference. Note, however, that any privacy is lost if a public node id was used for
+	/// [`Offer::signing_pubkey`].
+	///
+	/// Errors if the request contains unknown required features.
+	///
+	/// [`Invoice`]: crate::offers::invoice::Invoice
+	/// [`Invoice::created_at`]: crate::offers::invoice::Invoice::created_at
+	pub fn respond_with_no_std(
+		&self, payment_paths: Vec<(BlindedPath, BlindedPayInfo)>, payment_hash: PaymentHash,
+		created_at: core::time::Duration
+	) -> Result<InvoiceBuilder, SemanticError> {
+		if self.features().requires_unknown_bits() {
+			return Err(SemanticError::UnknownRequiredFeatures);
+		}
+
+		InvoiceBuilder::for_offer(self, payment_paths, created_at, payment_hash)
 	}
 
 	#[cfg(test)]
@@ -320,14 +375,14 @@ impl InvoiceRequest {
 		let (payer_tlv_stream, offer_tlv_stream, invoice_request_tlv_stream) =
 			self.contents.as_tlv_stream();
 		let signature_tlv_stream = SignatureTlvStreamRef {
-			signature: self.signature.as_ref(),
+			signature: Some(&self.signature),
 		};
 		(payer_tlv_stream, offer_tlv_stream, invoice_request_tlv_stream, signature_tlv_stream)
 	}
 }
 
 impl InvoiceRequestContents {
-	fn chain(&self) -> ChainHash {
+	pub(super) fn chain(&self) -> ChainHash {
 		self.chain.unwrap_or_else(|| self.offer.implied_chain())
 	}
 
@@ -371,7 +426,7 @@ impl Writeable for InvoiceRequestContents {
 tlv_stream!(InvoiceRequestTlvStream, InvoiceRequestTlvStreamRef, 80..160, {
 	(80, chain: ChainHash),
 	(82, amount: (u64, HighZeroBytesDroppedBigSize)),
-	(84, features: InvoiceRequestFeatures),
+	(84, features: (InvoiceRequestFeatures, WithoutLength)),
 	(86, quantity: (u64, HighZeroBytesDroppedBigSize)),
 	(88, payer_id: PublicKey),
 	(89, payer_note: (String, WithoutLength)),
@@ -421,9 +476,11 @@ impl TryFrom<Vec<u8>> for InvoiceRequest {
 			(payer_tlv_stream, offer_tlv_stream, invoice_request_tlv_stream)
 		)?;
 
-		if let Some(signature) = &signature {
-			merkle::verify_signature(signature, SIGNATURE_TAG, &bytes, contents.payer_id)?;
-		}
+		let signature = match signature {
+			None => return Err(ParseError::InvalidSemantics(SemanticError::MissingSignature)),
+			Some(signature) => signature,
+		};
+		merkle::verify_signature(&signature, SIGNATURE_TAG, &bytes, contents.payer_id)?;
 
 		Ok(InvoiceRequest { bytes, contents, signature })
 	}
@@ -471,7 +528,7 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 
 #[cfg(test)]
 mod tests {
-	use super::InvoiceRequest;
+	use super::{InvoiceRequest, InvoiceRequestTlvStreamRef, SIGNATURE_TAG};
 
 	use bitcoin::blockdata::constants::ChainHash;
 	use bitcoin::network::constants::Network;
@@ -483,9 +540,10 @@ mod tests {
 	use core::time::Duration;
 	use crate::ln::features::InvoiceRequestFeatures;
 	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
-	use crate::offers::merkle::SignError;
-	use crate::offers::offer::{Amount, OfferBuilder, Quantity};
+	use crate::offers::merkle::{SignError, SignatureTlvStreamRef, self};
+	use crate::offers::offer::{Amount, OfferBuilder, OfferTlvStreamRef, Quantity};
 	use crate::offers::parse::{ParseError, SemanticError};
+	use crate::offers::payer::PayerTlvStreamRef;
 	use crate::util::ser::{BigSize, Writeable};
 	use crate::util::string::PrintableString;
 
@@ -517,14 +575,13 @@ mod tests {
 
 	#[test]
 	fn builds_invoice_request_with_defaults() {
-		let offer = OfferBuilder::new("foo".into(), recipient_pubkey())
+		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
-			.build().unwrap();
-		let invoice_request = offer.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
-			.build().unwrap().sign(payer_sign).unwrap();
+			.build().unwrap()
+			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
+			.build().unwrap()
+			.sign(payer_sign).unwrap();
 
-		let (payer_tlv_stream, offer_tlv_stream, invoice_request_tlv_stream, signature_tlv_stream) =
-			invoice_request.as_tlv_stream();
 		let mut buffer = Vec::new();
 		invoice_request.write(&mut buffer).unwrap();
 
@@ -536,27 +593,40 @@ mod tests {
 		assert_eq!(invoice_request.quantity(), None);
 		assert_eq!(invoice_request.payer_id(), payer_pubkey());
 		assert_eq!(invoice_request.payer_note(), None);
-		assert!(invoice_request.signature().is_some());
+		assert!(
+			merkle::verify_signature(
+				&invoice_request.signature, SIGNATURE_TAG, &invoice_request.bytes, payer_pubkey()
+			).is_ok()
+		);
 
-		assert_eq!(payer_tlv_stream.metadata, Some(&vec![1; 32]));
-		assert_eq!(offer_tlv_stream.chains, None);
-		assert_eq!(offer_tlv_stream.metadata, None);
-		assert_eq!(offer_tlv_stream.currency, None);
-		assert_eq!(offer_tlv_stream.amount, Some(1000));
-		assert_eq!(offer_tlv_stream.description, Some(&String::from("foo")));
-		assert_eq!(offer_tlv_stream.features, None);
-		assert_eq!(offer_tlv_stream.absolute_expiry, None);
-		assert_eq!(offer_tlv_stream.paths, None);
-		assert_eq!(offer_tlv_stream.issuer, None);
-		assert_eq!(offer_tlv_stream.quantity_max, None);
-		assert_eq!(offer_tlv_stream.node_id, Some(&recipient_pubkey()));
-		assert_eq!(invoice_request_tlv_stream.chain, None);
-		assert_eq!(invoice_request_tlv_stream.amount, None);
-		assert_eq!(invoice_request_tlv_stream.features, None);
-		assert_eq!(invoice_request_tlv_stream.quantity, None);
-		assert_eq!(invoice_request_tlv_stream.payer_id, Some(&payer_pubkey()));
-		assert_eq!(invoice_request_tlv_stream.payer_note, None);
-		assert!(signature_tlv_stream.signature.is_some());
+		assert_eq!(
+			invoice_request.as_tlv_stream(),
+			(
+				PayerTlvStreamRef { metadata: Some(&vec![1; 32]) },
+				OfferTlvStreamRef {
+					chains: None,
+					metadata: None,
+					currency: None,
+					amount: Some(1000),
+					description: Some(&String::from("foo")),
+					features: None,
+					absolute_expiry: None,
+					paths: None,
+					issuer: None,
+					quantity_max: None,
+					node_id: Some(&recipient_pubkey()),
+				},
+				InvoiceRequestTlvStreamRef {
+					chain: None,
+					amount: None,
+					features: None,
+					quantity: None,
+					payer_id: Some(&payer_pubkey()),
+					payer_note: None,
+				},
+				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
+			),
+		);
 
 		if let Err(e) = InvoiceRequest::try_from(buffer) {
 			panic!("error parsing invoice request: {:?}", e);
@@ -758,6 +828,18 @@ mod tests {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, SemanticError::MissingAmount),
 		}
+
+		match OfferBuilder::new("foo".into(), recipient_pubkey())
+			.amount_msats(1000)
+			.supported_quantity(Quantity::Unbounded)
+			.build().unwrap()
+			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
+			.quantity(u64::max_value()).unwrap()
+			.build()
+		{
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, SemanticError::InvalidAmount),
+		}
 	}
 
 	#[test]
@@ -788,11 +870,12 @@ mod tests {
 
 	#[test]
 	fn builds_invoice_request_with_quantity() {
+		let one = NonZeroU64::new(1).unwrap();
 		let ten = NonZeroU64::new(10).unwrap();
 
 		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build().unwrap()
 			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
 			.build().unwrap()
@@ -803,7 +886,7 @@ mod tests {
 
 		match OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build().unwrap()
 			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
 			.amount_msats(2_000).unwrap()
@@ -854,6 +937,17 @@ mod tests {
 		match OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
 			.supported_quantity(Quantity::Unbounded)
+			.build().unwrap()
+			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
+			.build()
+		{
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, SemanticError::MissingQuantity),
+		}
+
+		match OfferBuilder::new("foo".into(), recipient_pubkey())
+			.amount_msats(1000)
+			.supported_quantity(Quantity::Bounded(one))
 			.build().unwrap()
 			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
 			.build()
@@ -1041,15 +1135,33 @@ mod tests {
 				assert_eq!(e, ParseError::InvalidSemantics(SemanticError::UnsupportedCurrency));
 			},
 		}
+
+		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
+			.amount_msats(1000)
+			.supported_quantity(Quantity::Unbounded)
+			.build().unwrap()
+			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
+			.quantity(u64::max_value()).unwrap()
+			.build_unchecked()
+			.sign(payer_sign).unwrap();
+
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		match InvoiceRequest::try_from(buffer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, ParseError::InvalidSemantics(SemanticError::InvalidAmount)),
+		}
 	}
 
 	#[test]
 	fn parses_invoice_request_with_quantity() {
+		let one = NonZeroU64::new(1).unwrap();
 		let ten = NonZeroU64::new(10).unwrap();
 
 		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build().unwrap()
 			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
 			.build().unwrap()
@@ -1064,7 +1176,7 @@ mod tests {
 
 		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build().unwrap()
 			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
 			.amount_msats(2_000).unwrap()
@@ -1149,6 +1261,22 @@ mod tests {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, ParseError::InvalidSemantics(SemanticError::MissingQuantity)),
 		}
+
+		let invoice_request = OfferBuilder::new("foo".into(), recipient_pubkey())
+			.amount_msats(1000)
+			.supported_quantity(Quantity::Bounded(one))
+			.build().unwrap()
+			.request_invoice(vec![1; 32], payer_pubkey()).unwrap()
+			.build_unchecked()
+			.sign(payer_sign).unwrap();
+
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		match InvoiceRequest::try_from(buffer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, ParseError::InvalidSemantics(SemanticError::MissingQuantity)),
+		}
 	}
 
 	#[test]
@@ -1213,7 +1341,7 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_invoice_request_without_signature() {
+	fn fails_parsing_invoice_request_without_signature() {
 		let mut buffer = Vec::new();
 		OfferBuilder::new("foo".into(), recipient_pubkey())
 			.amount_msats(1000)
@@ -1223,8 +1351,9 @@ mod tests {
 			.invoice_request
 			.write(&mut buffer).unwrap();
 
-		if let Err(e) = InvoiceRequest::try_from(buffer) {
-			panic!("error parsing invoice_request: {:?}", e);
+		match InvoiceRequest::try_from(buffer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, ParseError::InvalidSemantics(SemanticError::MissingSignature)),
 		}
 	}
 

@@ -29,6 +29,7 @@ use bitcoin::network::constants::Network;
 
 use bitcoin::hashes::Hash as TraitImport;
 use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hash_types::{BlockHash, WPubkeyHash};
 
 use lightning::chain;
@@ -36,11 +37,11 @@ use lightning::chain::{BestBlock, ChannelMonitorUpdateStatus, chainmonitor, chan
 use lightning::chain::channelmonitor::{ChannelMonitor, MonitorEvent};
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
-use lightning::chain::keysinterface::{KeyMaterial, KeysInterface, InMemorySigner, Recipient};
+use lightning::chain::keysinterface::{KeyMaterial, InMemorySigner, Recipient, EntropySource, NodeSigner, SignerProvider};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::ln::channelmanager::{self, ChainParameters, ChannelManager, PaymentSendFailure, ChannelManagerReadArgs, PaymentId};
+use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentSendFailure, ChannelManagerReadArgs, PaymentId};
 use lightning::ln::channel::FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE;
-use lightning::ln::msgs::{CommitmentUpdate, ChannelMessageHandler, DecodeError, UpdateAddHTLC, Init};
+use lightning::ln::msgs::{self, CommitmentUpdate, ChannelMessageHandler, DecodeError, UpdateAddHTLC, Init};
 use lightning::ln::script::ShutdownScript;
 use lightning::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
 use lightning::util::errors::APIError;
@@ -49,19 +50,18 @@ use lightning::util::logger::Logger;
 use lightning::util::config::UserConfig;
 use lightning::util::events::MessageSendEventsProvider;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
-use lightning::routing::router::{Route, RouteHop};
+use lightning::routing::router::{InFlightHtlcs, Route, RouteHop, RouteParameters, Router};
 
 use crate::utils::test_logger::{self, Output};
 use crate::utils::test_persister::TestPersister;
 
-use bitcoin::secp256k1::{PublicKey, SecretKey, Scalar};
+use bitcoin::secp256k1::{Message, PublicKey, SecretKey, Scalar, Secp256k1};
 use bitcoin::secp256k1::ecdh::SharedSecret;
-use bitcoin::secp256k1::ecdsa::RecoverableSignature;
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 
 use std::mem;
 use std::cmp::{self, Ordering};
-use std::collections::{HashSet, hash_map, HashMap};
+use hashbrown::{HashSet, hash_map, HashMap};
 use std::sync::{Arc,Mutex};
 use std::sync::atomic;
 use std::io::Cursor;
@@ -82,6 +82,20 @@ impl FeeEstimator for FuzzEstimator {
 			ConfirmationTarget::Background => 253,
 			ConfirmationTarget::Normal => cmp::min(self.ret_val.load(atomic::Ordering::Acquire), MAX_FEE),
 		}
+	}
+}
+
+struct FuzzRouter {}
+
+impl Router for FuzzRouter {
+	fn find_route(
+		&self, _payer: &PublicKey, _params: &RouteParameters, _first_hops: Option<&[&ChannelDetails]>,
+		_inflight_htlcs: &InFlightHtlcs
+	) -> Result<Route, msgs::LightningError> {
+		Err(msgs::LightningError {
+			err: String::from("Not implemented"),
+			action: msgs::ErrorAction::IgnoreError
+		})
 	}
 }
 
@@ -134,15 +148,15 @@ impl chain::Watch<EnforcingSigner> for TestChainMonitor {
 		self.chain_monitor.watch_channel(funding_txo, monitor)
 	}
 
-	fn update_channel(&self, funding_txo: OutPoint, update: channelmonitor::ChannelMonitorUpdate) -> chain::ChannelMonitorUpdateStatus {
+	fn update_channel(&self, funding_txo: OutPoint, update: &channelmonitor::ChannelMonitorUpdate) -> chain::ChannelMonitorUpdateStatus {
 		let mut map_lock = self.latest_monitors.lock().unwrap();
 		let mut map_entry = match map_lock.entry(funding_txo) {
 			hash_map::Entry::Occupied(entry) => entry,
 			hash_map::Entry::Vacant(_) => panic!("Didn't have monitor on update call"),
 		};
 		let deserialized_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingSigner>)>::
-			read(&mut Cursor::new(&map_entry.get().1), &*self.keys).unwrap().1;
-		deserialized_monitor.update_monitor(&update, &&TestBroadcaster{}, &FuzzEstimator { ret_val: atomic::AtomicU32::new(253) }, &self.logger).unwrap();
+			read(&mut Cursor::new(&map_entry.get().1), (&*self.keys, &*self.keys)).unwrap().1;
+		deserialized_monitor.update_monitor(update, &&TestBroadcaster{}, &FuzzEstimator { ret_val: atomic::AtomicU32::new(253) }, &self.logger).unwrap();
 		let mut ser = VecWriter(Vec::new());
 		deserialized_monitor.write(&mut ser).unwrap();
 		map_entry.insert((update.update_id, ser.0));
@@ -156,42 +170,57 @@ impl chain::Watch<EnforcingSigner> for TestChainMonitor {
 }
 
 struct KeyProvider {
-	node_id: u8,
+	node_secret: SecretKey,
 	rand_bytes_id: atomic::AtomicU32,
 	enforcement_states: Mutex<HashMap<[u8;32], Arc<Mutex<EnforcementState>>>>,
 }
-impl KeysInterface for KeyProvider {
-	type Signer = EnforcingSigner;
 
-	fn get_node_secret(&self, _recipient: Recipient) -> Result<SecretKey, ()> {
-		Ok(SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.node_id]).unwrap())
+impl EntropySource for KeyProvider {
+	fn get_secure_random_bytes(&self) -> [u8; 32] {
+		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed);
+		let mut res = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, self.node_secret[31]];
+		res[30-4..30].copy_from_slice(&id.to_le_bytes());
+		res
+	}
+}
+
+impl NodeSigner for KeyProvider {
+	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
+		let node_secret = match recipient {
+			Recipient::Node => Ok(&self.node_secret),
+			Recipient::PhantomNode => Err(())
+		}?;
+		Ok(PublicKey::from_secret_key(&Secp256k1::signing_only(), node_secret))
 	}
 
 	fn ecdh(&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>) -> Result<SharedSecret, ()> {
-		let mut node_secret = self.get_node_secret(recipient)?;
+		let mut node_secret = match recipient {
+			Recipient::Node => Ok(self.node_secret.clone()),
+			Recipient::PhantomNode => Err(())
+		}?;
 		if let Some(tweak) = tweak {
-			node_secret = node_secret.mul_tweak(tweak).unwrap();
+			node_secret = node_secret.mul_tweak(tweak).map_err(|_| ())?;
 		}
 		Ok(SharedSecret::new(other_key, &node_secret))
 	}
 
 	fn get_inbound_payment_key_material(&self) -> KeyMaterial {
-		KeyMaterial([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.node_id])
+		KeyMaterial([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, self.node_secret[31]])
 	}
 
-	fn get_destination_script(&self) -> Script {
-		let secp_ctx = Secp256k1::signing_only();
-		let channel_monitor_claim_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, self.node_id]).unwrap();
-		let our_channel_monitor_claim_key_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &channel_monitor_claim_key).serialize());
-		Builder::new().push_opcode(opcodes::all::OP_PUSHBYTES_0).push_slice(&our_channel_monitor_claim_key_hash[..]).into_script()
+	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
+		unreachable!()
 	}
 
-	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript {
+	fn sign_gossip_message(&self, msg: lightning::ln::msgs::UnsignedGossipMessage) -> Result<Signature, ()> {
+		let msg_hash = Message::from_slice(&Sha256dHash::hash(&msg.encode()[..])[..]).map_err(|_| ())?;
 		let secp_ctx = Secp256k1::signing_only();
-		let secret_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, self.node_id]).unwrap();
-		let pubkey_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &secret_key).serialize());
-		ShutdownScript::new_p2wpkh(&pubkey_hash)
+		Ok(secp_ctx.sign_ecdsa(&msg_hash, &self.node_secret))
 	}
+}
+
+impl SignerProvider for KeyProvider {
+	type Signer = EnforcingSigner;
 
 	fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
 		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed) as u8;
@@ -203,13 +232,12 @@ impl KeysInterface for KeyProvider {
 		let id = channel_keys_id[0];
 		let keys = InMemorySigner::new(
 			&secp_ctx,
-			self.get_node_secret(Recipient::Node).unwrap(),
-			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, self.node_id]).unwrap(),
-			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, self.node_id]).unwrap(),
-			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, self.node_id]).unwrap(),
-			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, self.node_id]).unwrap(),
-			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, self.node_id]).unwrap(),
-			[id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_id],
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, self.node_secret[31]]).unwrap(),
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, self.node_secret[31]]).unwrap(),
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, self.node_secret[31]]).unwrap(),
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, self.node_secret[31]]).unwrap(),
+			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, self.node_secret[31]]).unwrap(),
+			[id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_secret[31]],
 			channel_value_satoshis,
 			channel_keys_id,
 		);
@@ -217,17 +245,10 @@ impl KeysInterface for KeyProvider {
 		EnforcingSigner::new_with_revoked(keys, revoked_commitment, false)
 	}
 
-	fn get_secure_random_bytes(&self) -> [u8; 32] {
-		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed);
-		let mut res = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, self.node_id];
-		res[30-4..30].copy_from_slice(&id.to_le_bytes());
-		res
-	}
-
 	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, DecodeError> {
 		let mut reader = std::io::Cursor::new(buffer);
 
-		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self.get_node_secret(Recipient::Node).unwrap())?;
+		let inner: InMemorySigner = Readable::read(&mut reader)?;
 		let state = self.make_enforcement_state_cell(inner.commitment_seed);
 
 		Ok(EnforcingSigner {
@@ -237,8 +258,18 @@ impl KeysInterface for KeyProvider {
 		})
 	}
 
-	fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> {
-		unreachable!()
+	fn get_destination_script(&self) -> Script {
+		let secp_ctx = Secp256k1::signing_only();
+		let channel_monitor_claim_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, self.node_secret[31]]).unwrap();
+		let our_channel_monitor_claim_key_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &channel_monitor_claim_key).serialize());
+		Builder::new().push_opcode(opcodes::all::OP_PUSHBYTES_0).push_slice(&our_channel_monitor_claim_key_hash[..]).into_script()
+	}
+
+	fn get_shutdown_scriptpubkey(&self) -> ShutdownScript {
+		let secp_ctx = Secp256k1::signing_only();
+		let secret_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, self.node_secret[31]]).unwrap();
+		let pubkey_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &secret_key).serialize());
+		ShutdownScript::new_p2wpkh(&pubkey_hash)
 	}
 }
 
@@ -264,7 +295,7 @@ fn check_api_err(api_err: APIError) {
 			// all others. If you hit this panic, the list of acceptable errors
 			// is probably just stale and you should add new messages here.
 			match err.as_str() {
-				"Peer for first hop currently disconnected/pending monitor update!" => {},
+				"Peer for first hop currently disconnected" => {},
 				_ if err.starts_with("Cannot push more than their max accepted HTLCs ") => {},
 				_ if err.starts_with("Cannot send value that would put us over the max HTLC value in flight our peer will accept ") => {},
 				_ if err.starts_with("Cannot send value that would put our balance under counterparty-announced channel reserve value") => {},
@@ -298,14 +329,14 @@ fn check_payment_err(send_err: PaymentSendFailure) {
 	}
 }
 
-type ChanMan = ChannelManager<Arc<TestChainMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>, Arc<dyn Logger>>;
+type ChanMan<'a> = ChannelManager<Arc<TestChainMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<FuzzEstimator>, &'a FuzzRouter, Arc<dyn Logger>>;
 
 #[inline]
 fn get_payment_secret_hash(dest: &ChanMan, payment_id: &mut u8) -> Option<(PaymentSecret, PaymentHash)> {
 	let mut payment_hash;
 	for _ in 0..256 {
 		payment_hash = PaymentHash(Sha256::hash(&[*payment_id; 1]).into_inner());
-		if let Ok(payment_secret) = dest.create_inbound_payment_for_hash(payment_hash, None, 3600) {
+		if let Ok(payment_secret) = dest.create_inbound_payment_for_hash(payment_hash, None, 3600, None) {
 			return Some((payment_secret, payment_hash));
 		}
 		*payment_id = payment_id.wrapping_add(1);
@@ -323,9 +354,9 @@ fn send_payment(source: &ChanMan, dest: &ChanMan, dest_chan_id: u64, amt: u64, p
 	if let Err(err) = source.send_payment(&Route {
 		paths: vec![vec![RouteHop {
 			pubkey: dest.get_our_node_id(),
-			node_features: channelmanager::provided_node_features(),
+			node_features: dest.node_features(),
 			short_channel_id: dest_chan_id,
-			channel_features: channelmanager::provided_channel_features(),
+			channel_features: dest.channel_features(),
 			fee_msat: amt,
 			cltv_expiry_delta: 200,
 		}]],
@@ -345,16 +376,16 @@ fn send_hop_payment(source: &ChanMan, middle: &ChanMan, middle_chan_id: u64, des
 	if let Err(err) = source.send_payment(&Route {
 		paths: vec![vec![RouteHop {
 			pubkey: middle.get_our_node_id(),
-			node_features: channelmanager::provided_node_features(),
+			node_features: middle.node_features(),
 			short_channel_id: middle_chan_id,
-			channel_features: channelmanager::provided_channel_features(),
+			channel_features: middle.channel_features(),
 			fee_msat: 50000,
 			cltv_expiry_delta: 100,
 		},RouteHop {
 			pubkey: dest.get_our_node_id(),
-			node_features: channelmanager::provided_node_features(),
+			node_features: dest.node_features(),
 			short_channel_id: dest_chan_id,
-			channel_features: channelmanager::provided_channel_features(),
+			channel_features: dest.channel_features(),
 			fee_msat: amt,
 			cltv_expiry_delta: 200,
 		}]],
@@ -369,11 +400,13 @@ fn send_hop_payment(source: &ChanMan, middle: &ChanMan, middle_chan_id: u64, des
 pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 	let out = SearchingOutput::new(underlying_out);
 	let broadcast = Arc::new(TestBroadcaster{});
+	let router = FuzzRouter {};
 
 	macro_rules! make_node {
 		($node_id: expr, $fee_estimator: expr) => { {
 			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
-			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, rand_bytes_id: atomic::AtomicU32::new(0), enforcement_states: Mutex::new(HashMap::new()) });
+			let node_secret = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, $node_id]).unwrap();
+			let keys_manager = Arc::new(KeyProvider { node_secret, rand_bytes_id: atomic::AtomicU32::new(0), enforcement_states: Mutex::new(HashMap::new()) });
 			let monitor = Arc::new(TestChainMonitor::new(broadcast.clone(), logger.clone(), $fee_estimator.clone(),
 				Arc::new(TestPersister {
 					update_ret: Mutex::new(ChannelMonitorUpdateStatus::Completed)
@@ -385,9 +418,9 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 			let network = Network::Bitcoin;
 			let params = ChainParameters {
 				network,
-				best_block: BestBlock::from_genesis(network),
+				best_block: BestBlock::from_network(network),
 			};
-			(ChannelManager::new($fee_estimator.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, params),
+			(ChannelManager::new($fee_estimator.clone(), monitor.clone(), broadcast.clone(), &router, Arc::clone(&logger), keys_manager.clone(), keys_manager.clone(), keys_manager.clone(), config, params),
 			monitor, keys_manager)
 		} }
 	}
@@ -408,7 +441,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 			let mut monitors = HashMap::new();
 			let mut old_monitors = $old_monitors.latest_monitors.lock().unwrap();
 			for (outpoint, (update_id, monitor_ser)) in old_monitors.drain() {
-				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut Cursor::new(&monitor_ser), &*$keys_manager).expect("Failed to read monitor").1);
+				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<EnforcingSigner>)>::read(&mut Cursor::new(&monitor_ser), (&*$keys_manager, &*$keys_manager)).expect("Failed to read monitor").1);
 				chain_monitor.latest_monitors.lock().unwrap().insert(outpoint, (update_id, monitor_ser));
 			}
 			let mut monitor_refs = HashMap::new();
@@ -417,10 +450,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 			}
 
 			let read_args = ChannelManagerReadArgs {
-				keys_manager,
+				entropy_source: keys_manager.clone(),
+				node_signer: keys_manager.clone(),
+				signer_provider: keys_manager.clone(),
 				fee_estimator: $fee_estimator.clone(),
 				chain_monitor: chain_monitor.clone(),
 				tx_broadcaster: broadcast.clone(),
+				router: &router,
 				logger,
 				default_config: config,
 				channel_monitors: monitor_refs,
@@ -438,8 +474,8 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 	let mut channel_txn = Vec::new();
 	macro_rules! make_channel {
 		($source: expr, $dest: expr, $chan_id: expr) => { {
-			$source.peer_connected(&$dest.get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-			$dest.peer_connected(&$source.get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+			$source.peer_connected(&$dest.get_our_node_id(), &Init { features: $dest.init_features(), remote_network_address: None }, true).unwrap();
+			$dest.peer_connected(&$source.get_our_node_id(), &Init { features: $source.init_features(), remote_network_address: None }, false).unwrap();
 
 			$source.create_channel($dest.get_our_node_id(), 100_000, 42, 0, None).unwrap();
 			let open_channel = {
@@ -450,7 +486,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 				} else { panic!("Wrong event type"); }
 			};
 
-			$dest.handle_open_channel(&$source.get_our_node_id(), channelmanager::provided_init_features(), &open_channel);
+			$dest.handle_open_channel(&$source.get_our_node_id(), &open_channel);
 			let accept_channel = {
 				let events = $dest.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
@@ -459,7 +495,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 				} else { panic!("Wrong event type"); }
 			};
 
-			$source.handle_accept_channel(&$dest.get_our_node_id(), channelmanager::provided_init_features(), &accept_channel);
+			$source.handle_accept_channel(&$dest.get_our_node_id(), &accept_channel);
 			let funding_output;
 			{
 				let events = $source.get_and_clear_pending_events();
@@ -878,6 +914,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 						events::Event::PaymentClaimed { .. } => {},
 						events::Event::PaymentPathSuccessful { .. } => {},
 						events::Event::PaymentPathFailed { .. } => {},
+						events::Event::PaymentFailed { .. } => {},
 						events::Event::ProbeSuccessful { .. } | events::Event::ProbeFailed { .. } => {
 							// Even though we don't explicitly send probes, because probes are
 							// detected based on hashing the payment hash+preimage, its rather
@@ -942,31 +979,31 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 
 			0x0c => {
 				if !chan_a_disconnected {
-					nodes[0].peer_disconnected(&nodes[1].get_our_node_id(), false);
-					nodes[1].peer_disconnected(&nodes[0].get_our_node_id(), false);
+					nodes[0].peer_disconnected(&nodes[1].get_our_node_id());
+					nodes[1].peer_disconnected(&nodes[0].get_our_node_id());
 					chan_a_disconnected = true;
 					drain_msg_events_on_disconnect!(0);
 				}
 			},
 			0x0d => {
 				if !chan_b_disconnected {
-					nodes[1].peer_disconnected(&nodes[2].get_our_node_id(), false);
-					nodes[2].peer_disconnected(&nodes[1].get_our_node_id(), false);
+					nodes[1].peer_disconnected(&nodes[2].get_our_node_id());
+					nodes[2].peer_disconnected(&nodes[1].get_our_node_id());
 					chan_b_disconnected = true;
 					drain_msg_events_on_disconnect!(2);
 				}
 			},
 			0x0e => {
 				if chan_a_disconnected {
-					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &Init { features: nodes[1].init_features(), remote_network_address: None }, true).unwrap();
+					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &Init { features: nodes[0].init_features(), remote_network_address: None }, false).unwrap();
 					chan_a_disconnected = false;
 				}
 			},
 			0x0f => {
 				if chan_b_disconnected {
-					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &Init { features: nodes[2].init_features(), remote_network_address: None }, true).unwrap();
+					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &Init { features: nodes[1].init_features(), remote_network_address: None }, false).unwrap();
 					chan_b_disconnected = false;
 				}
 			},
@@ -1003,7 +1040,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 
 			0x2c => {
 				if !chan_a_disconnected {
-					nodes[1].peer_disconnected(&nodes[0].get_our_node_id(), false);
+					nodes[1].peer_disconnected(&nodes[0].get_our_node_id());
 					chan_a_disconnected = true;
 					drain_msg_events_on_disconnect!(0);
 				}
@@ -1017,14 +1054,14 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 			},
 			0x2d => {
 				if !chan_a_disconnected {
-					nodes[0].peer_disconnected(&nodes[1].get_our_node_id(), false);
+					nodes[0].peer_disconnected(&nodes[1].get_our_node_id());
 					chan_a_disconnected = true;
 					nodes[0].get_and_clear_pending_msg_events();
 					ab_events.clear();
 					ba_events.clear();
 				}
 				if !chan_b_disconnected {
-					nodes[2].peer_disconnected(&nodes[1].get_our_node_id(), false);
+					nodes[2].peer_disconnected(&nodes[1].get_our_node_id());
 					chan_b_disconnected = true;
 					nodes[2].get_and_clear_pending_msg_events();
 					bc_events.clear();
@@ -1036,7 +1073,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 			},
 			0x2e => {
 				if !chan_b_disconnected {
-					nodes[1].peer_disconnected(&nodes[2].get_our_node_id(), false);
+					nodes[1].peer_disconnected(&nodes[2].get_our_node_id());
 					chan_b_disconnected = true;
 					drain_msg_events_on_disconnect!(2);
 				}
@@ -1161,13 +1198,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 
 				// Next, make sure peers are all connected to each other
 				if chan_a_disconnected {
-					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+					nodes[0].peer_connected(&nodes[1].get_our_node_id(), &Init { features: nodes[1].init_features(), remote_network_address: None }, true).unwrap();
+					nodes[1].peer_connected(&nodes[0].get_our_node_id(), &Init { features: nodes[0].init_features(), remote_network_address: None }, false).unwrap();
 					chan_a_disconnected = false;
 				}
 				if chan_b_disconnected {
-					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+					nodes[1].peer_connected(&nodes[2].get_our_node_id(), &Init { features: nodes[2].init_features(), remote_network_address: None }, true).unwrap();
+					nodes[2].peer_connected(&nodes[1].get_our_node_id(), &Init { features: nodes[1].init_features(), remote_network_address: None }, false).unwrap();
 					chan_b_disconnected = false;
 				}
 

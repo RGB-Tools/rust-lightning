@@ -12,7 +12,7 @@ jobs:
                      beta,
                      # 1.41.1 is MSRV for Rust-Lightning, lightning-invoice, and lightning-persister
                      1.41.1,
-                     # 1.45.2 is MSRV for lightning-net-tokio, lightning-block-sync, lightning-background-processor, and coverage generation
+                     # 1.45.2 is MSRV for lightning-net-tokio, lightning-block-sync, lightning-background-processor
                      1.45.2,
                      # 1.47.0 will be the MSRV for no-std builds using hashbrown once core2 is updated
                      1.47.0]
@@ -21,43 +21,56 @@ jobs:
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
+            coverage: true
           - toolchain: stable
             platform: macos-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
+          - toolchain: stable
+            test-custom-message: true
           - toolchain: beta
             platform: macos-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: stable
             platform: windows-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: false
           - toolchain: beta
             platform: windows-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: false
           - toolchain: beta
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
+          - toolchain: beta
+            test-custom-message: true
           - toolchain: 1.41.1
             build-no-std: false
             test-log-variants: true
             build-futures: false
+            build-tx-sync: false
           - toolchain: 1.45.2
             build-net-old-tokio: true
             build-net-tokio: true
             build-no-std: false
             build-futures: true
-            coverage: true
+            build-tx-sync: false
           - toolchain: 1.47.0
             build-futures: true
             build-no-std: true
+            build-tx-sync: false
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -76,7 +89,7 @@ jobs:
       - name: Build on Rust ${{ matrix.toolchain }} with net-tokio
         if: "matrix.build-net-tokio && !matrix.coverage"
         run: cargo build --verbose --color always
-      - name: Build on Rust ${{ matrix.toolchain }} with net-tokio and full code-linking for coverage generation
+      - name: Build on Rust ${{ matrix.toolchain }} with net-tokio, and full code-linking for coverage generation
         if: matrix.coverage
         run: RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always
       - name: Build on Rust ${{ matrix.toolchain }}
@@ -108,14 +121,33 @@ jobs:
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client,tokio
+      - name: Build Transaction Sync Clients on Rust ${{ matrix.toolchain }} with features
+        if: "matrix.build-tx-sync && !matrix.coverage"
+        run: |
+          cd lightning-transaction-sync
+          cargo build --verbose --color always --features esplora-blocking
+          cargo build --verbose --color always --features esplora-async
+      - name: Build transaction sync clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
+        if: "matrix.build-tx-sync && matrix.coverage"
+        run: |
+          cd lightning-transaction-sync
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features esplora-blocking
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features esplora-async
+      - name: Test transaction sync clients on Rust ${{ matrix.toolchain }} with features
+        if: "matrix.build-tx-sync"
+        run: |
+          cd lightning-transaction-sync
+          cargo test --verbose --color always --features esplora-blocking
+          cargo test --verbose --color always --features esplora-async
       - name: Test backtrace-debug builds on Rust ${{ matrix.toolchain }}
         if: "matrix.toolchain == 'stable'"
+        shell: bash # Default on Winblows is powershell
         run: |
-          cd lightning && cargo test --verbose --color always --features backtrace
+          cd lightning && RUST_BACKTRACE=1 cargo test --verbose --color always --features backtrace
       - name: Test on Rust ${{ matrix.toolchain }} with net-tokio
         if: "matrix.build-net-tokio && !matrix.coverage"
         run: cargo test --verbose --color always
-      - name: Test on Rust ${{ matrix.toolchain }} with net-tokio and full code-linking for coverage generation
+      - name: Test on Rust ${{ matrix.toolchain }} with net-tokio, and full code-linking for coverage generation
         if: matrix.coverage
         run: RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always
       - name: Test no-std builds on Rust ${{ matrix.toolchain }}
@@ -136,7 +168,7 @@ jobs:
           done
           # check no-std compatibility across dependencies
           cd no-std-check
-          cargo check --verbose --color always
+          cargo check --verbose --color always --features lightning-transaction-sync
       - name: Build no-std-check on Rust ${{ matrix.toolchain }} for ARM Embedded
         if: "matrix.build-no-std && matrix.platform == 'ubuntu-latest'"
         run: |
@@ -192,6 +224,11 @@ jobs:
           RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client
           RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client
           RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client,tokio
+      - name: Test Custom Message Macros on Rust ${{ matrix.toolchain }}
+        if: "matrix.test-custom-message"
+        run: |
+          cd lightning-custom-message
+          cargo test --verbose --color always
       - name: Install deps for kcov
         if: matrix.coverage
         run: |
@@ -242,19 +279,19 @@ jobs:
         id: cache-graph
         uses: actions/cache@v3
         with:
-          path: lightning/net_graph-2021-05-31.bin
-          key: ldk-net_graph-v0.0.15-2021-05-31.bin
+          path: lightning/net_graph-2023-01-18.bin
+          key: ldk-net_graph-v0.0.113-2023-01-18.bin
       - name: Fetch routing graph snapshot
         if: steps.cache-graph.outputs.cache-hit != 'true'
         run: |
-          curl --verbose -L -o lightning/net_graph-2021-05-31.bin https://bitcoin.ninja/ldk-net_graph-v0.0.15-2021-05-31.bin
-          echo "Sha sum: $(sha256sum lightning/net_graph-2021-05-31.bin | awk '{ print $1 }')"
-          if [ "$(sha256sum lightning/net_graph-2021-05-31.bin | awk '{ print $1 }')" != "${EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM}" ]; then
+          curl --verbose -L -o lightning/net_graph-2023-01-18.bin https://bitcoin.ninja/ldk-net_graph-v0.0.113-2023-01-18.bin
+          echo "Sha sum: $(sha256sum lightning/net_graph-2023-01-18.bin | awk '{ print $1 }')"
+          if [ "$(sha256sum lightning/net_graph-2023-01-18.bin | awk '{ print $1 }')" != "${EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM}" ]; then
             echo "Bad hash"
             exit 1
           fi
         env:
-          EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM: 05a5361278f68ee2afd086cc04a1f927a63924be451f3221d380533acfacc303
+          EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM: da6066f2bddcddbe7d8a6debbd53545697137b310bbb8c4911bc8c81fc5ff48c
       - name: Fetch rapid graph sync reference input
         run: |
           curl --verbose -L -o lightning-rapid-gossip-sync/res/full_graph.lngossip https://bitcoin.ninja/ldk-compressed_graph-285cb27df79-2022-07-21.bin
@@ -349,7 +386,7 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.47.0
+      TOOLCHAIN: stable
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3

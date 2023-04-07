@@ -52,6 +52,10 @@
 //!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
 //! - `Keysend` - send funds to a node without an invoice
 //!     (see the [`Keysend` feature assignment proposal](https://github.com/lightning/bolts/issues/605#issuecomment-606679798) for more information).
+//! - `AnchorsZeroFeeHtlcTx` - requires/supports that commitment transactions include anchor outputs
+//!   and HTLC transactions are pre-signed with zero fee (see
+//!   [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more
+//!   information).
 //!
 //! [BOLT #9]: https://github.com/lightning/bolts/blob/master/09-features.md
 //! [messages]: crate::ln::msgs
@@ -65,7 +69,7 @@ use core::marker::PhantomData;
 use bitcoin::bech32;
 use bitcoin::bech32::{Base32Len, FromBase32, ToBase32, u5, WriteBase32};
 use crate::ln::msgs::DecodeError;
-use crate::util::ser::{Readable, Writeable, Writer};
+use crate::util::ser::{Readable, WithoutLength, Writeable, Writer};
 
 mod sealed {
 	use crate::prelude::*;
@@ -122,7 +126,7 @@ mod sealed {
 		// Byte 1
 		VariableLengthOnion | StaticRemoteKey | PaymentSecret,
 		// Byte 2
-		BasicMPP | Wumbo,
+		BasicMPP | Wumbo | AnchorsZeroFeeHtlcTx,
 		// Byte 3
 		ShutdownAnySegwit,
 		// Byte 4
@@ -138,7 +142,7 @@ mod sealed {
 		// Byte 1
 		VariableLengthOnion | StaticRemoteKey | PaymentSecret,
 		// Byte 2
-		BasicMPP | Wumbo,
+		BasicMPP | Wumbo | AnchorsZeroFeeHtlcTx,
 		// Byte 3
 		ShutdownAnySegwit,
 		// Byte 4
@@ -159,6 +163,15 @@ mod sealed {
 	]);
 	define_context!(OfferContext, []);
 	define_context!(InvoiceRequestContext, []);
+	define_context!(Bolt12InvoiceContext, [
+		// Byte 0
+		,
+		// Byte 1
+		,
+		// Byte 2
+		BasicMPP,
+	]);
+	define_context!(BlindedHopContext, []);
 	// This isn't a "real" feature context, and is only used in the channel_type field in an
 	// `OpenChannel` message.
 	define_context!(ChannelTypeContext, [
@@ -167,7 +180,7 @@ mod sealed {
 		// Byte 1
 		StaticRemoteKey,
 		// Byte 2
-		,
+		AnchorsZeroFeeHtlcTx,
 		// Byte 3
 		,
 		// Byte 4
@@ -342,12 +355,15 @@ mod sealed {
 	define_feature!(15, PaymentSecret, [InitContext, NodeContext, InvoiceContext],
 		"Feature flags for `payment_secret`.", set_payment_secret_optional, set_payment_secret_required,
 		supports_payment_secret, requires_payment_secret);
-	define_feature!(17, BasicMPP, [InitContext, NodeContext, InvoiceContext],
+	define_feature!(17, BasicMPP, [InitContext, NodeContext, InvoiceContext, Bolt12InvoiceContext],
 		"Feature flags for `basic_mpp`.", set_basic_mpp_optional, set_basic_mpp_required,
 		supports_basic_mpp, requires_basic_mpp);
 	define_feature!(19, Wumbo, [InitContext, NodeContext],
 		"Feature flags for `option_support_large_channel` (aka wumbo channels).", set_wumbo_optional, set_wumbo_required,
 		supports_wumbo, requires_wumbo);
+	define_feature!(23, AnchorsZeroFeeHtlcTx, [InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for `option_anchors_zero_fee_htlc_tx`.", set_anchors_zero_fee_htlc_tx_optional,
+		set_anchors_zero_fee_htlc_tx_required, supports_anchors_zero_fee_htlc_tx, requires_anchors_zero_fee_htlc_tx);
 	define_feature!(27, ShutdownAnySegwit, [InitContext, NodeContext],
 		"Feature flags for `opt_shutdown_anysegwit`.", set_shutdown_any_segwit_optional,
 		set_shutdown_any_segwit_required, supports_shutdown_anysegwit, requires_shutdown_anysegwit);
@@ -369,7 +385,7 @@ mod sealed {
 
 	#[cfg(test)]
 	define_feature!(123456789, UnknownFeature,
-		[NodeContext, ChannelContext, InvoiceContext, OfferContext, InvoiceRequestContext],
+		[NodeContext, ChannelContext, InvoiceContext, OfferContext, InvoiceRequestContext, Bolt12InvoiceContext, BlindedHopContext],
 		"Feature flags for an unknown feature used in testing.", set_unknown_feature_optional,
 		set_unknown_feature_required, supports_unknown_test_feature, requires_unknown_test_feature);
 }
@@ -432,6 +448,10 @@ pub type InvoiceFeatures = Features<sealed::InvoiceContext>;
 pub type OfferFeatures = Features<sealed::OfferContext>;
 /// Features used within an `invoice_request`.
 pub type InvoiceRequestFeatures = Features<sealed::InvoiceRequestContext>;
+/// Features used within an `invoice`.
+pub type Bolt12InvoiceFeatures = Features<sealed::Bolt12InvoiceContext>;
+/// Features used within BOLT 4 encrypted_data_tlv and BOLT 12 blinded_payinfo
+pub type BlindedHopFeatures = Features<sealed::BlindedHopContext>;
 
 /// Features used within the channel_type field in an OpenChannel message.
 ///
@@ -492,10 +512,10 @@ impl InvoiceFeatures {
 }
 
 impl ChannelTypeFeatures {
-	/// Constructs the implicit channel type based on the common supported types between us and our
-	/// counterparty
-	pub(crate) fn from_counterparty_init(counterparty_init: &InitFeatures) -> Self {
-		let mut ret = counterparty_init.to_context_internal();
+	// Maps the relevant `InitFeatures` to `ChannelTypeFeatures`. Any unknown features to
+	// `ChannelTypeFeatures` are not included in the result.
+	pub(crate) fn from_init(init: &InitFeatures) -> Self {
+		let mut ret = init.to_context_internal();
 		// ChannelTypeFeatures must only contain required bits, so we OR the required forms of all
 		// optional bits and then AND out the optional ones.
 		for byte in ret.flags.iter_mut() {
@@ -665,6 +685,24 @@ impl<T: sealed::Context> Features<T> {
 			(byte & unknown_features) != 0
 		})
 	}
+
+	// Returns true if the features within `self` are a subset of the features within `other`.
+	pub(crate) fn is_subset(&self, other: &Self) -> bool {
+		for (idx, byte) in self.flags.iter().enumerate() {
+			if let Some(other_byte) = other.flags.get(idx) {
+				if byte & other_byte != *byte {
+					// `self` has bits set that `other` doesn't.
+					return false;
+				}
+			} else {
+				if *byte > 0 {
+					// `self` has a non-zero byte that `other` doesn't.
+					return false;
+				}
+			}
+		}
+		true
+	}
 }
 
 impl<T: sealed::UpfrontShutdownScript> Features<T> {
@@ -688,6 +726,18 @@ impl<T: sealed::Wumbo> Features<T> {
 	pub(crate) fn clear_wumbo(mut self) -> Self {
 		<T as sealed::Wumbo>::clear_bits(&mut self.flags);
 		self
+	}
+}
+
+impl<T: sealed::SCIDPrivacy> Features<T> {
+	pub(crate) fn clear_scid_privacy(&mut self) {
+		<T as sealed::SCIDPrivacy>::clear_bits(&mut self.flags);
+	}
+}
+
+impl<T: sealed::AnchorsZeroFeeHtlcTx> Features<T> {
+	pub(crate) fn clear_anchors_zero_fee_htlc_tx(&mut self) {
+		<T as sealed::AnchorsZeroFeeHtlcTx>::clear_bits(&mut self.flags);
 	}
 }
 
@@ -719,32 +769,47 @@ impl_feature_len_prefixed_write!(InitFeatures);
 impl_feature_len_prefixed_write!(ChannelFeatures);
 impl_feature_len_prefixed_write!(NodeFeatures);
 impl_feature_len_prefixed_write!(InvoiceFeatures);
+impl_feature_len_prefixed_write!(BlindedHopFeatures);
 
 // Some features only appear inside of TLVs, so they don't have a length prefix when serialized.
 macro_rules! impl_feature_tlv_write {
 	($features: ident) => {
 		impl Writeable for $features {
 			fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-				self.write_be(w)
+				WithoutLength(self).write(w)
 			}
 		}
 		impl Readable for $features {
 			fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-				let v = io_extras::read_to_end(r)?;
-				Ok(Self::from_be_bytes(v))
+				Ok(WithoutLength::<Self>::read(r)?.0)
 			}
 		}
 	}
 }
 
 impl_feature_tlv_write!(ChannelTypeFeatures);
-impl_feature_tlv_write!(OfferFeatures);
-impl_feature_tlv_write!(InvoiceRequestFeatures);
+
+// Some features may appear both in a TLV record and as part of a TLV subtype sequence. The latter
+// requires a length but the former does not.
+
+impl<T: sealed::Context> Writeable for WithoutLength<&Features<T>> {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.0.write_be(w)
+	}
+}
+
+impl<T: sealed::Context> Readable for WithoutLength<Features<T>> {
+	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let v = io_extras::read_to_end(r)?;
+		Ok(WithoutLength(Features::<T>::from_be_bytes(v)))
+	}
+}
 
 #[cfg(test)]
 mod tests {
-	use super::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, InvoiceFeatures, NodeFeatures, sealed};
+	use super::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, InvoiceFeatures, NodeFeatures, OfferFeatures, sealed};
 	use bitcoin::bech32::{Base32Len, FromBase32, ToBase32, u5};
+	use crate::util::ser::{Readable, WithoutLength, Writeable};
 
 	#[test]
 	fn sanity_test_unknown_bits() {
@@ -780,6 +845,7 @@ mod tests {
 		init_features.set_channel_type_optional();
 		init_features.set_scid_privacy_optional();
 		init_features.set_zero_conf_optional();
+		init_features.set_anchors_zero_fee_htlc_tx_optional();
 
 		assert!(init_features.initial_routing_sync());
 		assert!(!init_features.supports_upfront_shutdown_script());
@@ -798,7 +864,7 @@ mod tests {
 			assert_eq!(node_features.flags.len(), 7);
 			assert_eq!(node_features.flags[0], 0b00000010);
 			assert_eq!(node_features.flags[1], 0b01010001);
-			assert_eq!(node_features.flags[2], 0b00001010);
+			assert_eq!(node_features.flags[2], 0b10001010);
 			assert_eq!(node_features.flags[3], 0b00001000);
 			assert_eq!(node_features.flags[4], 0b10000000);
 			assert_eq!(node_features.flags[5], 0b10100000);
@@ -839,6 +905,20 @@ mod tests {
 	}
 
 	#[test]
+	fn encodes_features_without_length() {
+		let features = OfferFeatures::from_le_bytes(vec![1, 2, 3, 4, 5, 42, 100, 101]);
+		assert_eq!(features.flags.len(), 8);
+
+		let mut serialized_features = Vec::new();
+		WithoutLength(&features).write(&mut serialized_features).unwrap();
+		assert_eq!(serialized_features.len(), 8);
+
+		let deserialized_features =
+			WithoutLength::<OfferFeatures>::read(&mut &serialized_features[..]).unwrap().0;
+		assert_eq!(features, deserialized_features);
+	}
+
+	#[test]
 	fn invoice_features_encoding() {
 		let features_as_u5s = vec![
 			u5::try_from_u8(6).unwrap(),
@@ -875,7 +955,7 @@ mod tests {
 		// required-StaticRemoteKey ChannelTypeFeatures.
 		let mut init_features = InitFeatures::empty();
 		init_features.set_static_remote_key_optional();
-		let converted_features = ChannelTypeFeatures::from_counterparty_init(&init_features);
+		let converted_features = ChannelTypeFeatures::from_init(&init_features);
 		assert_eq!(converted_features, ChannelTypeFeatures::only_static_remote_key());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());

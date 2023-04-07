@@ -37,7 +37,7 @@ pub enum APIError {
 	/// too-many-hops, etc).
 	InvalidRoute {
 		/// A human-readable error message
-		err: &'static str
+		err: String
 	},
 	/// We were unable to complete the request as the Channel required to do so is unable to
 	/// complete the request (or was not found). This can take many forms, including disconnected
@@ -55,13 +55,13 @@ pub enum APIError {
 	/// [`chain::Watch::update_channel`]: crate::chain::Watch::update_channel
 	/// [`ChannelMonitorUpdateStatus::InProgress`]: crate::chain::ChannelMonitorUpdateStatus::InProgress
 	MonitorUpdateInProgress,
-	/// [`KeysInterface::get_shutdown_scriptpubkey`] returned a shutdown scriptpubkey incompatible
+	/// [`SignerProvider::get_shutdown_scriptpubkey`] returned a shutdown scriptpubkey incompatible
 	/// with the channel counterparty as negotiated in [`InitFeatures`].
 	///
 	/// Using a SegWit v0 script should resolve this issue. If you cannot, you won't be able to open
 	/// a channel or cooperatively close one with this peer (and will have to force-close instead).
 	///
-	/// [`KeysInterface::get_shutdown_scriptpubkey`]: crate::chain::keysinterface::KeysInterface::get_shutdown_scriptpubkey
+	/// [`SignerProvider::get_shutdown_scriptpubkey`]: crate::chain::keysinterface::SignerProvider::get_shutdown_scriptpubkey
 	/// [`InitFeatures`]: crate::ln::features::InitFeatures
 	IncompatibleShutdownScript {
 		/// The incompatible shutdown script.
@@ -83,6 +83,18 @@ impl fmt::Debug for APIError {
 		}
 	}
 }
+
+impl_writeable_tlv_based_enum_upgradable!(APIError,
+	(0, APIMisuseError) => { (0, err, required), },
+	(2, FeeRateTooHigh) => {
+		(0, err, required),
+		(2, feerate, required),
+	},
+	(4, InvalidRoute) => { (0, err, required), },
+	(6, ChannelUnavailable) => { (0, err, required), },
+	(8, MonitorUpdateInProgress) => {},
+	(10, IncompatibleShutdownScript) => { (0, script, required), },
+);
 
 #[inline]
 pub(crate) fn get_onion_debug_field(error_code: u16) -> (&'static str, usize) {

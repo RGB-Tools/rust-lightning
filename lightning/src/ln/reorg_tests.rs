@@ -12,9 +12,9 @@
 use crate::chain::channelmonitor::ANTI_REORG_DELAY;
 use crate::chain::transaction::OutPoint;
 use crate::chain::Confirm;
-use crate::ln::channelmanager::{self, ChannelManager};
-use crate::ln::msgs::ChannelMessageHandler;
-use crate::util::events::{Event, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination};
+use crate::ln::channelmanager::ChannelManager;
+use crate::ln::msgs::{ChannelMessageHandler, Init};
+use crate::util::events::{Event, MessageSendEventsProvider, ClosureReason, HTLCDestination};
 use crate::util::test_utils;
 use crate::util::ser::Writeable;
 
@@ -24,7 +24,6 @@ use bitcoin::blockdata::opcodes;
 use bitcoin::secp256k1::Secp256k1;
 
 use crate::prelude::*;
-use core::mem;
 use bitcoin::hashes::Hash;
 use bitcoin::TxMerkleNode;
 
@@ -51,8 +50,8 @@ fn do_test_onchain_htlc_reorg(local_commitment: bool, claim: bool) {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
 	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
-	let chan_2 = create_announced_chan_between_nodes(&nodes, 1, 2, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_2 = create_announced_chan_between_nodes(&nodes, 1, 2);
 
 	// Make sure all nodes are at the same starting height
 	connect_blocks(&nodes[0], 2*CHAN_CONFIRM_DEPTH + 1 - nodes[0].best_block_info().1);
@@ -82,10 +81,7 @@ fn do_test_onchain_htlc_reorg(local_commitment: bool, claim: bool) {
 		check_closed_broadcast!(nodes[2], true); // We should get a BroadcastChannelUpdate (and *only* a BroadcstChannelUpdate)
 		check_closed_event!(nodes[2], 1, ClosureReason::CommitmentTxConfirmed);
 		let node_2_commitment_txn = nodes[2].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-		assert_eq!(node_2_commitment_txn.len(), 3); // ChannelMonitor: 1 offered HTLC-Claim, ChannelManger: 1 local commitment tx, 1 Received HTLC-Claim
-		assert_eq!(node_2_commitment_txn[1].output.len(), 2); // to-remote and Received HTLC (to-self is dust)
-		check_spends!(node_2_commitment_txn[1], chan_2.3);
-		check_spends!(node_2_commitment_txn[2], node_2_commitment_txn[1]);
+		assert_eq!(node_2_commitment_txn.len(), 1); // ChannelMonitor: 1 offered HTLC-Claim
 		check_spends!(node_2_commitment_txn[0], node_1_commitment_txn[0]);
 
 		// Make sure node 1's height is the same as the !local_commitment case
@@ -108,13 +104,11 @@ fn do_test_onchain_htlc_reorg(local_commitment: bool, claim: bool) {
 		mine_transaction(&nodes[1], &node_2_commitment_txn[0]);
 		connect_blocks(&nodes[1], TEST_FINAL_CLTV - 1); // Confirm blocks until the HTLC expires
 		let node_1_commitment_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
-		assert_eq!(node_1_commitment_txn.len(), 2); // ChannelMonitor: 1 offered HTLC-Timeout, ChannelManger: 1 local commitment tx
-		assert_eq!(node_1_commitment_txn[0].output.len(), 2); // to-local and Offered HTLC (to-remote is dust)
-		check_spends!(node_1_commitment_txn[0], chan_2.3);
-		check_spends!(node_1_commitment_txn[1], node_2_commitment_txn[0]);
+		assert_eq!(node_1_commitment_txn.len(), 1); // ChannelMonitor: 1 offered HTLC-Timeout
+		check_spends!(node_1_commitment_txn[0], node_2_commitment_txn[0]);
 
 		// Confirm node 1's HTLC-Timeout on node 1
-		mine_transaction(&nodes[1], &node_1_commitment_txn[1]);
+		mine_transaction(&nodes[1], &node_1_commitment_txn[0]);
 		// ...but return node 2's commitment tx (and claim) in case claim is set and we're preparing to reorg
 		vec![node_2_commitment_txn.pop().unwrap()]
 	};
@@ -196,7 +190,7 @@ fn test_counterparty_revoked_reorg() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
 
 	// Get the initial commitment transaction for broadcast, before any HTLCs are added at all.
 	let revoked_local_txn = get_local_commitment_txn!(nodes[0], chan.2);
@@ -265,17 +259,19 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let persister: test_utils::TestPersister;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let nodes_0_deserialized: ChannelManager<&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_0_deserialized: ChannelManager<&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestRouter, &test_utils::TestLogger>;
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	*nodes[0].connect_style.borrow_mut() = connect_style;
 
 	let chan_conf_height = core::cmp::max(nodes[0].best_block_info().1 + 1, nodes[1].best_block_info().1 + 1);
-	let chan = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
 
-	let channel_state = nodes[0].node.channel_state.lock().unwrap();
-	assert_eq!(channel_state.by_id.len(), 1);
-	assert_eq!(nodes[0].node.short_to_chan_info.read().unwrap().len(), 2);
-	mem::drop(channel_state);
+	{
+		let per_peer_state = nodes[0].node.per_peer_state.read().unwrap();
+		let peer_state = per_peer_state.get(&nodes[1].node.get_our_node_id()).unwrap().lock().unwrap();
+		assert_eq!(peer_state.channel_by_id.len(), 1);
+		assert_eq!(nodes[0].node.short_to_chan_info.read().unwrap().len(), 2);
+	}
 
 	assert_eq!(nodes[0].node.list_channels()[0].confirmations, Some(10));
 	assert_eq!(nodes[1].node.list_channels()[0].confirmations, Some(10));
@@ -308,8 +304,9 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 		handle_announce_close_broadcast_events(&nodes, 0, 1, true, "Channel closed because of an exception: Funding transaction was un-confirmed. Locked at 6 confs, now have 0 confs.");
 		check_added_monitors!(nodes[1], 1);
 		{
-			let channel_state = nodes[0].node.channel_state.lock().unwrap();
-			assert_eq!(channel_state.by_id.len(), 0);
+			let per_peer_state = nodes[0].node.per_peer_state.read().unwrap();
+			let peer_state = per_peer_state.get(&nodes[1].node.get_our_node_id()).unwrap().lock().unwrap();
+			assert_eq!(peer_state.channel_by_id.len(), 0);
 			assert_eq!(nodes[0].node.short_to_chan_info.read().unwrap().len(), 0);
 		}
 	}
@@ -359,8 +356,9 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 		handle_announce_close_broadcast_events(&nodes, 0, 1, true, "Channel closed because of an exception: Funding transaction was un-confirmed. Locked at 6 confs, now have 0 confs.");
 		check_added_monitors!(nodes[1], 1);
 		{
-			let channel_state = nodes[0].node.channel_state.lock().unwrap();
-			assert_eq!(channel_state.by_id.len(), 0);
+			let per_peer_state = nodes[0].node.per_peer_state.read().unwrap();
+			let peer_state = per_peer_state.get(&nodes[1].node.get_our_node_id()).unwrap().lock().unwrap();
+			assert_eq!(peer_state.channel_by_id.len(), 0);
 			assert_eq!(nodes[0].node.short_to_chan_info.read().unwrap().len(), 0);
 		}
 	}
@@ -376,7 +374,13 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 	nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
 
 	// Now check that we can create a new channel
-	create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	if reload_node && nodes[0].node.per_peer_state.read().unwrap().len() == 0 {
+		// If we dropped the channel before reloading the node, nodes[1] was also dropped from
+		// nodes[0] storage, and hence not connected again on startup. We therefore need to
+		// reconnect to the node before attempting to create a new channel.
+		nodes[0].node.peer_connected(&nodes[1].node.get_our_node_id(), &Init { features: nodes[1].node.init_features(), remote_network_address: None }, true).unwrap();
+	}
+	create_announced_chan_between_nodes(&nodes, 0, 1);
 	send_payment(&nodes[0], &[&nodes[1]], 8000000);
 }
 
@@ -429,7 +433,7 @@ fn test_set_outpoints_partial_claiming() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 59000000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1000000, 59000000);
 	let (payment_preimage_1, payment_hash_1, _) = route_payment(&nodes[1], &[&nodes[0]], 3_000_000);
 	let (payment_preimage_2, payment_hash_2, _) = route_payment(&nodes[1], &[&nodes[0]], 3_000_000);
 
@@ -459,12 +463,9 @@ fn test_set_outpoints_partial_claiming() {
 	// Verify node A broadcast tx claiming both HTLCs
 	{
 		let mut node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		// ChannelMonitor: claim tx, ChannelManager: local commitment tx + HTLC-Success*2
-		assert_eq!(node_txn.len(), 4);
+		// ChannelMonitor: claim tx
+		assert_eq!(node_txn.len(), 1);
 		check_spends!(node_txn[0], remote_txn[0]);
-		check_spends!(node_txn[1], chan.3);
-		check_spends!(node_txn[2], node_txn[1]);
-		check_spends!(node_txn[3], node_txn[1]);
 		assert_eq!(node_txn[0].input.len(), 2);
 		node_txn.clear();
 	}
@@ -534,7 +535,7 @@ fn do_test_to_remote_after_local_detection(style: ConnectStyle) {
 	*nodes[1].connect_style.borrow_mut() = style;
 
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
@@ -552,11 +553,6 @@ fn do_test_to_remote_after_local_detection(style: ConnectStyle) {
 	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed);
-
-	// Drop transactions broadcasted in response to the first commitment transaction (we have good
-	// test coverage of these things already elsewhere).
-	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0).len(), 1);
-	assert_eq!(nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0).len(), 1);
 
 	assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
 	assert!(nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());

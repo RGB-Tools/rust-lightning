@@ -10,11 +10,10 @@
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, MIN_CHAN_DUST_LIMIT_SATOSHIS};
 use crate::ln::chan_utils::{HTLCOutputInCommitment, ChannelPublicKeys, HolderCommitmentTransaction, CommitmentTransaction, ChannelTransactionParameters, TrustedCommitmentTransaction, ClosingTransaction};
 use crate::ln::{chan_utils, msgs, PaymentPreimage};
-use crate::chain::keysinterface::{Sign, InMemorySigner, BaseSign};
+use crate::chain::keysinterface::{WriteableEcdsaChannelSigner, InMemorySigner, ChannelSigner, EcdsaChannelSigner};
 
 use crate::prelude::*;
 use core::cmp;
-use std::path::PathBuf;
 use crate::sync::{Mutex, Arc};
 #[cfg(test)] use crate::sync::MutexGuard;
 
@@ -28,8 +27,6 @@ use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
 use crate::util::events::HTLCDescriptor;
 use crate::util::ser::{Writeable, Writer};
 use crate::io::Error;
-
-use rgb_rpc::client::Client;
 
 /// Initial value for revoked commitment downward counter
 pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
@@ -59,6 +56,12 @@ pub struct EnforcingSigner {
 	/// Channel state used for policy enforcement
 	pub state: Arc<Mutex<EnforcementState>>,
 	pub disable_revocation_policy_check: bool,
+}
+
+impl PartialEq for EnforcingSigner {
+	fn eq(&self, o: &Self) -> bool {
+		Arc::ptr_eq(&self.state, &o.state)
+	}
 }
 
 impl EnforcingSigner {
@@ -93,7 +96,7 @@ impl EnforcingSigner {
 	}
 }
 
-impl BaseSign for EnforcingSigner {
+impl ChannelSigner for EnforcingSigner {
 	fn get_per_commitment_point(&self, idx: u64, secp_ctx: &Secp256k1<secp256k1::All>) -> PublicKey {
 		self.inner.get_per_commitment_point(idx, secp_ctx)
 	}
@@ -117,9 +120,16 @@ impl BaseSign for EnforcingSigner {
 	}
 
 	fn pubkeys(&self) -> &ChannelPublicKeys { self.inner.pubkeys() }
+
 	fn channel_keys_id(&self) -> [u8; 32] { self.inner.channel_keys_id() }
 
-	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>, ldk_data_dir: &PathBuf) -> Result<(Signature, Vec<Signature>), ()> {
+	fn provide_channel_parameters(&mut self, channel_parameters: &ChannelTransactionParameters) {
+		self.inner.provide_channel_parameters(channel_parameters)
+	}
+}
+
+impl EcdsaChannelSigner for EnforcingSigner {
+	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
 		self.verify_counterparty_commitment_tx(commitment_tx, secp_ctx);
 
 		{
@@ -135,7 +145,7 @@ impl BaseSign for EnforcingSigner {
 			state.last_counterparty_commitment = cmp::min(last_commitment_number, actual_commitment_number)
 		}
 
-		Ok(self.inner.sign_counterparty_commitment(commitment_tx, preimages, secp_ctx, ldk_data_dir).unwrap())
+		Ok(self.inner.sign_counterparty_commitment(commitment_tx, preimages, secp_ctx).unwrap())
 	}
 
 	fn validate_counterparty_revocation(&self, idx: u64, _secret: &SecretKey) -> Result<(), ()> {
@@ -226,23 +236,20 @@ impl BaseSign for EnforcingSigner {
 		self.inner.sign_holder_anchor_input(anchor_tx, input, secp_ctx)
 	}
 
-	fn sign_channel_announcement(&self, msg: &msgs::UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>)
-	-> Result<(Signature, Signature), ()> {
-		self.inner.sign_channel_announcement(msg, secp_ctx)
-	}
-
-	fn provide_channel_parameters(&mut self, channel_parameters: &ChannelTransactionParameters) {
-		self.inner.provide_channel_parameters(channel_parameters)
+	fn sign_channel_announcement_with_funding_key(
+		&self, msg: &msgs::UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<Signature, ()> {
+		self.inner.sign_channel_announcement_with_funding_key(msg, secp_ctx)
 	}
 }
 
-impl Sign for EnforcingSigner {}
+impl WriteableEcdsaChannelSigner for EnforcingSigner {}
 
 impl Writeable for EnforcingSigner {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		// EnforcingSigner has two fields - `inner` ([`InMemorySigner`]) and `state`
 		// ([`EnforcementState`]). `inner` is serialized here and deserialized by
-		// [`KeysInterface::read_chan_signer`]. `state` is managed by [`KeysInterface`]
+		// [`SignerProvider::read_chan_signer`]. `state` is managed by [`SignerProvider`]
 		// and will be serialized as needed by the implementation of that trait.
 		self.inner.write(writer)?;
 		Ok(())

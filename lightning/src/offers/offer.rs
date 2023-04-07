@@ -13,7 +13,7 @@
 //! published as a QR code to be scanned by a customer. The customer uses the offer to request an
 //! invoice from the merchant to be paid.
 //!
-//! ```ignore
+//! ```
 //! extern crate bitcoin;
 //! extern crate core;
 //! extern crate lightning;
@@ -106,7 +106,7 @@ impl OfferBuilder {
 		let offer = OfferContents {
 			chains: None, metadata: None, amount: None, description,
 			features: OfferFeatures::empty(), absolute_expiry: None, issuer: None, paths: None,
-			supported_quantity: Quantity::one(), signing_pubkey: Some(signing_pubkey),
+			supported_quantity: Quantity::One, signing_pubkey,
 		};
 		OfferBuilder { offer }
 	}
@@ -178,7 +178,7 @@ impl OfferBuilder {
 	}
 
 	/// Sets the quantity of items for [`Offer::supported_quantity`]. If not called, defaults to
-	/// [`Quantity::one`].
+	/// [`Quantity::One`].
 	///
 	/// Successive calls to this method will override the previous setting.
 	pub fn supported_quantity(mut self, quantity: Quantity) -> Self {
@@ -232,7 +232,7 @@ impl OfferBuilder {
 /// An `Offer` is a potentially long-lived proposal for payment of a good or service.
 ///
 /// An offer is a precursor to an [`InvoiceRequest`]. A merchant publishes an offer from which a
-/// customer may request an `Invoice` for a specific quantity and using an amount sufficient to
+/// customer may request an [`Invoice`] for a specific quantity and using an amount sufficient to
 /// cover that quantity (i.e., at least `quantity * amount`). See [`Offer::amount`].
 ///
 /// Offers may be denominated in currency other than bitcoin but are ultimately paid using the
@@ -241,7 +241,8 @@ impl OfferBuilder {
 /// Through the use of [`BlindedPath`]s, offers provide recipient privacy.
 ///
 /// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
-#[derive(Clone, Debug)]
+/// [`Invoice`]: crate::offers::invoice::Invoice
+#[derive(Clone, Debug, PartialEq)]
 pub struct Offer {
 	// The serialized offer. Needed when creating an `InvoiceRequest` if the offer contains unknown
 	// fields.
@@ -249,10 +250,11 @@ pub struct Offer {
 	pub(super) contents: OfferContents,
 }
 
-/// The contents of an [`Offer`], which may be shared with an [`InvoiceRequest`] or an `Invoice`.
+/// The contents of an [`Offer`], which may be shared with an [`InvoiceRequest`] or an [`Invoice`].
 ///
 /// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
-#[derive(Clone, Debug)]
+/// [`Invoice`]: crate::offers::invoice::Invoice
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct OfferContents {
 	chains: Option<Vec<ChainHash>>,
 	metadata: Option<Vec<u8>>,
@@ -263,7 +265,7 @@ pub(super) struct OfferContents {
 	issuer: Option<String>,
 	paths: Option<Vec<BlindedPath>>,
 	supported_quantity: Quantity,
-	signing_pubkey: Option<PublicKey>,
+	signing_pubkey: PublicKey,
 }
 
 impl Offer {
@@ -319,13 +321,7 @@ impl Offer {
 	/// Whether the offer has expired.
 	#[cfg(feature = "std")]
 	pub fn is_expired(&self) -> bool {
-		match self.absolute_expiry() {
-			Some(seconds_from_epoch) => match SystemTime::UNIX_EPOCH.elapsed() {
-				Ok(elapsed) => elapsed > seconds_from_epoch,
-				Err(_) => false,
-			},
-			None => false,
-		}
+		self.contents.is_expired()
 	}
 
 	/// The issuer of the offer, possibly beginning with `user@domain` or `domain`. Intended to be
@@ -359,7 +355,7 @@ impl Offer {
 
 	/// The public key used by the recipient to sign invoices.
 	pub fn signing_pubkey(&self) -> PublicKey {
-		self.contents.signing_pubkey.unwrap()
+		self.contents.signing_pubkey()
 	}
 
 	/// Creates an [`InvoiceRequest`] for the offer with the given `metadata` and `payer_id`, which
@@ -410,6 +406,17 @@ impl OfferContents {
 		self.chains().contains(&chain)
 	}
 
+	#[cfg(feature = "std")]
+	pub(super) fn is_expired(&self) -> bool {
+		match self.absolute_expiry {
+			Some(seconds_from_epoch) => match SystemTime::UNIX_EPOCH.elapsed() {
+				Ok(elapsed) => elapsed > seconds_from_epoch,
+				Err(_) => false,
+			},
+			None => false,
+		}
+	}
+
 	pub fn amount(&self) -> Option<&Amount> {
 		self.amount.as_ref()
 	}
@@ -424,7 +431,8 @@ impl OfferContents {
 		};
 
 		if !self.expects_quantity() || quantity.is_some() {
-			let expected_amount_msats = offer_amount_msats * quantity.unwrap_or(1);
+			let expected_amount_msats = offer_amount_msats.checked_mul(quantity.unwrap_or(1))
+				.ok_or(SemanticError::InvalidAmount)?;
 			let amount_msats = amount_msats.unwrap_or(expected_amount_msats);
 
 			if amount_msats < expected_amount_msats {
@@ -457,20 +465,22 @@ impl OfferContents {
 
 	fn is_valid_quantity(&self, quantity: u64) -> bool {
 		match self.supported_quantity {
-			Quantity::Bounded(n) => {
-				let n = n.get();
-				if n == 1 { false }
-				else { quantity > 0 && quantity <= n }
-			},
+			Quantity::Bounded(n) => quantity <= n.get(),
 			Quantity::Unbounded => quantity > 0,
+			Quantity::One => quantity == 1,
 		}
 	}
 
 	fn expects_quantity(&self) -> bool {
 		match self.supported_quantity {
-			Quantity::Bounded(n) => n.get() != 1,
+			Quantity::Bounded(_) => true,
 			Quantity::Unbounded => true,
+			Quantity::One => false,
 		}
+	}
+
+	pub(super) fn signing_pubkey(&self) -> PublicKey {
+		self.signing_pubkey
 	}
 
 	pub(super) fn as_tlv_stream(&self) -> OfferTlvStreamRef {
@@ -497,7 +507,7 @@ impl OfferContents {
 			paths: self.paths.as_ref(),
 			issuer: self.issuer.as_ref(),
 			quantity_max: self.supported_quantity.to_tlv_record(),
-			node_id: self.signing_pubkey.as_ref(),
+			node_id: Some(&self.signing_pubkey),
 		}
 	}
 }
@@ -538,25 +548,24 @@ pub type CurrencyCode = [u8; 3];
 /// Quantity of items supported by an [`Offer`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Quantity {
-	/// Up to a specific number of items (inclusive).
+	/// Up to a specific number of items (inclusive). Use when more than one item can be requested
+	/// but is limited (e.g., because of per customer or inventory limits).
+	///
+	/// May be used with `NonZeroU64::new(1)` but prefer to use [`Quantity::One`] if only one item
+	/// is supported.
 	Bounded(NonZeroU64),
-	/// One or more items.
+	/// One or more items. Use when more than one item can be requested without any limit.
 	Unbounded,
+	/// Only one item. Use when only a single item can be requested.
+	One,
 }
 
 impl Quantity {
-	/// The default quantity of one.
-	pub fn one() -> Self {
-		Quantity::Bounded(NonZeroU64::new(1).unwrap())
-	}
-
 	fn to_tlv_record(&self) -> Option<u64> {
 		match self {
-			Quantity::Bounded(n) => {
-				let n = n.get();
-				if n == 1 { None } else { Some(n) }
-			},
+			Quantity::Bounded(n) => Some(n.get()),
 			Quantity::Unbounded => Some(0),
+			Quantity::One => None,
 		}
 	}
 }
@@ -567,7 +576,7 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef, 1..80, {
 	(6, currency: CurrencyCode),
 	(8, amount: (u64, HighZeroBytesDroppedBigSize)),
 	(10, description: (String, WithoutLength)),
-	(12, features: OfferFeatures),
+	(12, features: (OfferFeatures, WithoutLength)),
 	(14, absolute_expiry: (u64, HighZeroBytesDroppedBigSize)),
 	(16, paths: (Vec<BlindedPath>, WithoutLength)),
 	(18, issuer: (String, WithoutLength)),
@@ -628,19 +637,19 @@ impl TryFrom<OfferTlvStream> for OfferContents {
 			.map(|seconds_from_epoch| Duration::from_secs(seconds_from_epoch));
 
 		let supported_quantity = match quantity_max {
-			None => Quantity::one(),
+			None => Quantity::One,
 			Some(0) => Quantity::Unbounded,
-			Some(1) => return Err(SemanticError::InvalidQuantity),
 			Some(n) => Quantity::Bounded(NonZeroU64::new(n).unwrap()),
 		};
 
-		if node_id.is_none() {
-			return Err(SemanticError::MissingSigningPubkey);
-		}
+		let signing_pubkey = match node_id {
+			None => return Err(SemanticError::MissingSigningPubkey),
+			Some(node_id) => node_id,
+		};
 
 		Ok(OfferContents {
 			chains, metadata, amount, description, features, absolute_expiry, issuer, paths,
-			supported_quantity, signing_pubkey: node_id,
+			supported_quantity, signing_pubkey,
 		})
 	}
 }
@@ -653,7 +662,7 @@ impl core::fmt::Display for Offer {
 
 #[cfg(test)]
 mod tests {
-	use super::{Amount, Offer, OfferBuilder, Quantity};
+	use super::{Amount, Offer, OfferBuilder, OfferTlvStreamRef, Quantity};
 
 	use bitcoin::blockdata::constants::ChainHash;
 	use bitcoin::network::constants::Network;
@@ -680,7 +689,7 @@ mod tests {
 	#[test]
 	fn builds_offer_with_defaults() {
 		let offer = OfferBuilder::new("foo".into(), pubkey(42)).build().unwrap();
-		let tlv_stream = offer.as_tlv_stream();
+
 		let mut buffer = Vec::new();
 		offer.write(&mut buffer).unwrap();
 
@@ -696,20 +705,25 @@ mod tests {
 		assert!(!offer.is_expired());
 		assert_eq!(offer.paths(), &[]);
 		assert_eq!(offer.issuer(), None);
-		assert_eq!(offer.supported_quantity(), Quantity::one());
+		assert_eq!(offer.supported_quantity(), Quantity::One);
 		assert_eq!(offer.signing_pubkey(), pubkey(42));
 
-		assert_eq!(tlv_stream.chains, None);
-		assert_eq!(tlv_stream.metadata, None);
-		assert_eq!(tlv_stream.currency, None);
-		assert_eq!(tlv_stream.amount, None);
-		assert_eq!(tlv_stream.description, Some(&String::from("foo")));
-		assert_eq!(tlv_stream.features, None);
-		assert_eq!(tlv_stream.absolute_expiry, None);
-		assert_eq!(tlv_stream.paths, None);
-		assert_eq!(tlv_stream.issuer, None);
-		assert_eq!(tlv_stream.quantity_max, None);
-		assert_eq!(tlv_stream.node_id, Some(&pubkey(42)));
+		assert_eq!(
+			offer.as_tlv_stream(),
+			OfferTlvStreamRef {
+				chains: None,
+				metadata: None,
+				currency: None,
+				amount: None,
+				description: Some(&String::from("foo")),
+				features: None,
+				absolute_expiry: None,
+				paths: None,
+				issuer: None,
+				quantity_max: None,
+				node_id: Some(&pubkey(42)),
+			},
+		);
 
 		if let Err(e) = Offer::try_from(buffer) {
 			panic!("error parsing offer: {:?}", e);
@@ -913,14 +927,15 @@ mod tests {
 
 	#[test]
 	fn builds_offer_with_supported_quantity() {
+		let one = NonZeroU64::new(1).unwrap();
 		let ten = NonZeroU64::new(10).unwrap();
 
 		let offer = OfferBuilder::new("foo".into(), pubkey(42))
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build()
 			.unwrap();
 		let tlv_stream = offer.as_tlv_stream();
-		assert_eq!(offer.supported_quantity(), Quantity::one());
+		assert_eq!(offer.supported_quantity(), Quantity::One);
 		assert_eq!(tlv_stream.quantity_max, None);
 
 		let offer = OfferBuilder::new("foo".into(), pubkey(42))
@@ -940,12 +955,20 @@ mod tests {
 		assert_eq!(tlv_stream.quantity_max, Some(10));
 
 		let offer = OfferBuilder::new("foo".into(), pubkey(42))
-			.supported_quantity(Quantity::Bounded(ten))
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::Bounded(one))
 			.build()
 			.unwrap();
 		let tlv_stream = offer.as_tlv_stream();
-		assert_eq!(offer.supported_quantity(), Quantity::one());
+		assert_eq!(offer.supported_quantity(), Quantity::Bounded(one));
+		assert_eq!(tlv_stream.quantity_max, Some(1));
+
+		let offer = OfferBuilder::new("foo".into(), pubkey(42))
+			.supported_quantity(Quantity::Bounded(ten))
+			.supported_quantity(Quantity::One)
+			.build()
+			.unwrap();
+		let tlv_stream = offer.as_tlv_stream();
+		assert_eq!(offer.supported_quantity(), Quantity::One);
 		assert_eq!(tlv_stream.quantity_max, None);
 	}
 
@@ -1077,7 +1100,7 @@ mod tests {
 	#[test]
 	fn parses_offer_with_quantity() {
 		let offer = OfferBuilder::new("foo".into(), pubkey(42))
-			.supported_quantity(Quantity::one())
+			.supported_quantity(Quantity::One)
 			.build()
 			.unwrap();
 		if let Err(e) = offer.to_string().parse::<Offer>() {
@@ -1100,17 +1123,12 @@ mod tests {
 			panic!("error parsing offer: {:?}", e);
 		}
 
-		let mut tlv_stream = offer.as_tlv_stream();
-		tlv_stream.quantity_max = Some(1);
-
-		let mut encoded_offer = Vec::new();
-		tlv_stream.write(&mut encoded_offer).unwrap();
-
-		match Offer::try_from(encoded_offer) {
-			Ok(_) => panic!("expected error"),
-			Err(e) => {
-				assert_eq!(e, ParseError::InvalidSemantics(SemanticError::InvalidQuantity));
-			},
+		let offer = OfferBuilder::new("foo".into(), pubkey(42))
+			.supported_quantity(Quantity::Bounded(NonZeroU64::new(1).unwrap()))
+			.build()
+			.unwrap();
+		if let Err(e) = offer.to_string().parse::<Offer>() {
+			panic!("error parsing offer: {:?}", e);
 		}
 	}
 
@@ -1121,11 +1139,13 @@ mod tests {
 			panic!("error parsing offer: {:?}", e);
 		}
 
-		let mut builder = OfferBuilder::new("foo".into(), pubkey(42));
-		builder.offer.signing_pubkey = None;
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.node_id = None;
 
-		let offer = builder.build().unwrap();
-		match offer.to_string().parse::<Offer>() {
+		let mut encoded_offer = Vec::new();
+		tlv_stream.write(&mut encoded_offer).unwrap();
+
+		match Offer::try_from(encoded_offer) {
 			Ok(_) => panic!("expected error"),
 			Err(e) => {
 				assert_eq!(e, ParseError::InvalidSemantics(SemanticError::MissingSigningPubkey));

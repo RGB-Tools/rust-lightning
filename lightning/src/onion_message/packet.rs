@@ -118,6 +118,8 @@ pub enum OnionMessageContents<T: CustomOnionMessageContents> {
 
 impl<T: CustomOnionMessageContents> OnionMessageContents<T> {
 	/// Returns the type that was used to decode the message payload.
+	///
+	/// (C-not exported) as methods on non-cloneable enums are not currently exportable
 	pub fn tlv_type(&self) -> u64 {
 		match self {
 			&OnionMessageContents::Custom(ref msg) => msg.tlv_type(),
@@ -125,6 +127,7 @@ impl<T: CustomOnionMessageContents> OnionMessageContents<T> {
 	}
 }
 
+/// (C-not exported) as methods on non-cloneable enums are not currently exportable
 impl<T: CustomOnionMessageContents> Writeable for OnionMessageContents<T> {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		match self {
@@ -163,14 +166,14 @@ impl<T: CustomOnionMessageContents> Writeable for (Payload<T>, [u8; 32]) {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		match &self.0 {
 			Payload::Forward(ForwardControlTlvs::Blinded(encrypted_bytes)) => {
-				encode_varint_length_prefixed_tlv!(w, {
+				_encode_varint_length_prefixed_tlv!(w, {
 					(4, *encrypted_bytes, vec_type)
 				})
 			},
 			Payload::Receive {
 				control_tlvs: ReceiveControlTlvs::Blinded(encrypted_bytes), reply_path, message,
 			} => {
-				encode_varint_length_prefixed_tlv!(w, {
+				_encode_varint_length_prefixed_tlv!(w, {
 					(2, reply_path, option),
 					(4, *encrypted_bytes, vec_type),
 					(message.tlv_type(), message, required)
@@ -178,7 +181,7 @@ impl<T: CustomOnionMessageContents> Writeable for (Payload<T>, [u8; 32]) {
 			},
 			Payload::Forward(ForwardControlTlvs::Unblinded(control_tlvs)) => {
 				let write_adapter = ChaChaPolyWriteAdapter::new(self.1, &control_tlvs);
-				encode_varint_length_prefixed_tlv!(w, {
+				_encode_varint_length_prefixed_tlv!(w, {
 					(4, write_adapter, required)
 				})
 			},
@@ -186,7 +189,7 @@ impl<T: CustomOnionMessageContents> Writeable for (Payload<T>, [u8; 32]) {
 				control_tlvs: ReceiveControlTlvs::Unblinded(control_tlvs), reply_path, message,
 			} => {
 				let write_adapter = ChaChaPolyWriteAdapter::new(self.1, &control_tlvs);
-				encode_varint_length_prefixed_tlv!(w, {
+				_encode_varint_length_prefixed_tlv!(w, {
 					(2, reply_path, option),
 					(4, write_adapter, required),
 					(message.tlv_type(), message, required)
@@ -209,7 +212,7 @@ impl<H: CustomOnionMessageHandler> ReadableArgs<(SharedSecret, &H)> for Payload<
 		let rho = onion_utils::gen_rho_from_shared_secret(&encrypted_tlvs_ss.secret_bytes());
 		let mut message_type: Option<u64> = None;
 		let mut message = None;
-		decode_tlv_stream!(&mut rd, {
+		decode_tlv_stream_with_custom_tlv_decode!(&mut rd, {
 			(2, reply_path, option),
 			(4, read_adapter, (option: LengthReadableArgs, rho)),
 		}, |msg_type, msg_reader| {

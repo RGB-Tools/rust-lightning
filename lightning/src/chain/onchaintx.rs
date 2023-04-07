@@ -21,7 +21,7 @@ use bitcoin::hash_types::{Txid, BlockHash};
 use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
 use bitcoin::secp256k1;
 
-use crate::chain::keysinterface::BaseSign;
+use crate::chain::keysinterface::{ChannelSigner, EntropySource, SignerProvider};
 use crate::ln::msgs::DecodeError;
 use crate::ln::PaymentPreimage;
 #[cfg(anchors)]
@@ -31,12 +31,12 @@ use crate::ln::chan_utils::{ChannelTransactionParameters, HolderCommitmentTransa
 use crate::chain::chaininterface::ConfirmationTarget;
 use crate::chain::chaininterface::{FeeEstimator, BroadcasterInterface, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ANTI_REORG_DELAY, CLTV_SHARED_CLAIM_BUFFER};
-use crate::chain::keysinterface::{Sign, KeysInterface};
+use crate::chain::keysinterface::WriteableEcdsaChannelSigner;
 #[cfg(anchors)]
 use crate::chain::package::PackageSolvingData;
 use crate::chain::package::PackageTemplate;
 use crate::util::logger::Logger;
-use crate::util::ser::{Readable, ReadableArgs, MaybeReadable, Writer, Writeable, VecWriter};
+use crate::util::ser::{Readable, ReadableArgs, MaybeReadable, UpgradableRequired, Writer, Writeable, VecWriter};
 
 use crate::io;
 use crate::prelude::*;
@@ -107,18 +107,14 @@ impl MaybeReadable for OnchainEventEntry {
 		let mut txid = Txid::all_zeros();
 		let mut height = 0;
 		let mut block_hash = None;
-		let mut event = None;
+		let mut event = UpgradableRequired(None);
 		read_tlv_fields!(reader, {
 			(0, txid, required),
 			(1, block_hash, option),
 			(2, height, required),
-			(4, event, ignorable),
+			(4, event, upgradable_required),
 		});
-		if let Some(ev) = event {
-			Ok(Some(Self { txid, height, block_hash, event: ev }))
-		} else {
-			Ok(None)
-		}
+		Ok(Some(Self { txid, height, block_hash, event: _init_tlv_based_struct_field!(event, upgradable_required) }))
 	}
 }
 
@@ -220,7 +216,8 @@ type PackageID = [u8; 32];
 
 /// OnchainTxHandler receives claiming requests, aggregates them if it's sound, broadcast and
 /// do RBF bumping if possible.
-pub struct OnchainTxHandler<ChannelSigner: Sign> {
+#[derive(PartialEq)]
+pub struct OnchainTxHandler<ChannelSigner: WriteableEcdsaChannelSigner> {
 	destination_script: Script,
 	holder_commitment: HolderCommitmentTransaction,
 	// holder_htlc_sigs and prev_holder_htlc_sigs are in the order as they appear in the commitment
@@ -274,7 +271,7 @@ pub struct OnchainTxHandler<ChannelSigner: Sign> {
 const SERIALIZATION_VERSION: u8 = 1;
 const MIN_SERIALIZATION_VERSION: u8 = 1;
 
-impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
+impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 	pub(crate) fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		write_ver_prefix!(writer, SERIALIZATION_VERSION, MIN_SERIALIZATION_VERSION);
 
@@ -327,11 +324,12 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 	}
 }
 
-impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHandler<K::Signer> {
-	fn read<R: io::Read>(reader: &mut R, args: (&'a K, u64, [u8; 32])) -> Result<Self, DecodeError> {
-		let keys_manager = args.0;
-		let channel_value_satoshis = args.1;
-		let channel_keys_id = args.2;
+impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP, u64, [u8; 32])> for OnchainTxHandler<SP::Signer> {
+	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u64, [u8; 32])) -> Result<Self, DecodeError> {
+		let entropy_source = args.0;
+		let signer_provider = args.1;
+		let channel_value_satoshis = args.2;
+		let channel_keys_id = args.3;
 
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
@@ -359,7 +357,7 @@ impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHan
 			bytes_read += bytes_to_read;
 		}
 
-		let mut signer = keys_manager.derive_channel_signer(channel_value_satoshis, channel_keys_id);
+		let mut signer = signer_provider.derive_channel_signer(channel_value_satoshis, channel_keys_id);
 		signer.provide_channel_parameters(&channel_parameters);
 
 		let pending_claim_requests_len: u64 = Readable::read(reader)?;
@@ -400,7 +398,7 @@ impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHan
 		read_tlv_fields!(reader, {});
 
 		let mut secp_ctx = Secp256k1::new();
-		secp_ctx.seeded_randomize(&keys_manager.get_secure_random_bytes());
+		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
 		Ok(OnchainTxHandler {
 			destination_script,
@@ -422,7 +420,7 @@ impl<'a, K: KeysInterface> ReadableArgs<(&'a K, u64, [u8; 32])> for OnchainTxHan
 	}
 }
 
-impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
+impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 	pub(crate) fn new(destination_script: Script, signer: ChannelSigner, channel_parameters: ChannelTransactionParameters, holder_commitment: HolderCommitmentTransaction, secp_ctx: Secp256k1<secp256k1::All>, ldk_data_dir: PathBuf) -> Self {
 		OnchainTxHandler {
 			destination_script,
@@ -485,8 +483,8 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 		// remove it once it reaches the confirmation threshold, or to generate a new claim if the
 		// transaction is reorged out.
 		let mut all_inputs_have_confirmed_spend = true;
-		for outpoint in &request_outpoints {
-			if let Some(first_claim_txid_height) = self.claimable_outpoints.get(outpoint) {
+		for outpoint in request_outpoints.iter() {
+			if let Some(first_claim_txid_height) = self.claimable_outpoints.get(*outpoint) {
 				// We check for outpoint spends within claims individually rather than as a set
 				// since requests can have outpoints split off.
 				if !self.onchain_events_awaiting_threshold_conf.iter()
@@ -820,7 +818,7 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 							for outpoint in request.outpoints() {
 								log_debug!(logger, "Removing claim tracking for {} due to maturation of claim package {}.",
 									outpoint, log_bytes!(package_id));
-								self.claimable_outpoints.remove(&outpoint);
+								self.claimable_outpoints.remove(outpoint);
 								#[cfg(anchors)]
 								self.pending_claim_events.remove(&package_id);
 							}
@@ -829,7 +827,7 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 					OnchainEvent::ContentiousOutpoint { package } => {
 						log_debug!(logger, "Removing claim tracking due to maturation of claim tx for outpoints:");
 						log_debug!(logger, " {:?}", package.outpoints());
-						self.claimable_outpoints.remove(&package.outpoints()[0]);
+						self.claimable_outpoints.remove(package.outpoints()[0]);
 					}
 				}
 			} else {
@@ -907,7 +905,7 @@ impl<ChannelSigner: Sign> OnchainTxHandler<ChannelSigner> {
 				//- resurect outpoint back in its claimable set and regenerate tx
 				match entry.event {
 					OnchainEvent::ContentiousOutpoint { package } => {
-						if let Some(ancestor_claimable_txid) = self.claimable_outpoints.get(&package.outpoints()[0]) {
+						if let Some(ancestor_claimable_txid) = self.claimable_outpoints.get(package.outpoints()[0]) {
 							if let Some(request) = self.pending_claim_requests.get_mut(&ancestor_claimable_txid.0) {
 								request.merge_package(package);
 								// Using a HashMap guarantee us than if we have multiple outpoints getting

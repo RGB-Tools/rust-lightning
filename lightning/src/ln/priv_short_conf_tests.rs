@@ -12,8 +12,8 @@
 //! LSP).
 
 use crate::chain::ChannelMonitorUpdateStatus;
-use crate::chain::keysinterface::{Recipient, KeysInterface};
-use crate::ln::channelmanager::{self, ChannelManager, MIN_CLTV_EXPIRY_DELTA, PaymentId};
+use crate::chain::keysinterface::NodeSigner;
+use crate::ln::channelmanager::{ChannelManager, MIN_CLTV_EXPIRY_DELTA, PaymentId};
 use crate::routing::gossip::RoutingFees;
 use crate::routing::router::{PaymentParameters, RouteHint, RouteHintHop};
 use crate::ln::features::ChannelTypeFeatures;
@@ -31,10 +31,7 @@ use core::default::Default;
 use crate::ln::functional_test_utils::*;
 
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::hashes::Hash;
-use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::network::constants::Network;
-use bitcoin::secp256k1::Secp256k1;
 
 #[test]
 fn test_priv_forwarding_rejection() {
@@ -48,11 +45,11 @@ fn test_priv_forwarding_rejection() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(no_announce_cfg), None]);
 	let persister: test_utils::TestPersister;
 	let new_chain_monitor: test_utils::TestChainMonitor;
-	let nodes_1_deserialized: ChannelManager<&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
+	let nodes_1_deserialized: ChannelManager<&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestRouter, &test_utils::TestLogger>;
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	let chan_id_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features()).2;
-	let chan_id_2 = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features()).0.channel_id;
+	let chan_id_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000).2;
+	let chan_id_2 = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 500_000_000).0.channel_id;
 
 	// We should always be able to forward through nodes[1] as long as its out through a public
 	// channel:
@@ -69,8 +66,8 @@ fn test_priv_forwarding_rejection() {
 		htlc_maximum_msat: None,
 	}]);
 	let last_hops = vec![route_hint];
-	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
-		.with_features(channelmanager::provided_invoice_features())
+	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), TEST_FINAL_CLTV)
+		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(last_hops);
 	let (route, our_payment_hash, our_payment_preimage, our_payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 10_000, TEST_FINAL_CLTV);
 
@@ -93,8 +90,8 @@ fn test_priv_forwarding_rejection() {
 	// Now disconnect nodes[1] from its peers and restart with accept_forwards_to_priv_channels set
 	// to true. Sadly there is currently no way to change it at runtime.
 
-	nodes[0].node.peer_disconnected(&nodes[1].node.get_our_node_id(), false);
-	nodes[2].node.peer_disconnected(&nodes[1].node.get_our_node_id(), false);
+	nodes[0].node.peer_disconnected(&nodes[1].node.get_our_node_id());
+	nodes[2].node.peer_disconnected(&nodes[1].node.get_our_node_id());
 
 	let nodes_1_serialized = nodes[1].node.encode();
 	let monitor_a_serialized = get_monitor!(nodes[1], chan_id_1).encode();
@@ -103,8 +100,8 @@ fn test_priv_forwarding_rejection() {
 	no_announce_cfg.accept_forwards_to_priv_channels = true;
 	reload_node!(nodes[1], no_announce_cfg, &nodes_1_serialized, &[&monitor_a_serialized, &monitor_b_serialized], persister, new_chain_monitor, nodes_1_deserialized);
 
-	nodes[0].node.peer_connected(&nodes[1].node.get_our_node_id(), &msgs::Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-	nodes[1].node.peer_connected(&nodes[0].node.get_our_node_id(), &msgs::Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+	nodes[0].node.peer_connected(&nodes[1].node.get_our_node_id(), &msgs::Init { features: nodes[1].node.init_features(), remote_network_address: None }, true).unwrap();
+	nodes[1].node.peer_connected(&nodes[0].node.get_our_node_id(), &msgs::Init { features: nodes[0].node.init_features(), remote_network_address: None }, false).unwrap();
 	let as_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
 	let bs_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[0]).pop().unwrap();
 	nodes[1].node.handle_channel_reestablish(&nodes[0].node.get_our_node_id(), &as_reestablish);
@@ -112,8 +109,8 @@ fn test_priv_forwarding_rejection() {
 	get_event_msg!(nodes[0], MessageSendEvent::SendChannelUpdate, nodes[1].node.get_our_node_id());
 	get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, nodes[0].node.get_our_node_id());
 
-	nodes[1].node.peer_connected(&nodes[2].node.get_our_node_id(), &msgs::Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-	nodes[2].node.peer_connected(&nodes[1].node.get_our_node_id(), &msgs::Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+	nodes[1].node.peer_connected(&nodes[2].node.get_our_node_id(), &msgs::Init { features: nodes[2].node.init_features(), remote_network_address: None }, true).unwrap();
+	nodes[2].node.peer_connected(&nodes[1].node.get_our_node_id(), &msgs::Init { features: nodes[1].node.init_features(), remote_network_address: None }, false).unwrap();
 	let bs_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[2]).pop().unwrap();
 	let cs_reestablish = get_chan_reestablish_msgs!(nodes[2], nodes[1]).pop().unwrap();
 	nodes[2].node.handle_channel_reestablish(&nodes[1].node.get_our_node_id(), &bs_reestablish);
@@ -144,7 +141,7 @@ fn do_test_1_conf_open(connect_style: ConnectStyle) {
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	*nodes[0].connect_style.borrow_mut() = connect_style;
 
-	let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100000, 10001, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100000, 10001);
 	mine_transaction(&nodes[1], &tx);
 	nodes[0].node.handle_channel_ready(&nodes[1].node.get_our_node_id(), &get_event_msg!(nodes[1], MessageSendEvent::SendChannelReady, nodes[0].node.get_our_node_id()));
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
@@ -187,14 +184,14 @@ fn do_test_1_conf_open(connect_style: ConnectStyle) {
 		msg.clone()
 	} else { panic!("Unexpected event"); };
 	let (bs_announcement, bs_update) = if let MessageSendEvent::BroadcastChannelAnnouncement { ref msg, ref update_msg } = bs_announce_events[1] {
-		(msg.clone(), update_msg.clone())
+		(msg.clone(), update_msg.clone().unwrap())
 	} else { panic!("Unexpected event"); };
 
 	nodes[0].node.handle_announcement_signatures(&nodes[1].node.get_our_node_id(), &bs_announcement_sigs);
 	let as_announce_events = nodes[0].node.get_and_clear_pending_msg_events();
 	assert_eq!(as_announce_events.len(), 1);
 	let (announcement, as_update) = if let MessageSendEvent::BroadcastChannelAnnouncement { ref msg, ref update_msg } = as_announce_events[0] {
-		(msg.clone(), update_msg.clone())
+		(msg.clone(), update_msg.clone().unwrap())
 	} else { panic!("Unexpected event"); };
 	assert_eq!(announcement, bs_announcement);
 
@@ -221,8 +218,8 @@ fn test_routed_scid_alias() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(no_announce_cfg), None]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features()).2;
-	let mut as_channel_ready = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features()).0;
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000).2;
+	let mut as_channel_ready = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 500_000_000).0;
 
 	let last_hop = nodes[2].node.list_usable_channels();
 	let hop_hints = vec![RouteHint(vec![RouteHintHop {
@@ -236,8 +233,8 @@ fn test_routed_scid_alias() {
 		htlc_maximum_msat: None,
 		htlc_minimum_msat: None,
 	}])];
-	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
-		.with_features(channelmanager::provided_invoice_features())
+	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), 42)
+		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 100_000, 42);
 	assert_eq!(route.paths[0][1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
@@ -245,6 +242,13 @@ fn test_routed_scid_alias() {
 	check_added_monitors!(nodes[0], 1);
 
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 100_000, payment_hash, payment_secret);
+
+	as_channel_ready.short_channel_id_alias = Some(0xeadbeef);
+	nodes[2].node.handle_channel_ready(&nodes[1].node.get_our_node_id(), &as_channel_ready);
+	// Note that we always respond to a channel_ready with a channel_update. Not a lot of reason
+	// to bother updating that code, so just drop the message here.
+	get_event_msg!(nodes[2], MessageSendEvent::SendChannelUpdate, nodes[1].node.get_our_node_id());
+
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
 
 	// Now test that if a peer sends us a second channel_ready after the channel is operational we
@@ -280,7 +284,7 @@ fn test_scid_privacy_on_pub_channel() {
 	open_channel.channel_type.as_mut().unwrap().set_scid_privacy_required();
 	assert_eq!(open_channel.channel_flags & 1, 1); // The `announce_channel` bit is set.
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(), &open_channel);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel);
 	let err = get_err_msg!(nodes[1], nodes[0].node.get_our_node_id());
 	assert_eq!(err.data, "SCID Alias/Privacy Channel Type cannot be set on a public channel");
 }
@@ -313,8 +317,8 @@ fn test_scid_privacy_negotiation() {
 
 	let second_open_channel = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, nodes[1].node.get_our_node_id());
 	assert!(!second_open_channel.channel_type.as_ref().unwrap().supports_scid_privacy());
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(), &second_open_channel);
-	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), channelmanager::provided_init_features(), &get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, nodes[0].node.get_our_node_id()));
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &second_open_channel);
+	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), &get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, nodes[0].node.get_our_node_id()));
 
 	let events = nodes[0].node.get_and_clear_pending_events();
 	assert_eq!(events.len(), 1);
@@ -338,7 +342,7 @@ fn test_inbound_scid_privacy() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(accept_forward_cfg), None]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
 
 	let mut no_announce_cfg = test_default_channel_config();
 	no_announce_cfg.channel_handshake_config.announced_channel = false;
@@ -348,9 +352,9 @@ fn test_inbound_scid_privacy() {
 
 	assert!(open_channel.channel_type.as_ref().unwrap().requires_scid_privacy());
 
-	nodes[2].node.handle_open_channel(&nodes[1].node.get_our_node_id(), channelmanager::provided_init_features(), &open_channel);
+	nodes[2].node.handle_open_channel(&nodes[1].node.get_our_node_id(), &open_channel);
 	let accept_channel = get_event_msg!(nodes[2], MessageSendEvent::SendAcceptChannel, nodes[1].node.get_our_node_id());
-	nodes[1].node.handle_accept_channel(&nodes[2].node.get_our_node_id(), channelmanager::provided_init_features(), &accept_channel);
+	nodes[1].node.handle_accept_channel(&nodes[2].node.get_our_node_id(), &accept_channel);
 
 	let (temporary_channel_id, tx, _) = create_funding_transaction(&nodes[1], &nodes[2].node.get_our_node_id(), 100_000, 42);
 	nodes[1].node.funding_transaction_generated(&temporary_channel_id, &nodes[2].node.get_our_node_id(), tx.clone()).unwrap();
@@ -391,8 +395,8 @@ fn test_inbound_scid_privacy() {
 		htlc_maximum_msat: None,
 		htlc_minimum_msat: None,
 	}])];
-	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
-		.with_features(channelmanager::provided_invoice_features())
+	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), 42)
+		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints.clone());
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 100_000, 42);
 	assert_eq!(route.paths[0][1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
@@ -406,8 +410,8 @@ fn test_inbound_scid_privacy() {
 	// what channel we're talking about.
 	hop_hints[0].0[0].short_channel_id = last_hop[0].short_channel_id.unwrap();
 
-	let payment_params_2 = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
-		.with_features(channelmanager::provided_invoice_features())
+	let payment_params_2 = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), 42)
+		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (route_2, payment_hash_2, _, payment_secret_2) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params_2, 100_000, 42);
 	assert_eq!(route_2.paths[0][1].short_channel_id, last_hop[0].short_channel_id.unwrap());
@@ -442,8 +446,8 @@ fn test_scid_alias_returned() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(accept_forward_cfg), None]);
 	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 0, channelmanager::provided_init_features(), channelmanager::provided_init_features());
-	let chan = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 10_000, 0, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 0);
+	let chan = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 10_000, 0);
 
 	let last_hop = nodes[2].node.list_usable_channels();
 	let mut hop_hints = vec![RouteHint(vec![RouteHintHop {
@@ -457,8 +461,8 @@ fn test_scid_alias_returned() {
 		htlc_maximum_msat: None,
 		htlc_minimum_msat: None,
 	}])];
-	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id())
-		.with_features(channelmanager::provided_invoice_features())
+	let payment_params = PaymentParameters::from_node_id(nodes[2].node.get_our_node_id(), 42)
+		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (mut route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 10_000, 42);
 	assert_eq!(route.paths[0][1].short_channel_id, nodes[2].node.list_usable_channels()[0].inbound_scid_alias.unwrap());
@@ -493,8 +497,7 @@ fn test_scid_alias_returned() {
 		fee_proportional_millionths: last_hop[0].counterparty.forwarding_info.as_ref().unwrap().fee_proportional_millionths,
 		excess_data: Vec::new(),
 	};
-	let msg_hash = Sha256dHash::hash(&contents.encode()[..]);
-	let signature = Secp256k1::new().sign_ecdsa(&hash_to_message!(&msg_hash[..]), &nodes[1].keys_manager.get_node_secret(Recipient::Node).unwrap());
+	let signature = nodes[1].keys_manager.sign_gossip_message(msgs::UnsignedGossipMessage::ChannelUpdate(&contents)).unwrap();
 	let msg = msgs::ChannelUpdate { signature, contents };
 
 	let mut err_data = Vec::new();
@@ -565,13 +568,13 @@ fn test_0conf_channel_with_async_monitor() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(chan_config), None]);
 	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 0, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 0);
 
 	chan_config.channel_handshake_config.announced_channel = false;
 	nodes[0].node.create_channel(nodes[1].node.get_our_node_id(), 100000, 10001, 42, Some(chan_config)).unwrap();
 	let open_channel = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, nodes[1].node.get_our_node_id());
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(), &open_channel);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel);
 	let events = nodes[1].node.get_and_clear_pending_events();
 	assert_eq!(events.len(), 1);
 	match events[0] {
@@ -583,7 +586,7 @@ fn test_0conf_channel_with_async_monitor() {
 
 	let mut accept_channel = get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, nodes[0].node.get_our_node_id());
 	assert_eq!(accept_channel.minimum_depth, 0);
-	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), channelmanager::provided_init_features(), &accept_channel);
+	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), &accept_channel);
 
 	let (temporary_channel_id, tx, funding_output) = create_funding_transaction(&nodes[0], &nodes[1].node.get_our_node_id(), 100000, 42);
 	nodes[0].node.funding_transaction_generated(&temporary_channel_id, &nodes[1].node.get_our_node_id(), tx.clone()).unwrap();
@@ -761,7 +764,7 @@ fn test_public_0conf_channel() {
 	match bs_announcement[0] {
 		MessageSendEvent::BroadcastChannelAnnouncement { ref msg, ref update_msg } => {
 			announcement = msg.clone();
-			bs_update = update_msg.clone();
+			bs_update = update_msg.clone().unwrap();
 		},
 		_ => panic!("Unexpected event"),
 	};
@@ -771,6 +774,7 @@ fn test_public_0conf_channel() {
 	match as_announcement[0] {
 		MessageSendEvent::BroadcastChannelAnnouncement { ref msg, ref update_msg } => {
 			assert!(announcement == *msg);
+			let update_msg = update_msg.as_ref().unwrap();
 			assert_eq!(update_msg.contents.short_channel_id, scid);
 			assert_eq!(update_msg.contents.short_channel_id, announcement.contents.short_channel_id);
 			assert_eq!(update_msg.contents.short_channel_id, bs_update.contents.short_channel_id);
@@ -844,7 +848,7 @@ fn test_zero_conf_accept_reject() {
 
 	open_channel_msg.channel_type = Some(channel_type_features.clone());
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(), &open_channel_msg);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel_msg);
 
 	let msg_events = nodes[1].node.get_and_clear_pending_msg_events();
 	match msg_events[0] {
@@ -872,8 +876,7 @@ fn test_zero_conf_accept_reject() {
 
 	open_channel_msg.channel_type = Some(channel_type_features.clone());
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(),
-		&open_channel_msg);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel_msg);
 
 	// Assert that `nodes[1]` has no `MessageSendEvent::SendAcceptChannel` in the `msg_events`.
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -905,8 +908,7 @@ fn test_zero_conf_accept_reject() {
 
 	open_channel_msg.channel_type = Some(channel_type_features);
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(),
-		&open_channel_msg);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel_msg);
 
 	let events = nodes[1].node.get_and_clear_pending_events();
 
@@ -944,7 +946,7 @@ fn test_connect_before_funding() {
 	nodes[0].node.create_channel(nodes[1].node.get_our_node_id(), 100_000, 10_001, 42, None).unwrap();
 	let open_channel = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, nodes[1].node.get_our_node_id());
 
-	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), channelmanager::provided_init_features(), &open_channel);
+	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel);
 	let events = nodes[1].node.get_and_clear_pending_events();
 	assert_eq!(events.len(), 1);
 	match events[0] {
@@ -956,7 +958,7 @@ fn test_connect_before_funding() {
 
 	let mut accept_channel = get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, nodes[0].node.get_our_node_id());
 	assert_eq!(accept_channel.minimum_depth, 0);
-	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), channelmanager::provided_init_features(), &accept_channel);
+	nodes[0].node.handle_accept_channel(&nodes[1].node.get_our_node_id(), &accept_channel);
 
 	let events = nodes[0].node.get_and_clear_pending_events();
 	assert_eq!(events.len(), 1);

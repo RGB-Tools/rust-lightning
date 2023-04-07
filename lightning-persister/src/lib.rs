@@ -20,7 +20,7 @@ extern crate libc;
 use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin::hashes::hex::FromHex;
 use lightning::chain::channelmonitor::ChannelMonitor;
-use lightning::chain::keysinterface::KeysInterface;
+use lightning::chain::keysinterface::{EntropySource, SignerProvider};
 use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning::util::persist::KVStorePersister;
 use std::fs;
@@ -48,7 +48,7 @@ impl FilesystemPersister {
 	/// Initialize a new FilesystemPersister and set the path to the individual channels'
 	/// files.
 	pub fn new(path_to_channel_data: String) -> Self {
-		return Self {
+		Self {
 			path_to_channel_data,
 		}
 	}
@@ -59,10 +59,12 @@ impl FilesystemPersister {
 	}
 
 	/// Read `ChannelMonitor`s from disk.
-	pub fn read_channelmonitors<K: Deref> (
-		&self, keys_manager: K
-	) -> Result<Vec<(BlockHash, ChannelMonitor<<K::Target as KeysInterface>::Signer>)>, std::io::Error>
-		where K::Target: KeysInterface + Sized,
+	pub fn read_channelmonitors<ES: Deref, SP: Deref> (
+		&self, entropy_source: ES, signer_provider: SP
+	) -> std::io::Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>>
+		where
+			ES::Target: EntropySource + Sized,
+			SP::Target: SignerProvider + Sized
 	{
 		let mut path = PathBuf::from(&self.path_to_channel_data);
 		path.push("monitors");
@@ -70,45 +72,44 @@ impl FilesystemPersister {
 			return Ok(Vec::new());
 		}
 		let mut res = Vec::new();
-		for file_option in fs::read_dir(path).unwrap() {
+		for file_option in fs::read_dir(path)? {
 			let file = file_option.unwrap();
 			let owned_file_name = file.file_name();
-			let filename = owned_file_name.to_str();
-			if !filename.is_some() || !filename.unwrap().is_ascii() || filename.unwrap().len() < 65 {
+			let filename = owned_file_name.to_str()
+				.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData,
+					"File name is not a valid utf8 string"))?;
+			if !filename.is_ascii() || filename.len() < 65 {
 				return Err(std::io::Error::new(
 					std::io::ErrorKind::InvalidData,
 					"Invalid ChannelMonitor file name",
 				));
 			}
-			if filename.unwrap().ends_with(".tmp") {
+			if filename.ends_with(".tmp") {
 				// If we were in the middle of committing an new update and crashed, it should be
 				// safe to ignore the update - we should never have returned to the caller and
 				// irrevocably committed to the new state in any way.
 				continue;
 			}
 
-			let txid = Txid::from_hex(filename.unwrap().split_at(64).0);
-			if txid.is_err() {
-				return Err(std::io::Error::new(
+			let txid = Txid::from_hex(filename.split_at(64).0)
+				.map_err(|_| std::io::Error::new(
 					std::io::ErrorKind::InvalidData,
 					"Invalid tx ID in filename",
-				));
-			}
+				))?;
 
-			let index: Result<u16, _> = filename.unwrap().split_at(65).1.parse();
-			if index.is_err() {
-				return Err(std::io::Error::new(
+			let index = filename.split_at(65).1.parse::<u16>()
+				.map_err(|_| std::io::Error::new(
 					std::io::ErrorKind::InvalidData,
 					"Invalid tx index in filename",
-				));
-			}
+				))?;
 
 			let contents = fs::read(&file.path())?;
 			let mut buffer = Cursor::new(&contents);
-			match <(BlockHash, ChannelMonitor<<K::Target as KeysInterface>::Signer>)>::read(&mut buffer, &*keys_manager) {
+			match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>::read(&mut buffer, (&*entropy_source, &*signer_provider)) {
 				Ok((blockhash, channel_monitor)) => {
-					if channel_monitor.get_funding_txo().0.txid != txid.unwrap() || channel_monitor.get_funding_txo().0.index != index.unwrap() {
-						return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ChannelMonitor was stored in the wrong file"));
+					if channel_monitor.get_funding_txo().0.txid != txid || channel_monitor.get_funding_txo().0.index != index {
+						return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+									       "ChannelMonitor was stored in the wrong file"));
 					}
 					res.push((blockhash, channel_monitor));
 				}
@@ -142,7 +143,6 @@ mod tests {
 	use lightning::chain::chainmonitor::Persist;
 	use lightning::chain::transaction::OutPoint;
 	use lightning::{check_closed_broadcast, check_closed_event, check_added_monitors};
-	use lightning::ln::channelmanager;
 	use lightning::ln::functional_test_utils::*;
 	use lightning::util::events::{ClosureReason, MessageSendEventsProvider};
 	use lightning::util::test_utils;
@@ -165,6 +165,27 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn test_if_monitors_is_not_dir() {
+		let persister = FilesystemPersister::new("test_monitors_is_not_dir".to_string());
+
+		fs::create_dir_all(&persister.path_to_channel_data).unwrap();
+		let mut path = std::path::PathBuf::from(&persister.path_to_channel_data);
+		path.push("monitors");
+		fs::File::create(path).unwrap();
+
+		let chanmon_cfgs = create_chanmon_cfgs(1);
+		let mut node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
+		let chain_mon_0 = test_utils::TestChainMonitor::new(Some(&chanmon_cfgs[0].chain_source), &chanmon_cfgs[0].tx_broadcaster, &chanmon_cfgs[0].logger, &chanmon_cfgs[0].fee_estimator, &persister, &node_cfgs[0].keys_manager);
+		node_cfgs[0].chain_monitor = chain_mon_0;
+		let node_chanmgrs = create_node_chanmgrs(1, &node_cfgs, &[None]);
+		let nodes = create_network(1, &node_cfgs, &node_chanmgrs);
+
+		// Check that read_channelmonitors() returns error if monitors/ is not a
+		// directory.
+		assert!(persister.read_channelmonitors(nodes[0].keys_manager, nodes[0].keys_manager).is_err());
+	}
+
 	// Integration-test the FilesystemPersister. Test relaying a few payments
 	// and check that the persisted data is updated the appropriate number of
 	// times.
@@ -184,20 +205,20 @@ mod tests {
 
 		// Check that the persisted channel data is empty before any channels are
 		// open.
-		let mut persisted_chan_data_0 = persister_0.read_channelmonitors(nodes[0].keys_manager).unwrap();
+		let mut persisted_chan_data_0 = persister_0.read_channelmonitors(nodes[0].keys_manager, nodes[0].keys_manager).unwrap();
 		assert_eq!(persisted_chan_data_0.len(), 0);
-		let mut persisted_chan_data_1 = persister_1.read_channelmonitors(nodes[1].keys_manager).unwrap();
+		let mut persisted_chan_data_1 = persister_1.read_channelmonitors(nodes[1].keys_manager, nodes[1].keys_manager).unwrap();
 		assert_eq!(persisted_chan_data_1.len(), 0);
 
 		// Helper to make sure the channel is on the expected update ID.
 		macro_rules! check_persisted_data {
 			($expected_update_id: expr) => {
-				persisted_chan_data_0 = persister_0.read_channelmonitors(nodes[0].keys_manager).unwrap();
+				persisted_chan_data_0 = persister_0.read_channelmonitors(nodes[0].keys_manager, nodes[0].keys_manager).unwrap();
 				assert_eq!(persisted_chan_data_0.len(), 1);
 				for (_, mon) in persisted_chan_data_0.iter() {
 					assert_eq!(mon.get_latest_update_id(), $expected_update_id);
 				}
-				persisted_chan_data_1 = persister_1.read_channelmonitors(nodes[1].keys_manager).unwrap();
+				persisted_chan_data_1 = persister_1.read_channelmonitors(nodes[1].keys_manager, nodes[1].keys_manager).unwrap();
 				assert_eq!(persisted_chan_data_1.len(), 1);
 				for (_, mon) in persisted_chan_data_1.iter() {
 					assert_eq!(mon.get_latest_update_id(), $expected_update_id);
@@ -206,7 +227,7 @@ mod tests {
 		}
 
 		// Create some initial channel and check that a channel was persisted.
-		let _ = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		let _ = create_announced_chan_between_nodes(&nodes, 0, 1);
 		check_persisted_data!(0);
 
 		// Send a few payments and make sure the monitors are updated to the latest.
@@ -250,7 +271,7 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let chan = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
 		nodes[1].node.force_close_broadcasting_latest_txn(&chan.2, &nodes[0].node.get_our_node_id()).unwrap();
 		check_closed_event!(nodes[1], 1, ClosureReason::HolderForceClosed);
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
@@ -289,7 +310,7 @@ mod tests {
 		let mut node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let chan = create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
 		nodes[1].node.force_close_broadcasting_latest_txn(&chan.2, &nodes[0].node.get_our_node_id()).unwrap();
 		check_closed_event!(nodes[1], 1, ClosureReason::HolderForceClosed);
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();

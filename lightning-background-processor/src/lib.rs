@@ -11,31 +11,51 @@
 
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+
+#[cfg(any(test, feature = "std"))]
+extern crate core;
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 #[macro_use] extern crate lightning;
 extern crate lightning_rapid_gossip_sync;
 
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::chainmonitor::{ChainMonitor, Persist};
-use lightning::chain::keysinterface::KeysInterface;
+use lightning::chain::keysinterface::{EntropySource, NodeSigner, SignerProvider};
 use lightning::ln::channelmanager::ChannelManager;
 use lightning::ln::msgs::{ChannelMessageHandler, OnionMessageHandler, RoutingMessageHandler};
 use lightning::ln::peer_handler::{CustomMessageHandler, PeerManager, SocketDescriptor};
 use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
-use lightning::routing::scoring::WriteableScore;
-use lightning::util::events::{Event, EventHandler, EventsProvider};
+use lightning::routing::utxo::UtxoLookup;
+use lightning::routing::router::Router;
+use lightning::routing::scoring::{Score, WriteableScore};
+use lightning::util::events::{Event, PathFailure};
+#[cfg(feature = "std")]
+use lightning::util::events::{EventHandler, EventsProvider};
 use lightning::util::logger::Logger;
 use lightning::util::persist::Persister;
 use lightning_rapid_gossip_sync::RapidGossipSync;
+
+use core::ops::Deref;
+use core::time::Duration;
+
+#[cfg(feature = "std")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use std::ops::Deref;
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "std")]
+use std::thread::{self, JoinHandle};
+#[cfg(feature = "std")]
+use std::time::Instant;
 
 #[cfg(feature = "futures")]
-use futures_util::{select_biased, future::FutureExt};
+use futures_util::{select_biased, future::FutureExt, task};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// `BackgroundProcessor` takes care of tasks that (1) need to happen periodically to keep
 /// Rust-Lightning running properly, and (2) either can or should be run in the background. Its
@@ -61,6 +81,7 @@ use futures_util::{select_biased, future::FutureExt};
 ///
 /// [`ChannelMonitor`]: lightning::chain::channelmonitor::ChannelMonitor
 /// [`Event`]: lightning::util::events::Event
+#[cfg(feature = "std")]
 #[must_use = "BackgroundProcessor will immediately stop on drop. It should be stored until shutdown."]
 pub struct BackgroundProcessor {
 	stop_thread: Arc<AtomicBool>,
@@ -97,13 +118,13 @@ const FIRST_NETWORK_PRUNE_TIMER: u64 = 1;
 
 /// Either [`P2PGossipSync`] or [`RapidGossipSync`].
 pub enum GossipSync<
-	P: Deref<Target = P2PGossipSync<G, A, L>>,
+	P: Deref<Target = P2PGossipSync<G, U, L>>,
 	R: Deref<Target = RapidGossipSync<G, L>>,
 	G: Deref<Target = NetworkGraph<L>>,
-	A: Deref,
+	U: Deref,
 	L: Deref,
 >
-where A::Target: chain::Access, L::Target: Logger {
+where U::Target: UtxoLookup, L::Target: Logger {
 	/// Gossip sync via the lightning peer-to-peer network as defined by BOLT 7.
 	P2P(P),
 	/// Rapid gossip sync from a trusted server.
@@ -113,13 +134,13 @@ where A::Target: chain::Access, L::Target: Logger {
 }
 
 impl<
-	P: Deref<Target = P2PGossipSync<G, A, L>>,
+	P: Deref<Target = P2PGossipSync<G, U, L>>,
 	R: Deref<Target = RapidGossipSync<G, L>>,
 	G: Deref<Target = NetworkGraph<L>>,
-	A: Deref,
+	U: Deref,
 	L: Deref,
-> GossipSync<P, R, G, A, L>
-where A::Target: chain::Access, L::Target: Logger {
+> GossipSync<P, R, G, U, L>
+where U::Target: UtxoLookup, L::Target: Logger {
 	fn network_graph(&self) -> Option<&G> {
 		match self {
 			GossipSync::P2P(gossip_sync) => Some(gossip_sync.network_graph()),
@@ -144,10 +165,10 @@ where A::Target: chain::Access, L::Target: Logger {
 }
 
 /// (C-not exported) as the bindings concretize everything and have constructors for us
-impl<P: Deref<Target = P2PGossipSync<G, A, L>>, G: Deref<Target = NetworkGraph<L>>, A: Deref, L: Deref>
-	GossipSync<P, &RapidGossipSync<G, L>, G, A, L>
+impl<P: Deref<Target = P2PGossipSync<G, U, L>>, G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref>
+	GossipSync<P, &RapidGossipSync<G, L>, G, U, L>
 where
-	A::Target: chain::Access,
+	U::Target: UtxoLookup,
 	L::Target: Logger,
 {
 	/// Initializes a new [`GossipSync::P2P`] variant.
@@ -159,10 +180,10 @@ where
 /// (C-not exported) as the bindings concretize everything and have constructors for us
 impl<'a, R: Deref<Target = RapidGossipSync<G, L>>, G: Deref<Target = NetworkGraph<L>>, L: Deref>
 	GossipSync<
-		&P2PGossipSync<G, &'a (dyn chain::Access + Send + Sync), L>,
+		&P2PGossipSync<G, &'a (dyn UtxoLookup + Send + Sync), L>,
 		R,
 		G,
-		&'a (dyn chain::Access + Send + Sync),
+		&'a (dyn UtxoLookup + Send + Sync),
 		L,
 	>
 where
@@ -177,10 +198,10 @@ where
 /// (C-not exported) as the bindings concretize everything and have constructors for us
 impl<'a, L: Deref>
 	GossipSync<
-		&P2PGossipSync<&'a NetworkGraph<L>, &'a (dyn chain::Access + Send + Sync), L>,
+		&P2PGossipSync<&'a NetworkGraph<L>, &'a (dyn UtxoLookup + Send + Sync), L>,
 		&RapidGossipSync<&'a NetworkGraph<L>, L>,
 		&'a NetworkGraph<L>,
-		&'a (dyn chain::Access + Send + Sync),
+		&'a (dyn UtxoLookup + Send + Sync),
 		L,
 	>
 where
@@ -195,10 +216,41 @@ where
 fn handle_network_graph_update<L: Deref>(
 	network_graph: &NetworkGraph<L>, event: &Event
 ) where L::Target: Logger {
-	if let Event::PaymentPathFailed { ref network_update, .. } = event {
-		if let Some(network_update) = network_update {
-			network_graph.handle_network_update(&network_update);
-		}
+	if let Event::PaymentPathFailed {
+		failure: PathFailure::OnPath { network_update: Some(ref upd) }, .. } = event
+	{
+		network_graph.handle_network_update(upd);
+	}
+}
+
+fn update_scorer<'a, S: 'static + Deref<Target = SC> + Send + Sync, SC: 'a + WriteableScore<'a>>(
+	scorer: &'a S, event: &Event
+) {
+	let mut score = scorer.lock();
+	match event {
+		Event::PaymentPathFailed { ref path, short_channel_id: Some(scid), .. } => {
+			let path = path.iter().collect::<Vec<_>>();
+			score.payment_path_failed(&path, *scid);
+		},
+		Event::PaymentPathFailed { ref path, payment_failed_permanently: true, .. } => {
+			// Reached if the destination explicitly failed it back. We treat this as a successful probe
+			// because the payment made it all the way to the destination with sufficient liquidity.
+			let path = path.iter().collect::<Vec<_>>();
+			score.probe_successful(&path);
+		},
+		Event::PaymentPathSuccessful { path, .. } => {
+			let path = path.iter().collect::<Vec<_>>();
+			score.payment_path_successful(&path);
+		},
+		Event::ProbeSuccessful { path, .. } => {
+			let path = path.iter().collect::<Vec<_>>();
+			score.probe_successful(&path);
+		},
+		Event::ProbeFailed { path, short_channel_id: Some(scid), .. } => {
+			let path = path.iter().collect::<Vec<_>>();
+			score.probe_failed(&path, *scid);
+		},
+		_ => {},
 	}
 }
 
@@ -206,15 +258,15 @@ macro_rules! define_run_body {
 	($persister: ident, $chain_monitor: ident, $process_chain_monitor_events: expr,
 	 $channel_manager: ident, $process_channel_manager_events: expr,
 	 $gossip_sync: ident, $peer_manager: ident, $logger: ident, $scorer: ident,
-	 $loop_exit_check: expr, $await: expr)
+	 $loop_exit_check: expr, $await: expr, $get_timer: expr, $timer_elapsed: expr)
 	=> { {
 		log_trace!($logger, "Calling ChannelManager's timer_tick_occurred on startup");
 		$channel_manager.timer_tick_occurred();
 
-		let mut last_freshness_call = Instant::now();
-		let mut last_ping_call = Instant::now();
-		let mut last_prune_call = Instant::now();
-		let mut last_scorer_persist_call = Instant::now();
+		let mut last_freshness_call = $get_timer(FRESHNESS_TIMER);
+		let mut last_ping_call = $get_timer(PING_TIMER);
+		let mut last_prune_call = $get_timer(FIRST_NETWORK_PRUNE_TIMER);
+		let mut last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
 		let mut have_pruned = false;
 
 		loop {
@@ -236,9 +288,9 @@ macro_rules! define_run_body {
 
 			// We wait up to 100ms, but track how long it takes to detect being put to sleep,
 			// see `await_start`'s use below.
-			let await_start = Instant::now();
+			let mut await_start = $get_timer(1);
 			let updates_available = $await;
-			let await_time = await_start.elapsed();
+			let await_slow = $timer_elapsed(&mut await_start, 1);
 
 			if updates_available {
 				log_trace!($logger, "Persisting ChannelManager...");
@@ -250,12 +302,12 @@ macro_rules! define_run_body {
 				log_trace!($logger, "Terminating background processor.");
 				break;
 			}
-			if last_freshness_call.elapsed().as_secs() > FRESHNESS_TIMER {
+			if $timer_elapsed(&mut last_freshness_call, FRESHNESS_TIMER) {
 				log_trace!($logger, "Calling ChannelManager's timer_tick_occurred");
 				$channel_manager.timer_tick_occurred();
-				last_freshness_call = Instant::now();
+				last_freshness_call = $get_timer(FRESHNESS_TIMER);
 			}
-			if await_time > Duration::from_secs(1) {
+			if await_slow {
 				// On various platforms, we may be starved of CPU cycles for several reasons.
 				// E.g. on iOS, if we've been in the background, we will be entirely paused.
 				// Similarly, if we're on a desktop platform and the device has been asleep, we
@@ -270,40 +322,46 @@ macro_rules! define_run_body {
 				// peers.
 				log_trace!($logger, "100ms sleep took more than a second, disconnecting peers.");
 				$peer_manager.disconnect_all_peers();
-				last_ping_call = Instant::now();
-			} else if last_ping_call.elapsed().as_secs() > PING_TIMER {
+				last_ping_call = $get_timer(PING_TIMER);
+			} else if $timer_elapsed(&mut last_ping_call, PING_TIMER) {
 				log_trace!($logger, "Calling PeerManager's timer_tick_occurred");
 				$peer_manager.timer_tick_occurred();
-				last_ping_call = Instant::now();
+				last_ping_call = $get_timer(PING_TIMER);
 			}
 
 			// Note that we want to run a graph prune once not long after startup before
 			// falling back to our usual hourly prunes. This avoids short-lived clients never
 			// pruning their network graph. We run once 60 seconds after startup before
 			// continuing our normal cadence.
-			if last_prune_call.elapsed().as_secs() > if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER } {
+			if $timer_elapsed(&mut last_prune_call, if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER }) {
 				// The network graph must not be pruned while rapid sync completion is pending
 				if let Some(network_graph) = $gossip_sync.prunable_network_graph() {
-					log_trace!($logger, "Pruning and persisting network graph.");
-					network_graph.remove_stale_channels_and_tracking();
+					#[cfg(feature = "std")] {
+						log_trace!($logger, "Pruning and persisting network graph.");
+						network_graph.remove_stale_channels_and_tracking();
+					}
+					#[cfg(not(feature = "std"))] {
+						log_warn!($logger, "Not pruning network graph, consider enabling `std` or doing so manually with remove_stale_channels_and_tracking_with_time.");
+						log_trace!($logger, "Persisting network graph.");
+					}
 
 					if let Err(e) = $persister.persist_graph(network_graph) {
 						log_error!($logger, "Error: Failed to persist network graph, check your disk and permissions {}", e)
 					}
 
-					last_prune_call = Instant::now();
+					last_prune_call = $get_timer(NETWORK_PRUNE_TIMER);
 					have_pruned = true;
 				}
 			}
 
-			if last_scorer_persist_call.elapsed().as_secs() > SCORER_PERSIST_TIMER {
+			if $timer_elapsed(&mut last_scorer_persist_call, SCORER_PERSIST_TIMER) {
 				if let Some(ref scorer) = $scorer {
 					log_trace!($logger, "Persisting scorer");
 					if let Err(e) = $persister.persist_scorer(&scorer) {
 						log_error!($logger, "Error: Failed to persist scorer, check your disk and permissions {}", e)
 					}
 				}
-				last_scorer_persist_call = Instant::now();
+				last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
 			}
 		}
 
@@ -333,15 +391,23 @@ macro_rules! define_run_body {
 /// future which outputs true, the loop will exit and this function's future will complete.
 ///
 /// See [`BackgroundProcessor::start`] for information on which actions this handles.
+///
+/// Requires the `futures` feature. Note that while this method is available without the `std`
+/// feature, doing so will skip calling [`NetworkGraph::remove_stale_channels_and_tracking`],
+/// you should call [`NetworkGraph::remove_stale_channels_and_tracking_with_time`] regularly
+/// manually instead.
 #[cfg(feature = "futures")]
 pub async fn process_events_async<
 	'a,
-	CA: 'static + Deref + Send + Sync,
+	UL: 'static + Deref + Send + Sync,
 	CF: 'static + Deref + Send + Sync,
 	CW: 'static + Deref + Send + Sync,
 	T: 'static + Deref + Send + Sync,
-	K: 'static + Deref + Send + Sync,
+	ES: 'static + Deref + Send + Sync,
+	NS: 'static + Deref + Send + Sync,
+	SP: 'static + Deref + Send + Sync,
 	F: 'static + Deref + Send + Sync,
+	R: 'static + Deref + Send + Sync,
 	G: 'static + Deref<Target = NetworkGraph<L>> + Send + Sync,
 	L: 'static + Deref + Send + Sync,
 	P: 'static + Deref + Send + Sync,
@@ -352,43 +418,50 @@ pub async fn process_events_async<
 	EventHandlerFuture: core::future::Future<Output = ()>,
 	EventHandler: Fn(Event) -> EventHandlerFuture,
 	PS: 'static + Deref + Send,
-	M: 'static + Deref<Target = ChainMonitor<<K::Target as KeysInterface>::Signer, CF, T, F, L, P>> + Send + Sync,
-	CM: 'static + Deref<Target = ChannelManager<CW, T, K, F, L>> + Send + Sync,
-	PGS: 'static + Deref<Target = P2PGossipSync<G, CA, L>> + Send + Sync,
+	M: 'static + Deref<Target = ChainMonitor<<SP::Target as SignerProvider>::Signer, CF, T, F, L, P>> + Send + Sync,
+	CM: 'static + Deref<Target = ChannelManager<CW, T, ES, NS, SP, F, R, L>> + Send + Sync,
+	PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>> + Send + Sync,
 	RGS: 'static + Deref<Target = RapidGossipSync<G, L>> + Send,
 	UMH: 'static + Deref + Send + Sync,
-	PM: 'static + Deref<Target = PeerManager<Descriptor, CMH, RMH, OMH, L, UMH>> + Send + Sync,
+	PM: 'static + Deref<Target = PeerManager<Descriptor, CMH, RMH, OMH, L, UMH, NS>> + Send + Sync,
 	S: 'static + Deref<Target = SC> + Send + Sync,
-	SC: WriteableScore<'a>,
-	SleepFuture: core::future::Future<Output = bool>,
+	SC: for<'b> WriteableScore<'b>,
+	SleepFuture: core::future::Future<Output = bool> + core::marker::Unpin,
 	Sleeper: Fn(Duration) -> SleepFuture
 >(
 	persister: PS, event_handler: EventHandler, chain_monitor: M, channel_manager: CM,
-	gossip_sync: GossipSync<PGS, RGS, G, CA, L>, peer_manager: PM, logger: L, scorer: Option<S>,
+	gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM, logger: L, scorer: Option<S>,
 	sleeper: Sleeper,
-) -> Result<(), std::io::Error>
+) -> Result<(), lightning::io::Error>
 where
-	CA::Target: 'static + chain::Access,
+	UL::Target: 'static + UtxoLookup,
 	CF::Target: 'static + chain::Filter,
-	CW::Target: 'static + chain::Watch<<K::Target as KeysInterface>::Signer>,
+	CW::Target: 'static + chain::Watch<<SP::Target as SignerProvider>::Signer>,
 	T::Target: 'static + BroadcasterInterface,
-	K::Target: 'static + KeysInterface,
+	ES::Target: 'static + EntropySource,
+	NS::Target: 'static + NodeSigner,
+	SP::Target: 'static + SignerProvider,
 	F::Target: 'static + FeeEstimator,
+	R::Target: 'static + Router,
 	L::Target: 'static + Logger,
-	P::Target: 'static + Persist<<K::Target as KeysInterface>::Signer>,
+	P::Target: 'static + Persist<<SP::Target as SignerProvider>::Signer>,
 	CMH::Target: 'static + ChannelMessageHandler,
 	OMH::Target: 'static + OnionMessageHandler,
 	RMH::Target: 'static + RoutingMessageHandler,
 	UMH::Target: 'static + CustomMessageHandler,
-	PS::Target: 'static + Persister<'a, CW, T, K, F, L, SC>,
+	PS::Target: 'static + Persister<'a, CW, T, ES, NS, SP, F, R, L, SC>,
 {
 	let mut should_break = true;
 	let async_event_handler = |event| {
 		let network_graph = gossip_sync.network_graph();
 		let event_handler = &event_handler;
+		let scorer = &scorer;
 		async move {
 			if let Some(network_graph) = network_graph {
 				handle_network_graph_update(network_graph, &event)
+			}
+			if let Some(ref scorer) = scorer {
+				update_scorer(scorer, &event);
 			}
 			event_handler(event).await;
 		}
@@ -404,9 +477,15 @@ where
 					false
 				}
 			}
+		}, |t| sleeper(Duration::from_secs(t)),
+		|fut: &mut SleepFuture, _| {
+			let mut waker = task::noop_waker();
+			let mut ctx = task::Context::from_waker(&mut waker);
+			core::pin::Pin::new(fut).poll(&mut ctx).is_ready()
 		})
 }
 
+#[cfg(feature = "std")]
 impl BackgroundProcessor {
 	/// Start a background thread that takes care of responsibilities enumerated in the [top-level
 	/// documentation].
@@ -454,12 +533,15 @@ impl BackgroundProcessor {
 	/// [`NetworkGraph::write`]: lightning::routing::gossip::NetworkGraph#impl-Writeable
 	pub fn start<
 		'a,
-		CA: 'static + Deref + Send + Sync,
+		UL: 'static + Deref + Send + Sync,
 		CF: 'static + Deref + Send + Sync,
 		CW: 'static + Deref + Send + Sync,
 		T: 'static + Deref + Send + Sync,
-		K: 'static + Deref + Send + Sync,
+		ES: 'static + Deref + Send + Sync,
+		NS: 'static + Deref + Send + Sync,
+		SP: 'static + Deref + Send + Sync,
 		F: 'static + Deref + Send + Sync,
+		R: 'static + Deref + Send + Sync,
 		G: 'static + Deref<Target = NetworkGraph<L>> + Send + Sync,
 		L: 'static + Deref + Send + Sync,
 		P: 'static + Deref + Send + Sync,
@@ -469,32 +551,35 @@ impl BackgroundProcessor {
 		RMH: 'static + Deref + Send + Sync,
 		EH: 'static + EventHandler + Send,
 		PS: 'static + Deref + Send,
-		M: 'static + Deref<Target = ChainMonitor<<K::Target as KeysInterface>::Signer, CF, T, F, L, P>> + Send + Sync,
-		CM: 'static + Deref<Target = ChannelManager<CW, T, K, F, L>> + Send + Sync,
-		PGS: 'static + Deref<Target = P2PGossipSync<G, CA, L>> + Send + Sync,
+		M: 'static + Deref<Target = ChainMonitor<<SP::Target as SignerProvider>::Signer, CF, T, F, L, P>> + Send + Sync,
+		CM: 'static + Deref<Target = ChannelManager<CW, T, ES, NS, SP, F, R, L>> + Send + Sync,
+		PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>> + Send + Sync,
 		RGS: 'static + Deref<Target = RapidGossipSync<G, L>> + Send,
 		UMH: 'static + Deref + Send + Sync,
-		PM: 'static + Deref<Target = PeerManager<Descriptor, CMH, RMH, OMH, L, UMH>> + Send + Sync,
+		PM: 'static + Deref<Target = PeerManager<Descriptor, CMH, RMH, OMH, L, UMH, NS>> + Send + Sync,
 		S: 'static + Deref<Target = SC> + Send + Sync,
-		SC: WriteableScore<'a>,
+		SC: for <'b> WriteableScore<'b>,
 	>(
 		persister: PS, event_handler: EH, chain_monitor: M, channel_manager: CM,
-		gossip_sync: GossipSync<PGS, RGS, G, CA, L>, peer_manager: PM, logger: L, scorer: Option<S>,
+		gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM, logger: L, scorer: Option<S>,
 	) -> Self
 	where
-		CA::Target: 'static + chain::Access,
+		UL::Target: 'static + UtxoLookup,
 		CF::Target: 'static + chain::Filter,
-		CW::Target: 'static + chain::Watch<<K::Target as KeysInterface>::Signer>,
+		CW::Target: 'static + chain::Watch<<SP::Target as SignerProvider>::Signer>,
 		T::Target: 'static + BroadcasterInterface,
-		K::Target: 'static + KeysInterface,
+		ES::Target: 'static + EntropySource,
+		NS::Target: 'static + NodeSigner,
+		SP::Target: 'static + SignerProvider,
 		F::Target: 'static + FeeEstimator,
+		R::Target: 'static + Router,
 		L::Target: 'static + Logger,
-		P::Target: 'static + Persist<<K::Target as KeysInterface>::Signer>,
+		P::Target: 'static + Persist<<SP::Target as SignerProvider>::Signer>,
 		CMH::Target: 'static + ChannelMessageHandler,
 		OMH::Target: 'static + OnionMessageHandler,
 		RMH::Target: 'static + RoutingMessageHandler,
 		UMH::Target: 'static + CustomMessageHandler,
-		PS::Target: 'static + Persister<'a, CW, T, K, F, L, SC>,
+		PS::Target: 'static + Persister<'a, CW, T, ES, NS, SP, F, R, L, SC>,
 	{
 		let stop_thread = Arc::new(AtomicBool::new(false));
 		let stop_thread_clone = stop_thread.clone();
@@ -504,12 +589,16 @@ impl BackgroundProcessor {
 				if let Some(network_graph) = network_graph {
 					handle_network_graph_update(network_graph, &event)
 				}
+				if let Some(ref scorer) = scorer {
+					update_scorer(scorer, &event);
+				}
 				event_handler.handle_event(event);
 			};
 			define_run_body!(persister, chain_monitor, chain_monitor.process_pending_events(&event_handler),
 				channel_manager, channel_manager.process_pending_events(&event_handler),
 				gossip_sync, peer_manager, logger, scorer, stop_thread.load(Ordering::Acquire),
-				channel_manager.await_persistable_update_timeout(Duration::from_millis(100)))
+				channel_manager.await_persistable_update_timeout(Duration::from_millis(100)),
+				|_| Instant::now(), |time: &Instant, dur| time.elapsed().as_secs() > dur)
 		});
 		Self { stop_thread: stop_thread_clone, thread_handle: Some(handle) }
 	}
@@ -555,37 +644,42 @@ impl BackgroundProcessor {
 	}
 }
 
+#[cfg(feature = "std")]
 impl Drop for BackgroundProcessor {
 	fn drop(&mut self) {
 		self.stop_and_join_thread().unwrap();
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(feature = "std", test))]
 mod tests {
 	use bitcoin::blockdata::block::BlockHeader;
 	use bitcoin::blockdata::constants::genesis_block;
 	use bitcoin::blockdata::locktime::PackedLockTime;
 	use bitcoin::blockdata::transaction::{Transaction, TxOut};
 	use bitcoin::network::constants::Network;
+	use bitcoin::secp256k1::{SecretKey, PublicKey, Secp256k1};
 	use lightning::chain::{BestBlock, Confirm, chainmonitor};
 	use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
-	use lightning::chain::keysinterface::{InMemorySigner, Recipient, KeysInterface, KeysManager};
+	use lightning::chain::keysinterface::{InMemorySigner, KeysManager};
 	use lightning::chain::transaction::OutPoint;
 	use lightning::get_event_msg;
-	use lightning::ln::channelmanager::{self, BREAKDOWN_TIMEOUT, ChainParameters, ChannelManager, SimpleArcChannelManager};
-	use lightning::ln::features::ChannelFeatures;
+	use lightning::ln::PaymentHash;
+	use lightning::ln::channelmanager;
+	use lightning::ln::channelmanager::{BREAKDOWN_TIMEOUT, ChainParameters, MIN_CLTV_EXPIRY_DELTA, PaymentId};
+	use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 	use lightning::ln::msgs::{ChannelMessageHandler, Init};
 	use lightning::ln::peer_handler::{PeerManager, MessageHandler, SocketDescriptor, IgnoringMessageHandler};
-	use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
-	use lightning::routing::router::DefaultRouter;
+	use lightning::routing::gossip::{NetworkGraph, NodeId, P2PGossipSync};
+	use lightning::routing::router::{DefaultRouter, RouteHop};
+	use lightning::routing::scoring::{ChannelUsage, Score};
 	use lightning::util::config::UserConfig;
-	use lightning::util::events::{Event, MessageSendEventsProvider, MessageSendEvent};
+	use lightning::util::events::{Event, PathFailure, MessageSendEventsProvider, MessageSendEvent};
 	use lightning::util::ser::Writeable;
 	use lightning::util::test_utils;
 	use lightning::util::persist::KVStorePersister;
-	use lightning_invoice::payment::{InvoicePayer, Retry};
 	use lightning_persister::FilesystemPersister;
+	use std::collections::VecDeque;
 	use std::fs;
 	use std::path::PathBuf;
 	use std::sync::{Arc, Mutex};
@@ -593,7 +687,6 @@ mod tests {
 	use std::time::Duration;
 	use bitcoin::hashes::Hash;
 	use bitcoin::TxMerkleNode;
-	use lightning::routing::scoring::{FixedPenaltyScorer};
 	use lightning_rapid_gossip_sync::RapidGossipSync;
 	use super::{BackgroundProcessor, GossipSync, FRESHNESS_TIMER};
 
@@ -609,23 +702,25 @@ mod tests {
 		fn disconnect_socket(&mut self) {}
 	}
 
+	type ChannelManager = channelmanager::ChannelManager<Arc<ChainMonitor>, Arc<test_utils::TestBroadcaster>, Arc<KeysManager>, Arc<KeysManager>, Arc<KeysManager>, Arc<test_utils::TestFeeEstimator>, Arc<DefaultRouter< Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestLogger>, Arc<Mutex<TestScorer>>>>, Arc<test_utils::TestLogger>>;
+
 	type ChainMonitor = chainmonitor::ChainMonitor<InMemorySigner, Arc<test_utils::TestChainSource>, Arc<test_utils::TestBroadcaster>, Arc<test_utils::TestFeeEstimator>, Arc<test_utils::TestLogger>, Arc<FilesystemPersister>>;
 
 	type PGS = Arc<P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>>;
 	type RGS = Arc<RapidGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestLogger>>>;
 
 	struct Node {
-		node: Arc<SimpleArcChannelManager<ChainMonitor, test_utils::TestBroadcaster, test_utils::TestFeeEstimator, test_utils::TestLogger>>,
+		node: Arc<ChannelManager>,
 		p2p_gossip_sync: PGS,
 		rapid_gossip_sync: RGS,
-		peer_manager: Arc<PeerManager<TestDescriptor, Arc<test_utils::TestChannelMessageHandler>, Arc<test_utils::TestRoutingMessageHandler>, IgnoringMessageHandler, Arc<test_utils::TestLogger>, IgnoringMessageHandler>>,
+		peer_manager: Arc<PeerManager<TestDescriptor, Arc<test_utils::TestChannelMessageHandler>, Arc<test_utils::TestRoutingMessageHandler>, IgnoringMessageHandler, Arc<test_utils::TestLogger>, IgnoringMessageHandler, Arc<KeysManager>>>,
 		chain_monitor: Arc<ChainMonitor>,
 		persister: Arc<FilesystemPersister>,
 		tx_broadcaster: Arc<test_utils::TestBroadcaster>,
 		network_graph: Arc<NetworkGraph<Arc<test_utils::TestLogger>>>,
 		logger: Arc<test_utils::TestLogger>,
 		best_block: BestBlock,
-		scorer: Arc<Mutex<FixedPenaltyScorer>>,
+		scorer: Arc<Mutex<TestScorer>>,
 	}
 
 	impl Node {
@@ -711,6 +806,128 @@ mod tests {
 		}
 	}
 
+	struct TestScorer {
+		event_expectations: Option<VecDeque<TestResult>>,
+	}
+
+	#[derive(Debug)]
+	enum TestResult {
+		PaymentFailure { path: Vec<RouteHop>, short_channel_id: u64 },
+		PaymentSuccess { path: Vec<RouteHop> },
+		ProbeFailure { path: Vec<RouteHop> },
+		ProbeSuccess { path: Vec<RouteHop> },
+	}
+
+	impl TestScorer {
+		fn new() -> Self {
+			Self { event_expectations: None }
+		}
+
+		fn expect(&mut self, expectation: TestResult) {
+			self.event_expectations.get_or_insert_with(|| VecDeque::new()).push_back(expectation);
+		}
+	}
+
+	impl lightning::util::ser::Writeable for TestScorer {
+		fn write<W: lightning::util::ser::Writer>(&self, _: &mut W) -> Result<(), lightning::io::Error> { Ok(()) }
+	}
+
+	impl Score for TestScorer {
+		fn channel_penalty_msat(
+			&self, _short_channel_id: u64, _source: &NodeId, _target: &NodeId, _usage: ChannelUsage
+		) -> u64 { unimplemented!(); }
+
+		fn payment_path_failed(&mut self, actual_path: &[&RouteHop], actual_short_channel_id: u64) {
+			if let Some(expectations) = &mut self.event_expectations {
+				match expectations.pop_front().unwrap() {
+					TestResult::PaymentFailure { path, short_channel_id } => {
+						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+						assert_eq!(actual_short_channel_id, short_channel_id);
+					},
+					TestResult::PaymentSuccess { path } => {
+						panic!("Unexpected successful payment path: {:?}", path)
+					},
+					TestResult::ProbeFailure { path } => {
+						panic!("Unexpected probe failure: {:?}", path)
+					},
+					TestResult::ProbeSuccess { path } => {
+						panic!("Unexpected probe success: {:?}", path)
+					}
+				}
+			}
+		}
+
+		fn payment_path_successful(&mut self, actual_path: &[&RouteHop]) {
+			if let Some(expectations) = &mut self.event_expectations {
+				match expectations.pop_front().unwrap() {
+					TestResult::PaymentFailure { path, .. } => {
+						panic!("Unexpected payment path failure: {:?}", path)
+					},
+					TestResult::PaymentSuccess { path } => {
+						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+					},
+					TestResult::ProbeFailure { path } => {
+						panic!("Unexpected probe failure: {:?}", path)
+					},
+					TestResult::ProbeSuccess { path } => {
+						panic!("Unexpected probe success: {:?}", path)
+					}
+				}
+			}
+		}
+
+		fn probe_failed(&mut self, actual_path: &[&RouteHop], _: u64) {
+			if let Some(expectations) = &mut self.event_expectations {
+				match expectations.pop_front().unwrap() {
+					TestResult::PaymentFailure { path, .. } => {
+						panic!("Unexpected payment path failure: {:?}", path)
+					},
+					TestResult::PaymentSuccess { path } => {
+						panic!("Unexpected payment path success: {:?}", path)
+					},
+					TestResult::ProbeFailure { path } => {
+						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+					},
+					TestResult::ProbeSuccess { path } => {
+						panic!("Unexpected probe success: {:?}", path)
+					}
+				}
+			}
+		}
+		fn probe_successful(&mut self, actual_path: &[&RouteHop]) {
+			if let Some(expectations) = &mut self.event_expectations {
+				match expectations.pop_front().unwrap() {
+					TestResult::PaymentFailure { path, .. } => {
+						panic!("Unexpected payment path failure: {:?}", path)
+					},
+					TestResult::PaymentSuccess { path } => {
+						panic!("Unexpected payment path success: {:?}", path)
+					},
+					TestResult::ProbeFailure { path } => {
+						panic!("Unexpected probe failure: {:?}", path)
+					},
+					TestResult::ProbeSuccess { path } => {
+						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+					}
+				}
+			}
+		}
+	}
+
+	impl Drop for TestScorer {
+		fn drop(&mut self) {
+			if std::thread::panicking() {
+				return;
+			}
+
+			if let Some(event_expectations) = &self.event_expectations {
+				if !event_expectations.is_empty() {
+					panic!("Unsatisfied event expectations: {:?}", event_expectations);
+				}
+			}
+		}
+	}
+
 	fn get_full_filepath(filepath: String, filename: String) -> String {
 		let mut path = PathBuf::from(filepath);
 		path.push(filename);
@@ -722,32 +939,33 @@ mod tests {
 		for i in 0..num_nodes {
 			let tx_broadcaster = Arc::new(test_utils::TestBroadcaster{txn_broadcasted: Mutex::new(Vec::new()), blocks: Arc::new(Mutex::new(Vec::new()))});
 			let fee_estimator = Arc::new(test_utils::TestFeeEstimator { sat_per_kw: Mutex::new(253) });
-			let chain_source = Arc::new(test_utils::TestChainSource::new(Network::Testnet));
 			let logger = Arc::new(test_utils::TestLogger::with_id(format!("node {}", i)));
-			let persister = Arc::new(FilesystemPersister::new(format!("{}_persister_{}", persist_dir, i)));
-			let seed = [i as u8; 32];
 			let network = Network::Testnet;
 			let genesis_block = genesis_block(network);
+			let network_graph = Arc::new(NetworkGraph::new(network, logger.clone()));
+			let scorer = Arc::new(Mutex::new(TestScorer::new()));
+			let seed = [i as u8; 32];
+			let router = Arc::new(DefaultRouter::new(network_graph.clone(), logger.clone(), seed, scorer.clone()));
+			let chain_source = Arc::new(test_utils::TestChainSource::new(Network::Testnet));
+			let persister = Arc::new(FilesystemPersister::new(format!("{}_persister_{}", persist_dir, i)));
 			let now = Duration::from_secs(genesis_block.header.time as u64);
 			let keys_manager = Arc::new(KeysManager::new(&seed, now.as_secs(), now.subsec_nanos()));
 			let chain_monitor = Arc::new(chainmonitor::ChainMonitor::new(Some(chain_source.clone()), tx_broadcaster.clone(), logger.clone(), fee_estimator.clone(), persister.clone()));
-			let best_block = BestBlock::from_genesis(network);
+			let best_block = BestBlock::from_network(network);
 			let params = ChainParameters { network, best_block };
-			let manager = Arc::new(ChannelManager::new(fee_estimator.clone(), chain_monitor.clone(), tx_broadcaster.clone(), logger.clone(), keys_manager.clone(), UserConfig::default(), params));
-			let network_graph = Arc::new(NetworkGraph::new(genesis_block.header.block_hash(), logger.clone()));
+			let manager = Arc::new(ChannelManager::new(fee_estimator.clone(), chain_monitor.clone(), tx_broadcaster.clone(), router.clone(), logger.clone(), keys_manager.clone(), keys_manager.clone(), keys_manager.clone(), UserConfig::default(), params));
 			let p2p_gossip_sync = Arc::new(P2PGossipSync::new(network_graph.clone(), Some(chain_source.clone()), logger.clone()));
-			let rapid_gossip_sync = Arc::new(RapidGossipSync::new(network_graph.clone()));
+			let rapid_gossip_sync = Arc::new(RapidGossipSync::new(network_graph.clone(), logger.clone()));
 			let msg_handler = MessageHandler { chan_handler: Arc::new(test_utils::TestChannelMessageHandler::new()), route_handler: Arc::new(test_utils::TestRoutingMessageHandler::new()), onion_message_handler: IgnoringMessageHandler{}};
-			let peer_manager = Arc::new(PeerManager::new(msg_handler, keys_manager.get_node_secret(Recipient::Node).unwrap(), 0, &seed, logger.clone(), IgnoringMessageHandler{}));
-			let scorer = Arc::new(Mutex::new(test_utils::TestScorer::with_penalty(0)));
+			let peer_manager = Arc::new(PeerManager::new(msg_handler, 0, &seed, logger.clone(), IgnoringMessageHandler{}, keys_manager.clone()));
 			let node = Node { node: manager, p2p_gossip_sync, rapid_gossip_sync, peer_manager, chain_monitor, persister, tx_broadcaster, network_graph, logger, best_block, scorer };
 			nodes.push(node);
 		}
 
 		for i in 0..num_nodes {
 			for j in (i+1)..num_nodes {
-				nodes[i].node.peer_connected(&nodes[j].node.get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
-				nodes[j].node.peer_connected(&nodes[i].node.get_our_node_id(), &Init { features: channelmanager::provided_init_features(), remote_network_address: None }).unwrap();
+				nodes[i].node.peer_connected(&nodes[j].node.get_our_node_id(), &Init { features: nodes[j].node.init_features(), remote_network_address: None }, true).unwrap();
+				nodes[j].node.peer_connected(&nodes[i].node.get_our_node_id(), &Init { features: nodes[i].node.init_features(), remote_network_address: None }, false).unwrap();
 			}
 		}
 
@@ -768,8 +986,8 @@ mod tests {
 	macro_rules! begin_open_channel {
 		($node_a: expr, $node_b: expr, $channel_value: expr) => {{
 			$node_a.node.create_channel($node_b.node.get_our_node_id(), $channel_value, 100, 42, None).unwrap();
-			$node_b.node.handle_open_channel(&$node_a.node.get_our_node_id(), channelmanager::provided_init_features(), &get_event_msg!($node_a, MessageSendEvent::SendOpenChannel, $node_b.node.get_our_node_id()));
-			$node_a.node.handle_accept_channel(&$node_b.node.get_our_node_id(), channelmanager::provided_init_features(), &get_event_msg!($node_b, MessageSendEvent::SendAcceptChannel, $node_a.node.get_our_node_id()));
+			$node_b.node.handle_open_channel(&$node_a.node.get_our_node_id(), &get_event_msg!($node_a, MessageSendEvent::SendOpenChannel, $node_b.node.get_our_node_id()));
+			$node_a.node.handle_accept_channel(&$node_b.node.get_our_node_id(), &get_event_msg!($node_b, MessageSendEvent::SendAcceptChannel, $node_a.node.get_our_node_id()));
 		}}
 	}
 
@@ -1094,7 +1312,7 @@ mod tests {
 			0, 0, 0, 1, 0, 0, 0, 0, 58, 85, 116, 216, 255, 8, 153, 192, 0, 2, 27, 0, 0, 25, 0, 0,
 			0, 1, 0, 0, 0, 125, 255, 2, 68, 226, 0, 6, 11, 0, 1, 5, 0, 0, 0, 0, 29, 129, 25, 192,
 		];
-		nodes[0].rapid_gossip_sync.update_network_graph(&initialization_input[..]).unwrap();
+		nodes[0].rapid_gossip_sync.update_network_graph_no_std(&initialization_input[..], Some(1642291930)).unwrap();
 
 		// this should have added two channels
 		assert_eq!(network_graph.read_only().channels().len(), 3);
@@ -1110,18 +1328,120 @@ mod tests {
 	}
 
 	#[test]
-	fn test_invoice_payer() {
-		let keys_manager = test_utils::TestKeysInterface::new(&[0u8; 32], Network::Testnet);
-		let random_seed_bytes = keys_manager.get_secure_random_bytes();
-		let nodes = create_nodes(2, "test_invoice_payer".to_string());
+	fn test_payment_path_scoring() {
+		// Ensure that we update the scorer when relevant events are processed. In this case, we ensure
+		// that we update the scorer upon a payment path succeeding (note that the channel must be
+		// public or else we won't score it).
+		// Set up a background event handler for FundingGenerationReady events.
+		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+		let event_handler = move |event: Event| match event {
+			Event::PaymentPathFailed { .. } => sender.send(event).unwrap(),
+			Event::PaymentPathSuccessful { .. } => sender.send(event).unwrap(),
+			Event::ProbeSuccessful { .. } => sender.send(event).unwrap(),
+			Event::ProbeFailed { .. } => sender.send(event).unwrap(),
+			_ => panic!("Unexpected event: {:?}", event),
+		};
 
-		// Initiate the background processors to watch each node.
+		let nodes = create_nodes(1, "test_payment_path_scoring".to_string());
 		let data_dir = nodes[0].persister.get_data_dir();
-		let persister = Arc::new(Persister::new(data_dir));
-		let router = DefaultRouter::new(Arc::clone(&nodes[0].network_graph), Arc::clone(&nodes[0].logger), random_seed_bytes, Arc::clone(&nodes[0].scorer));
-		let invoice_payer = Arc::new(InvoicePayer::new(Arc::clone(&nodes[0].node), router, Arc::clone(&nodes[0].logger), |_: _| {}, Retry::Attempts(2)));
-		let event_handler = Arc::clone(&invoice_payer);
+		let persister = Arc::new(Persister::new(data_dir.clone()));
 		let bg_processor = BackgroundProcessor::start(persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(), nodes[0].no_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(), Some(nodes[0].scorer.clone()));
+
+		let scored_scid = 4242;
+		let secp_ctx = Secp256k1::new();
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_id = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+
+		let path = vec![RouteHop {
+			pubkey: node_1_id,
+			node_features: NodeFeatures::empty(),
+			short_channel_id: scored_scid,
+			channel_features: ChannelFeatures::empty(),
+			fee_msat: 0,
+			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA as u32,
+		}];
+
+		nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentFailure { path: path.clone(), short_channel_id: scored_scid });
+		nodes[0].node.push_pending_event(Event::PaymentPathFailed {
+			payment_id: None,
+			payment_hash: PaymentHash([42; 32]),
+			payment_failed_permanently: false,
+			failure: PathFailure::OnPath { network_update: None },
+			path: path.clone(),
+			short_channel_id: Some(scored_scid),
+			retry: None,
+		});
+		let event = receiver
+			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("PaymentPathFailed not handled within deadline");
+		match event {
+			Event::PaymentPathFailed { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+
+		// Ensure we'll score payments that were explicitly failed back by the destination as
+		// ProbeSuccess.
+		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
+		nodes[0].node.push_pending_event(Event::PaymentPathFailed {
+			payment_id: None,
+			payment_hash: PaymentHash([42; 32]),
+			payment_failed_permanently: true,
+			failure: PathFailure::OnPath { network_update: None },
+			path: path.clone(),
+			short_channel_id: None,
+			retry: None,
+		});
+		let event = receiver
+			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("PaymentPathFailed not handled within deadline");
+		match event {
+			Event::PaymentPathFailed { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+
+		nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentSuccess { path: path.clone() });
+		nodes[0].node.push_pending_event(Event::PaymentPathSuccessful {
+			payment_id: PaymentId([42; 32]),
+			payment_hash: None,
+			path: path.clone(),
+		});
+		let event = receiver
+			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("PaymentPathSuccessful not handled within deadline");
+		match event {
+			Event::PaymentPathSuccessful { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+
+		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
+		nodes[0].node.push_pending_event(Event::ProbeSuccessful {
+			payment_id: PaymentId([42; 32]),
+			payment_hash: PaymentHash([42; 32]),
+			path: path.clone(),
+		});
+		let event = receiver
+			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("ProbeSuccessful not handled within deadline");
+		match event {
+			Event::ProbeSuccessful  { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+
+		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeFailure { path: path.clone() });
+		nodes[0].node.push_pending_event(Event::ProbeFailed {
+			payment_id: PaymentId([42; 32]),
+			payment_hash: PaymentHash([42; 32]),
+			path: path.clone(),
+			short_channel_id: Some(scored_scid),
+		});
+		let event = receiver
+			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("ProbeFailure not handled within deadline");
+		match event {
+			Event::ProbeFailed { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+
 		assert!(bg_processor.stop().is_ok());
 	}
 }

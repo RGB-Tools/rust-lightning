@@ -9,17 +9,29 @@
 
 //! Further functional tests which test blockchain reorganizations.
 
+#[cfg(anchors)]
+use crate::chain::keysinterface::BaseSign;
+#[cfg(anchors)]
+use crate::chain::channelmonitor::LATENCY_GRACE_PERIOD_BLOCKS;
 use crate::chain::channelmonitor::{ANTI_REORG_DELAY, Balance};
 use crate::chain::transaction::OutPoint;
 use crate::chain::chaininterface::LowerBoundedFeeEstimator;
 use crate::ln::channel;
-use crate::ln::channelmanager::{self, BREAKDOWN_TIMEOUT, PaymentId};
+#[cfg(anchors)]
+use crate::ln::chan_utils;
+use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, PaymentId};
 use crate::ln::msgs::ChannelMessageHandler;
+#[cfg(anchors)]
+use crate::util::config::UserConfig;
+#[cfg(anchors)]
+use crate::util::events::BumpTransactionEvent;
 use crate::util::events::{Event, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination};
 
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::opcodes;
 use bitcoin::secp256k1::Secp256k1;
+#[cfg(anchors)]
+use bitcoin::{Amount, Script, TxIn, TxOut, PackedLockTime};
 use bitcoin::Transaction;
 
 use crate::prelude::*;
@@ -48,8 +60,8 @@ fn chanmon_fail_from_stale_commitment() {
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
-	let (update_a, _, chan_id_2, _) = create_announced_chan_between_nodes(&nodes, 1, 2, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let (update_a, _, chan_id_2, _) = create_announced_chan_between_nodes(&nodes, 1, 2);
 
 	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], 1_000_000);
 	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
@@ -105,7 +117,7 @@ fn revoked_output_htlc_resolution_timing() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
 
 	let payment_hash_1 = route_payment(&nodes[1], &[&nodes[0]], 1_000_000).1;
 
@@ -124,9 +136,8 @@ fn revoked_output_htlc_resolution_timing() {
 	check_closed_broadcast!(nodes[1], true);
 
 	let bs_spend_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(bs_spend_txn.len(), 2);
+	assert_eq!(bs_spend_txn.len(), 1);
 	check_spends!(bs_spend_txn[0], revoked_local_txn[0]);
-	check_spends!(bs_spend_txn[1], chan.3);
 
 	// After the commitment transaction confirms, we should still wait on the HTLC spend
 	// transaction to confirm before resolving the HTLC.
@@ -155,12 +166,12 @@ fn chanmon_claim_value_coop_close() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 1_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 1_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
 	assert_eq!(vec![Balance::ClaimableOnChannelClose {
 			claimable_amount_satoshis: 1_000_000 - 1_000 - chan_feerate * channel::commitment_tx_base_weight(opt_anchors) / 1000
@@ -171,9 +182,9 @@ fn chanmon_claim_value_coop_close() {
 
 	nodes[0].node.close_channel(&chan_id, &nodes[1].node.get_our_node_id()).unwrap();
 	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, nodes[1].node.get_our_node_id());
-	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &channelmanager::provided_init_features(), &node_0_shutdown);
+	nodes[1].node.handle_shutdown(&nodes[0].node.get_our_node_id(), &node_0_shutdown);
 	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, nodes[0].node.get_our_node_id());
-	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &channelmanager::provided_init_features(), &node_1_shutdown);
+	nodes[0].node.handle_shutdown(&nodes[1].node.get_our_node_id(), &node_1_shutdown);
 
 	let node_0_closing_signed = get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_closing_signed(&nodes[0].node.get_our_node_id(), &node_0_closing_signed);
@@ -256,7 +267,7 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 1_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 1_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
@@ -270,8 +281,8 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 
 	let htlc_cltv_timeout = nodes[0].best_block_info().1 + TEST_FINAL_CLTV + 1; // Note ChannelManager adds one to CLTV timeouts for safety
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
 	let remote_txn = get_local_commitment_txn!(nodes[1], chan_id);
 	// Before B receives the payment preimage, it only suggests the push_msat value of 1_000 sats
@@ -364,21 +375,14 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 	mine_transaction(&nodes[1], &remote_txn[0]);
 
 	let b_broadcast_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(b_broadcast_txn.len(), if prev_commitment_tx { 4 } else { 5 });
-	if prev_commitment_tx {
-		check_spends!(b_broadcast_txn[3], b_broadcast_txn[2]);
-	} else {
-		assert_eq!(b_broadcast_txn[0], b_broadcast_txn[3]);
-		assert_eq!(b_broadcast_txn[1], b_broadcast_txn[4]);
-	}
-	// b_broadcast_txn[0] should spend the HTLC output of the commitment tx for 3_000 sats
+	assert_eq!(b_broadcast_txn.len(), 2);
+	// b_broadcast_txn should spend the HTLCs output of the commitment tx for 3_000 and 4_000 sats
 	check_spends!(b_broadcast_txn[0], remote_txn[0]);
 	check_spends!(b_broadcast_txn[1], remote_txn[0]);
 	assert_eq!(b_broadcast_txn[0].input.len(), 1);
 	assert_eq!(b_broadcast_txn[1].input.len(), 1);
 	assert_eq!(remote_txn[0].output[b_broadcast_txn[0].input[0].previous_output.vout as usize].value, 3_000);
 	assert_eq!(remote_txn[0].output[b_broadcast_txn[1].input[0].previous_output.vout as usize].value, 4_000);
-	check_spends!(b_broadcast_txn[2], funding_tx);
 
 	assert!(nodes[0].node.list_channels().is_empty());
 	check_closed_broadcast!(nodes[0], true);
@@ -482,21 +486,20 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 	// When the HTLC timeout output is spendable in the next block, A should broadcast it
 	connect_blocks(&nodes[0], htlc_cltv_timeout - nodes[0].best_block_info().1 - 1);
 	let a_broadcast_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(a_broadcast_txn.len(), 3);
-	check_spends!(a_broadcast_txn[0], funding_tx);
+	assert_eq!(a_broadcast_txn.len(), 2);
+	assert_eq!(a_broadcast_txn[0].input.len(), 1);
+	check_spends!(a_broadcast_txn[0], remote_txn[0]);
 	assert_eq!(a_broadcast_txn[1].input.len(), 1);
 	check_spends!(a_broadcast_txn[1], remote_txn[0]);
-	assert_eq!(a_broadcast_txn[2].input.len(), 1);
-	check_spends!(a_broadcast_txn[2], remote_txn[0]);
-	assert_ne!(a_broadcast_txn[1].input[0].previous_output.vout,
-	           a_broadcast_txn[2].input[0].previous_output.vout);
-	// a_broadcast_txn [1] and [2] should spend the HTLC outputs of the commitment tx
-	assert_eq!(remote_txn[0].output[a_broadcast_txn[1].input[0].previous_output.vout as usize].value, 3_000);
-	assert_eq!(remote_txn[0].output[a_broadcast_txn[2].input[0].previous_output.vout as usize].value, 4_000);
+	assert_ne!(a_broadcast_txn[0].input[0].previous_output.vout,
+	           a_broadcast_txn[1].input[0].previous_output.vout);
+	// a_broadcast_txn [0] and [1] should spend the HTLC outputs of the commitment tx
+	assert_eq!(remote_txn[0].output[a_broadcast_txn[0].input[0].previous_output.vout as usize].value, 3_000);
+	assert_eq!(remote_txn[0].output[a_broadcast_txn[1].input[0].previous_output.vout as usize].value, 4_000);
 
 	// Once the HTLC-Timeout transaction confirms, A will no longer consider the HTLC
 	// "MaybeClaimable", but instead move it to "AwaitingConfirmations".
-	mine_transaction(&nodes[0], &a_broadcast_txn[2]);
+	mine_transaction(&nodes[0], &a_broadcast_txn[1]);
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 	assert_eq!(vec![Balance::ClaimableAwaitingConfirmations {
 			claimable_amount_satoshis: 4_000,
@@ -510,7 +513,7 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 		nodes[0].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances());
 	expect_payment_failed!(nodes[0], timeout_payment_hash, false);
 
-	test_spendable_output(&nodes[0], &a_broadcast_txn[2]);
+	test_spendable_output(&nodes[0], &a_broadcast_txn[1]);
 
 	// Node B will no longer consider the HTLC "contentious" after the HTLC claim transaction
 	// confirms, and consider it simply "awaiting confirmations". Note that it has to wait for the
@@ -558,7 +561,7 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 	// Finally, mine the HTLC timeout transaction that A broadcasted (even though B should be able
 	// to claim this HTLC with the preimage it knows!). It will remain listed as a claimable HTLC
 	// until ANTI_REORG_DELAY confirmations on the spend.
-	mine_transaction(&nodes[1], &a_broadcast_txn[2]);
+	mine_transaction(&nodes[1], &a_broadcast_txn[1]);
 	assert_eq!(vec![Balance::ContentiousClaimable {
 			claimable_amount_satoshis: 4_000,
 			timeout_height: htlc_cltv_timeout,
@@ -603,7 +606,7 @@ fn test_balances_on_local_commitment_htlcs() {
 
 	// Create a single channel with two pending HTLCs from nodes[0] to nodes[1], one which nodes[1]
 	// knows the preimage for, one which it does not.
-	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 
 	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], 10_000_000);
@@ -633,8 +636,8 @@ fn test_balances_on_local_commitment_htlcs() {
 	check_added_monitors!(nodes[1], 1);
 	expect_payment_claimed!(nodes[1], payment_hash_2, 20_000_000);
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
 	// Get nodes[0]'s commitment transaction and HTLC-Timeout transactions
 	let as_txn = get_local_commitment_txn!(nodes[0], chan_id);
@@ -670,10 +673,8 @@ fn test_balances_on_local_commitment_htlcs() {
 	check_closed_broadcast!(nodes[1], true);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed);
 	let bs_htlc_claim_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(bs_htlc_claim_txn.len(), 3);
+	assert_eq!(bs_htlc_claim_txn.len(), 1);
 	check_spends!(bs_htlc_claim_txn[0], as_txn[0]);
-	check_spends!(bs_htlc_claim_txn[1], funding_tx);
-	check_spends!(bs_htlc_claim_txn[2], bs_htlc_claim_txn[1]);
 
 	// Connect blocks until the HTLCs expire, allowing us to (validly) broadcast the HTLC-Timeout
 	// transaction.
@@ -779,7 +780,7 @@ fn test_no_preimage_inbound_htlc_balances() {
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
-	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 
 	// Send two HTLCs, one from A to B, and one from B to A.
@@ -787,8 +788,8 @@ fn test_no_preimage_inbound_htlc_balances() {
 	let to_a_failed_payment_hash = route_payment(&nodes[1], &[&nodes[0]], 20_000_000).1;
 	let htlc_cltv_timeout = nodes[0].best_block_info().1 + TEST_FINAL_CLTV + 1; // Note ChannelManager adds one to CLTV timeouts for safety
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
 	// Both A and B will have an HTLC that's claimable on timeout and one that's claimable if they
 	// receive the preimage. These will remain the same through the channel closure and until the
@@ -1032,7 +1033,7 @@ fn do_test_revoked_counterparty_commitment_balances(confirm_htlc_spend_first: bo
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
@@ -1063,9 +1064,9 @@ fn do_test_revoked_counterparty_commitment_balances(confirm_htlc_spend_first: bo
 
 	// Get the latest commitment transaction from A and then update the fee to revoke it
 	let as_revoked_txn = get_local_commitment_txn!(nodes[0], chan_id);
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
 
 	let missing_htlc_cltv_timeout = nodes[0].best_block_info().1 + TEST_FINAL_CLTV + 1; // Note ChannelManager adds one to CLTV timeouts for safety
 	let missing_htlc_payment_hash = route_payment(&nodes[1], &[&nodes[0]], 2_000_000).1;
@@ -1240,11 +1241,10 @@ fn do_test_revoked_counterparty_commitment_balances(confirm_htlc_spend_first: bo
 	test_spendable_output(&nodes[1], &as_revoked_txn[0]);
 
 	let mut payment_failed_events = nodes[1].node.get_and_clear_pending_events();
-	expect_payment_failed_conditions_event(&nodes[1], payment_failed_events.pop().unwrap(),
-		dust_payment_hash, false, PaymentFailedConditions::new());
-	expect_payment_failed_conditions_event(&nodes[1], payment_failed_events.pop().unwrap(),
+	expect_payment_failed_conditions_event(payment_failed_events[..2].to_vec(),
 		missing_htlc_payment_hash, false, PaymentFailedConditions::new());
-	assert!(payment_failed_events.is_empty());
+	expect_payment_failed_conditions_event(payment_failed_events[2..].to_vec(),
+		dust_payment_hash, false, PaymentFailedConditions::new());
 
 	connect_blocks(&nodes[1], 1);
 	test_spendable_output(&nodes[1], &claim_txn[if confirm_htlc_spend_first { 2 } else { 3 }]);
@@ -1284,7 +1284,7 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 
 	// Create some initial channels
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 11_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 11_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
@@ -1299,8 +1299,8 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage);
 
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
 
 	// B will generate an HTLC-Success from its revoked commitment tx
 	mine_transaction(&nodes[1], &revoked_local_txn[0]);
@@ -1309,11 +1309,10 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed);
 	let revoked_htlc_success_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 
-	assert_eq!(revoked_htlc_success_txn.len(), 2);
+	assert_eq!(revoked_htlc_success_txn.len(), 1);
 	assert_eq!(revoked_htlc_success_txn[0].input.len(), 1);
 	assert_eq!(revoked_htlc_success_txn[0].input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
 	check_spends!(revoked_htlc_success_txn[0], revoked_local_txn[0]);
-	check_spends!(revoked_htlc_success_txn[1], funding_tx);
 
 	connect_blocks(&nodes[1], TEST_FINAL_CLTV);
 	let revoked_htlc_timeout_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
@@ -1331,9 +1330,8 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 	let to_remote_conf_height = nodes[0].best_block_info().1 + ANTI_REORG_DELAY - 1;
 
 	let as_commitment_claim_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(as_commitment_claim_txn.len(), 2);
+	assert_eq!(as_commitment_claim_txn.len(), 1);
 	check_spends!(as_commitment_claim_txn[0], revoked_local_txn[0]);
-	check_spends!(as_commitment_claim_txn[1], funding_tx);
 
 	// The next two checks have the same balance set for A - even though we confirm a revoked HTLC
 	// transaction our balance tracking doesn't use the on-chain value so the
@@ -1496,7 +1494,7 @@ fn test_revoked_counterparty_aggregated_claims() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let (_, _, chan_id, funding_tx) =
-		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
 	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
 
@@ -1521,8 +1519,8 @@ fn test_revoked_counterparty_aggregated_claims() {
 	check_spends!(as_revoked_txn[0], funding_tx);
 	check_spends!(as_revoked_txn[1], as_revoked_txn[0]); // The HTLC-Claim transaction
 
-	let opt_anchors = get_opt_anchors!(nodes[0], chan_id);
-	let chan_feerate = get_feerate!(nodes[0], chan_id) as u64;
+	let opt_anchors = get_opt_anchors!(nodes[0], nodes[1], chan_id);
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
 
 	{
 		let mut feerate = chanmon_cfgs[0].fee_estimator.sat_per_kw.lock().unwrap();
@@ -1678,4 +1676,142 @@ fn test_revoked_counterparty_aggregated_claims() {
 	connect_blocks(&nodes[1], 6);
 	assert!(nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
 	assert!(nodes[1].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances().is_empty());
+}
+
+#[cfg(anchors)]
+#[test]
+fn test_yield_anchors_events() {
+	// Tests that two parties supporting anchor outputs can open a channel, route payments over
+	// it, and finalize its resolution uncooperatively. Once the HTLCs are locked in, one side will
+	// force close once the HTLCs expire. The force close should stem from an event emitted by LDK,
+	// allowing the consumer to provide additional fees to the commitment transaction to be
+	// broadcast. Once the commitment transaction confirms, events for the HTLC resolution should be
+	// emitted by LDK, such that the consumer can attach fees to the zero fee HTLC transactions.
+	let secp = Secp256k1::new();
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut anchors_config = UserConfig::default();
+	anchors_config.channel_handshake_config.announced_channel = true;
+	anchors_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(anchors_config), Some(anchors_config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let chan_id = create_announced_chan_between_nodes_with_value(
+		&nodes, 0, 1, 1_000_000, 500_000_000
+	).2;
+	route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	let (payment_preimage, payment_hash, _) = route_payment(&nodes[1], &[&nodes[0]], 1_000_000);
+
+	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+
+	connect_blocks(&nodes[0], TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + 1);
+	check_closed_broadcast!(&nodes[0], true);
+	assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
+
+	get_monitor!(nodes[0], chan_id).provide_payment_preimage(
+		&payment_hash, &payment_preimage, &node_cfgs[0].tx_broadcaster,
+		&LowerBoundedFeeEstimator::new(node_cfgs[0].fee_estimator), &nodes[0].logger
+	);
+
+	let mut holder_events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	assert_eq!(holder_events.len(), 1);
+	let (commitment_tx, anchor_tx) = match holder_events.pop().unwrap() {
+		Event::BumpTransaction(BumpTransactionEvent::ChannelClose { commitment_tx, anchor_descriptor, .. })  => {
+			assert_eq!(commitment_tx.input.len(), 1);
+			assert_eq!(commitment_tx.output.len(), 6);
+			let mut anchor_tx = Transaction {
+				version: 2,
+				lock_time: PackedLockTime::ZERO,
+				input: vec![
+					TxIn { previous_output: anchor_descriptor.outpoint, ..Default::default() },
+					TxIn { ..Default::default() },
+				],
+				output: vec![TxOut {
+					value: Amount::ONE_BTC.to_sat(),
+					script_pubkey: Script::new_op_return(&[]),
+				}],
+			};
+			let signer = nodes[0].keys_manager.derive_channel_keys(
+				anchor_descriptor.channel_value_satoshis, &anchor_descriptor.channel_keys_id,
+			);
+			let funding_sig = signer.sign_holder_anchor_input(&mut anchor_tx, 0, &secp).unwrap();
+			anchor_tx.input[0].witness = chan_utils::build_anchor_input_witness(
+				&signer.pubkeys().funding_pubkey, &funding_sig
+			);
+			(commitment_tx, anchor_tx)
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	mine_transactions(&nodes[0], &[&commitment_tx, &anchor_tx]);
+	check_added_monitors!(nodes[0], 1);
+
+	let mut holder_events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	// Certain block `ConnectStyle`s cause an extra `ChannelClose` event to be emitted since the
+	// best block is being updated prior to the confirmed transactions.
+	match *nodes[0].connect_style.borrow() {
+		ConnectStyle::BestBlockFirst|ConnectStyle::BestBlockFirstReorgsOnlyTip|ConnectStyle::BestBlockFirstSkippingBlocks => {
+			assert_eq!(holder_events.len(), 3);
+			if let Event::BumpTransaction(BumpTransactionEvent::ChannelClose { .. }) = holder_events.remove(0) {}
+			else { panic!("unexpected event"); }
+
+		},
+		_ => assert_eq!(holder_events.len(), 2),
+	};
+	let mut htlc_txs = Vec::with_capacity(2);
+	for event in holder_events {
+		match event {
+			Event::BumpTransaction(BumpTransactionEvent::HTLCResolution { htlc_descriptors, .. }) => {
+				assert_eq!(htlc_descriptors.len(), 1);
+				let htlc_descriptor = &htlc_descriptors[0];
+				let signer = nodes[0].keys_manager.derive_channel_keys(
+					htlc_descriptor.channel_value_satoshis, &htlc_descriptor.channel_keys_id
+				);
+				let per_commitment_point = signer.get_per_commitment_point(htlc_descriptor.per_commitment_number, &secp);
+				let mut htlc_tx = Transaction {
+					version: 2,
+					lock_time: if htlc_descriptor.htlc.offered {
+						PackedLockTime(htlc_descriptor.htlc.cltv_expiry)
+					} else {
+						PackedLockTime::ZERO
+					},
+					input: vec![
+						htlc_descriptor.unsigned_tx_input(), // HTLC input
+						TxIn { ..Default::default() } // Fee input
+					],
+					output: vec![
+						htlc_descriptor.tx_output(&per_commitment_point, &secp), // HTLC output
+						TxOut { // Fee input change
+							value: Amount::ONE_BTC.to_sat(),
+							script_pubkey: Script::new_op_return(&[]),
+						}
+					]
+				};
+				let our_sig = signer.sign_holder_htlc_transaction(&mut htlc_tx, 0, htlc_descriptor, &secp).unwrap();
+				let witness_script = htlc_descriptor.witness_script(&per_commitment_point, &secp);
+				htlc_tx.input[0].witness = htlc_descriptor.tx_input_witness(&our_sig, &witness_script);
+				htlc_txs.push(htlc_tx);
+			},
+			_ => panic!("Unexpected event"),
+		}
+	}
+
+	mine_transactions(&nodes[0], &[&htlc_txs[0], &htlc_txs[1]]);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
+
+	assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+
+	connect_blocks(&nodes[0], BREAKDOWN_TIMEOUT as u32);
+
+	let holder_events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	assert_eq!(holder_events.len(), 3);
+	for event in holder_events {
+		match event {
+			Event::SpendableOutputs { .. } => {},
+			_ => panic!("Unexpected event"),
+		}
+	}
+
+	// Clear the remaining events as they're not relevant to what we're testing.
+	nodes[0].node.get_and_clear_pending_events();
 }

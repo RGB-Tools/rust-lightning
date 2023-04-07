@@ -27,13 +27,15 @@ use bitcoin::secp256k1::{Secp256k1, All};
 use crate::prelude::*;
 use crate::sync::{self, Arc};
 
+use crate::routing::gossip::NodeId;
+
 // Using the same keys for LN and BTC ids
 pub(super) fn add_channel(
 	gossip_sync: &P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
 	secp_ctx: &Secp256k1<All>, node_1_privkey: &SecretKey, node_2_privkey: &SecretKey, features: ChannelFeatures, short_channel_id: u64
 ) {
-	let node_id_1 = PublicKey::from_secret_key(&secp_ctx, node_1_privkey);
-	let node_id_2 = PublicKey::from_secret_key(&secp_ctx, node_2_privkey);
+	let node_id_1 = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_1_privkey));
+	let node_id_2 = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_2_privkey));
 
 	let unsigned_announcement = UnsignedChannelAnnouncement {
 		features,
@@ -64,7 +66,7 @@ pub(super) fn add_or_update_node(
 	gossip_sync: &P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
 	secp_ctx: &Secp256k1<All>, node_privkey: &SecretKey, features: NodeFeatures, timestamp: u32
 ) {
-	let node_id = PublicKey::from_secret_key(&secp_ctx, node_privkey);
+	let node_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_privkey));
 	let unsigned_announcement = UnsignedNodeAnnouncement {
 		features,
 		timestamp,
@@ -139,8 +141,7 @@ pub(super) fn build_line_graph() -> (
 	let secp_ctx = Secp256k1::new();
 	let logger = Arc::new(test_utils::TestLogger::new());
 	let chain_monitor = Arc::new(test_utils::TestChainSource::new(Network::Testnet));
-	let genesis_hash = genesis_block(Network::Testnet).header.block_hash();
-	let network_graph = Arc::new(NetworkGraph::new(genesis_hash, Arc::clone(&logger)));
+	let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, Arc::clone(&logger)));
 	let gossip_sync = P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger));
 
 	// Build network from our_id to node 19:
@@ -193,8 +194,7 @@ pub(super) fn build_graph() -> (
 	let secp_ctx = Secp256k1::new();
 	let logger = Arc::new(test_utils::TestLogger::new());
 	let chain_monitor = Arc::new(test_utils::TestChainSource::new(Network::Testnet));
-	let genesis_hash = genesis_block(Network::Testnet).header.block_hash();
-	let network_graph = Arc::new(NetworkGraph::new(genesis_hash, Arc::clone(&logger)));
+	let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, Arc::clone(&logger)));
 	let gossip_sync = P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger));
 	// Build network from our_id to node6:
 	//

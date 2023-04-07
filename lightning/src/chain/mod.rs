@@ -12,13 +12,12 @@
 use bitcoin::blockdata::block::{Block, BlockHeader};
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::script::Script;
-use bitcoin::blockdata::transaction::TxOut;
 use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
 
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, MonitorEvent};
-use crate::chain::keysinterface::Sign;
+use crate::chain::keysinterface::WriteableEcdsaChannelSigner;
 use crate::chain::transaction::{OutPoint, TransactionData};
 
 use crate::prelude::*;
@@ -41,7 +40,7 @@ pub struct BestBlock {
 impl BestBlock {
 	/// Constructs a `BestBlock` that represents the genesis block at height 0 of the given
 	/// network.
-	pub fn from_genesis(network: Network) -> Self {
+	pub fn from_network(network: Network) -> Self {
 		BestBlock {
 			block_hash: genesis_block(network).header.block_hash(),
 			height: 0,
@@ -60,26 +59,6 @@ impl BestBlock {
 	pub fn height(&self) -> u32 { self.height }
 }
 
-/// An error when accessing the chain via [`Access`].
-#[derive(Clone, Debug)]
-pub enum AccessError {
-	/// The requested chain is unknown.
-	UnknownChain,
-
-	/// The requested transaction doesn't exist or hasn't confirmed.
-	UnknownTx,
-}
-
-/// The `Access` trait defines behavior for accessing chain data and state, such as blocks and
-/// UTXOs.
-pub trait Access {
-	/// Returns the transaction output of a funding transaction encoded by [`short_channel_id`].
-	/// Returns an error if `genesis_hash` is for a different chain or if such a transaction output
-	/// is unknown.
-	///
-	/// [`short_channel_id`]: https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#definition-of-short_channel_id
-	fn get_utxo(&self, genesis_hash: &BlockHash, short_channel_id: u64) -> Result<TxOut, AccessError>;
-}
 
 /// The `Listen` trait is used to notify when blocks have been connected or disconnected from the
 /// chain.
@@ -175,6 +154,9 @@ pub trait Confirm {
 	fn best_block_updated(&self, header: &BlockHeader, height: u32);
 	/// Returns transactions that must be monitored for reorganization out of the chain along
 	/// with the hash of the block as part of which it had been previously confirmed.
+	///
+	/// Note that the returned `Option<BlockHash>` might be `None` for channels created with LDK
+	/// 0.0.112 and prior, in which case you need to manually track previous confirmations.
 	///
 	/// Will include any transactions passed to [`transactions_confirmed`] that have insufficient
 	/// confirmations to be safe from a chain reorganization. Will not include any transactions
@@ -291,7 +273,7 @@ pub enum ChannelMonitorUpdateStatus {
 /// multiple instances.
 ///
 /// [`PermanentFailure`]: ChannelMonitorUpdateStatus::PermanentFailure
-pub trait Watch<ChannelSigner: Sign> {
+pub trait Watch<ChannelSigner: WriteableEcdsaChannelSigner> {
 	/// Watches a channel identified by `funding_txo` using `monitor`.
 	///
 	/// Implementations are responsible for watching the chain for the funding transaction along
@@ -312,7 +294,7 @@ pub trait Watch<ChannelSigner: Sign> {
 	/// [`ChannelMonitorUpdateStatus`] for invariants around returning an error.
 	///
 	/// [`update_monitor`]: channelmonitor::ChannelMonitor::update_monitor
-	fn update_channel(&self, funding_txo: OutPoint, update: ChannelMonitorUpdate) -> ChannelMonitorUpdateStatus;
+	fn update_channel(&self, funding_txo: OutPoint, update: &ChannelMonitorUpdate) -> ChannelMonitorUpdateStatus;
 
 	/// Returns any monitor events since the last call. Subsequent calls must only return new
 	/// events.

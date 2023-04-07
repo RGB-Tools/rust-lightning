@@ -48,9 +48,9 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 /// use lightning::chain::chaininterface::BroadcasterInterface;
 /// use lightning::chain::chaininterface::FeeEstimator;
 /// use lightning::chain::keysinterface;
-/// use lightning::chain::keysinterface::KeysInterface;
-/// use lightning::ln::channelmanager::ChannelManager;
-/// use lightning::ln::channelmanager::ChannelManagerReadArgs;
+/// use lightning::chain::keysinterface::{EntropySource, NodeSigner, SignerProvider};
+/// use lightning::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs};
+/// use lightning::routing::router::Router;
 /// use lightning::util::config::UserConfig;
 /// use lightning::util::logger::Logger;
 /// use lightning::util::ser::ReadableArgs;
@@ -61,40 +61,49 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 ///
 /// async fn init_sync<
 /// 	B: BlockSource,
-/// 	K: KeysInterface,
+/// 	ES: EntropySource,
+/// 	NS: NodeSigner,
+/// 	SP: SignerProvider,
 /// 	T: BroadcasterInterface,
 /// 	F: FeeEstimator,
+/// 	R: Router,
 /// 	L: Logger,
 /// 	C: chain::Filter,
-/// 	P: chainmonitor::Persist<K::Signer>,
+/// 	P: chainmonitor::Persist<SP::Signer>,
 /// >(
 /// 	block_source: &B,
-/// 	chain_monitor: &ChainMonitor<K::Signer, &C, &T, &F, &L, &P>,
+/// 	chain_monitor: &ChainMonitor<SP::Signer, &C, &T, &F, &L, &P>,
 /// 	config: UserConfig,
-/// 	keys_manager: &K,
+/// 	entropy_source: &ES,
+/// 	node_signer: &NS,
+/// 	signer_provider: &SP,
 /// 	tx_broadcaster: &T,
 /// 	fee_estimator: &F,
+/// 	router: &R,
 /// 	logger: &L,
 /// 	persister: &P,
 /// ) {
 /// 	// Read a serialized channel monitor paired with the block hash when it was persisted.
 /// 	let serialized_monitor = "...";
-/// 	let (monitor_block_hash, mut monitor) = <(BlockHash, ChannelMonitor<K::Signer>)>::read(
-/// 		&mut Cursor::new(&serialized_monitor), keys_manager).unwrap();
+/// 	let (monitor_block_hash, mut monitor) = <(BlockHash, ChannelMonitor<SP::Signer>)>::read(
+/// 		&mut Cursor::new(&serialized_monitor), (entropy_source, signer_provider)).unwrap();
 ///
 /// 	// Read the channel manager paired with the block hash when it was persisted.
 /// 	let serialized_manager = "...";
 /// 	let (manager_block_hash, mut manager) = {
 /// 		let read_args = ChannelManagerReadArgs::new(
-/// 			keys_manager,
+/// 			entropy_source,
+/// 			node_signer,
+/// 			signer_provider,
 /// 			fee_estimator,
 /// 			chain_monitor,
 /// 			tx_broadcaster,
+/// 			router,
 /// 			logger,
 /// 			config,
 /// 			vec![&mut monitor],
 /// 		);
-/// 		<(BlockHash, ChannelManager<&ChainMonitor<K::Signer, &C, &T, &F, &L, &P>, &T, &K, &F, &L>)>::read(
+/// 		<(BlockHash, ChannelManager<&ChainMonitor<SP::Signer, &C, &T, &F, &L, &P>, &T, &ES, &NS, &SP, &F, &R, &L>)>::read(
 /// 			&mut Cursor::new(&serialized_manager), read_args).unwrap()
 /// 	};
 ///

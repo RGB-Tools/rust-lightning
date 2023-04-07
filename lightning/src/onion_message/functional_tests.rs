@@ -9,7 +9,7 @@
 
 //! Onion message testing and test utilities live here.
 
-use crate::chain::keysinterface::{KeysInterface, Recipient};
+use crate::chain::keysinterface::{NodeSigner, Recipient};
 use crate::ln::features::InitFeatures;
 use crate::ln::msgs::{self, DecodeError, OnionMessageHandler};
 use super::{BlindedPath, CustomOnionMessageContents, CustomOnionMessageHandler, Destination, OnionMessageContents, OnionMessenger, SendError};
@@ -24,14 +24,13 @@ use crate::sync::Arc;
 
 struct MessengerNode {
 	keys_manager: Arc<test_utils::TestKeysInterface>,
-	messenger: OnionMessenger<Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestLogger>, Arc<TestCustomMessageHandler>>,
+	messenger: OnionMessenger<Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestLogger>, Arc<TestCustomMessageHandler>>,
 	logger: Arc<test_utils::TestLogger>,
 }
 
 impl MessengerNode {
 	fn get_node_pk(&self) -> PublicKey {
-		let secp_ctx = Secp256k1::new();
-		PublicKey::from_secret_key(&secp_ctx, &self.keys_manager.get_node_secret(Recipient::Node).unwrap())
+		self.keys_manager.get_node_id(Recipient::Node).unwrap()
 	}
 }
 
@@ -77,7 +76,7 @@ fn create_nodes(num_messengers: u8) -> Vec<MessengerNode> {
 		let keys_manager = Arc::new(test_utils::TestKeysInterface::new(&seed, Network::Testnet));
 		nodes.push(MessengerNode {
 			keys_manager: keys_manager.clone(),
-			messenger: OnionMessenger::new(keys_manager, logger.clone(), Arc::new(TestCustomMessageHandler {})),
+			messenger: OnionMessenger::new(keys_manager.clone(), keys_manager.clone(), logger.clone(), Arc::new(TestCustomMessageHandler {})),
 			logger,
 		});
 	}
@@ -86,8 +85,8 @@ fn create_nodes(num_messengers: u8) -> Vec<MessengerNode> {
 		let mut features = InitFeatures::empty();
 		features.set_onion_messages_optional();
 		let init_msg = msgs::Init { features, remote_network_address: None };
-		nodes[i].messenger.peer_connected(&nodes[i + 1].get_node_pk(), &init_msg.clone()).unwrap();
-		nodes[i + 1].messenger.peer_connected(&nodes[i].get_node_pk(), &init_msg.clone()).unwrap();
+		nodes[i].messenger.peer_connected(&nodes[i + 1].get_node_pk(), &init_msg.clone(), true).unwrap();
+		nodes[i + 1].messenger.peer_connected(&nodes[i].get_node_pk(), &init_msg.clone(), false).unwrap();
 	}
 	nodes
 }

@@ -13,7 +13,7 @@
 pub(crate) mod fuzz_wrappers;
 
 #[macro_use]
-pub(crate) mod ser_macros;
+pub mod ser_macros;
 
 pub mod events;
 pub mod errors;
@@ -28,8 +28,6 @@ pub mod transaction_utils;
 pub(crate) mod atomic_counter;
 pub(crate) mod byte_utils;
 pub(crate) mod chacha20;
-#[cfg(all(any(feature = "_bench_unstable", not(test)), feature = "std"))]
-pub(crate) mod fairrwlock;
 #[cfg(fuzzing)]
 pub mod zbase32;
 #[cfg(not(fuzzing))]
@@ -39,6 +37,8 @@ pub(crate) mod poly1305;
 pub(crate) mod chacha20poly1305rfc;
 pub(crate) mod scid_utils;
 pub(crate) mod time;
+
+pub mod indexed_map;
 
 /// Logging macro utilities.
 #[macro_use]

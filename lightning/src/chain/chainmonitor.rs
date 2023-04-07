@@ -31,7 +31,7 @@ use crate::chain::{ChannelMonitorUpdateStatus, Filter, WatchedOutput};
 use crate::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, Balance, MonitorEvent, TransactionOutputs, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::chain::keysinterface::Sign;
+use crate::chain::keysinterface::WriteableEcdsaChannelSigner;
 use crate::util::atomic_counter::AtomicCounter;
 use crate::util::logger::Logger;
 use crate::util::errors::APIError;
@@ -68,7 +68,7 @@ impl MonitorUpdateId {
 	pub(crate) fn from_monitor_update(update: &ChannelMonitorUpdate) -> Self {
 		Self { contents: UpdateOrigin::OffChain(update.update_id) }
 	}
-	pub(crate) fn from_new_monitor<ChannelSigner: Sign>(monitor: &ChannelMonitor<ChannelSigner>) -> Self {
+	pub(crate) fn from_new_monitor<ChannelSigner: WriteableEcdsaChannelSigner>(monitor: &ChannelMonitor<ChannelSigner>) -> Self {
 		Self { contents: UpdateOrigin::OffChain(monitor.get_latest_update_id()) }
 	}
 }
@@ -93,7 +93,7 @@ impl MonitorUpdateId {
 ///    [`ChannelMonitorUpdateStatus::PermanentFailure`], in which case the channel will likely be
 ///    closed without broadcasting the latest state. See
 ///    [`ChannelMonitorUpdateStatus::PermanentFailure`] for more details.
-pub trait Persist<ChannelSigner: Sign> {
+pub trait Persist<ChannelSigner: WriteableEcdsaChannelSigner> {
 	/// Persist a new channel's data in response to a [`chain::Watch::watch_channel`] call. This is
 	/// called by [`ChannelManager`] for new channels, or may be called directly, e.g. on startup.
 	///
@@ -144,10 +144,10 @@ pub trait Persist<ChannelSigner: Sign> {
 	/// [`ChannelMonitorUpdateStatus`] for requirements when returning errors.
 	///
 	/// [`Writeable::write`]: crate::util::ser::Writeable::write
-	fn update_persisted_channel(&self, channel_id: OutPoint, update: &Option<ChannelMonitorUpdate>, data: &ChannelMonitor<ChannelSigner>, update_id: MonitorUpdateId) -> ChannelMonitorUpdateStatus;
+	fn update_persisted_channel(&self, channel_id: OutPoint, update: Option<&ChannelMonitorUpdate>, data: &ChannelMonitor<ChannelSigner>, update_id: MonitorUpdateId) -> ChannelMonitorUpdateStatus;
 }
 
-struct MonitorHolder<ChannelSigner: Sign> {
+struct MonitorHolder<ChannelSigner: WriteableEcdsaChannelSigner> {
 	monitor: ChannelMonitor<ChannelSigner>,
 	/// The full set of pending monitor updates for this Channel.
 	///
@@ -182,7 +182,7 @@ struct MonitorHolder<ChannelSigner: Sign> {
 	last_chain_persist_height: AtomicUsize,
 }
 
-impl<ChannelSigner: Sign> MonitorHolder<ChannelSigner> {
+impl<ChannelSigner: WriteableEcdsaChannelSigner> MonitorHolder<ChannelSigner> {
 	fn has_pending_offchain_updates(&self, pending_monitor_updates_lock: &MutexGuard<Vec<MonitorUpdateId>>) -> bool {
 		pending_monitor_updates_lock.iter().any(|update_id|
 			if let UpdateOrigin::OffChain(_) = update_id.contents { true } else { false })
@@ -197,12 +197,12 @@ impl<ChannelSigner: Sign> MonitorHolder<ChannelSigner> {
 ///
 /// Note that this holds a mutex in [`ChainMonitor`] and may block other events until it is
 /// released.
-pub struct LockedChannelMonitor<'a, ChannelSigner: Sign> {
+pub struct LockedChannelMonitor<'a, ChannelSigner: WriteableEcdsaChannelSigner> {
 	lock: RwLockReadGuard<'a, HashMap<OutPoint, MonitorHolder<ChannelSigner>>>,
 	funding_txo: OutPoint,
 }
 
-impl<ChannelSigner: Sign> Deref for LockedChannelMonitor<'_, ChannelSigner> {
+impl<ChannelSigner: WriteableEcdsaChannelSigner> Deref for LockedChannelMonitor<'_, ChannelSigner> {
 	type Target = ChannelMonitor<ChannelSigner>;
 	fn deref(&self) -> &ChannelMonitor<ChannelSigner> {
 		&self.lock.get(&self.funding_txo).expect("Checked at construction").monitor
@@ -218,7 +218,7 @@ impl<ChannelSigner: Sign> Deref for LockedChannelMonitor<'_, ChannelSigner> {
 ///
 /// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 /// [module-level documentation]: crate::chain::chainmonitor
-pub struct ChainMonitor<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
+pub struct ChainMonitor<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
 	where C::Target: chain::Filter,
         T::Target: BroadcasterInterface,
         F::Target: FeeEstimator,
@@ -242,7 +242,7 @@ pub struct ChainMonitor<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: De
 	highest_chain_height: AtomicUsize,
 }
 
-impl<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref> ChainMonitor<ChannelSigner, C, T, F, L, P>
+impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref> ChainMonitor<ChannelSigner, C, T, F, L, P>
 where C::Target: chain::Filter,
 	    T::Target: BroadcasterInterface,
 	    F::Target: FeeEstimator,
@@ -294,7 +294,7 @@ where C::Target: chain::Filter,
 				}
 
 				log_trace!(self.logger, "Syncing Channel Monitor for channel {}", log_funding_info!(monitor));
-				match self.persister.update_persisted_channel(*funding_outpoint, &None, monitor, update_id) {
+				match self.persister.update_persisted_channel(*funding_outpoint, None, monitor, update_id) {
 					ChannelMonitorUpdateStatus::Completed =>
 						log_trace!(self.logger, "Finished syncing Channel Monitor for channel {}", log_funding_info!(monitor)),
 					ChannelMonitorUpdateStatus::PermanentFailure => {
@@ -516,7 +516,7 @@ where C::Target: chain::Filter,
 	}
 }
 
-impl<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
+impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
 chain::Listen for ChainMonitor<ChannelSigner, C, T, F, L, P>
 where
 	C::Target: chain::Filter,
@@ -543,7 +543,7 @@ where
 	}
 }
 
-impl<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
+impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
 chain::Confirm for ChainMonitor<ChannelSigner, C, T, F, L, P>
 where
 	C::Target: chain::Filter,
@@ -592,7 +592,7 @@ where
 	}
 }
 
-impl<ChannelSigner: Sign, C: Deref , T: Deref , F: Deref , L: Deref , P: Deref >
+impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref , T: Deref , F: Deref , L: Deref , P: Deref >
 chain::Watch<ChannelSigner> for ChainMonitor<ChannelSigner, C, T, F, L, P>
 where C::Target: chain::Filter,
 	    T::Target: BroadcasterInterface,
@@ -646,7 +646,7 @@ where C::Target: chain::Filter,
 
 	/// Note that we persist the given `ChannelMonitor` update while holding the
 	/// `ChainMonitor` monitors lock.
-	fn update_channel(&self, funding_txo: OutPoint, update: ChannelMonitorUpdate) -> ChannelMonitorUpdateStatus {
+	fn update_channel(&self, funding_txo: OutPoint, update: &ChannelMonitorUpdate) -> ChannelMonitorUpdateStatus {
 		// Update the monitor that watches the channel referred to by the given outpoint.
 		let monitors = self.monitors.read().unwrap();
 		match monitors.get(&funding_txo) {
@@ -664,15 +664,15 @@ where C::Target: chain::Filter,
 			Some(monitor_state) => {
 				let monitor = &monitor_state.monitor;
 				log_trace!(self.logger, "Updating ChannelMonitor for channel {}", log_funding_info!(monitor));
-				let update_res = monitor.update_monitor(&update, &self.broadcaster, &*self.fee_estimator, &self.logger);
+				let update_res = monitor.update_monitor(update, &self.broadcaster, &*self.fee_estimator, &self.logger);
 				if update_res.is_err() {
 					log_error!(self.logger, "Failed to update ChannelMonitor for channel {}.", log_funding_info!(monitor));
 				}
 				// Even if updating the monitor returns an error, the monitor's state will
 				// still be changed. So, persist the updated monitor despite the error.
-				let update_id = MonitorUpdateId::from_monitor_update(&update);
+				let update_id = MonitorUpdateId::from_monitor_update(update);
 				let mut pending_monitor_updates = monitor_state.pending_monitor_updates.lock().unwrap();
-				let persist_res = self.persister.update_persisted_channel(funding_txo, &Some(update), monitor, update_id);
+				let persist_res = self.persister.update_persisted_channel(funding_txo, Some(update), monitor, update_id);
 				match persist_res {
 					ChannelMonitorUpdateStatus::InProgress => {
 						pending_monitor_updates.push(update_id);
@@ -735,7 +735,7 @@ where C::Target: chain::Filter,
 	}
 }
 
-impl<ChannelSigner: Sign, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref> events::EventsProvider for ChainMonitor<ChannelSigner, C, T, F, L, P>
+impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref> events::EventsProvider for ChainMonitor<ChannelSigner, C, T, F, L, P>
 	where C::Target: chain::Filter,
 	      T::Target: BroadcasterInterface,
 	      F::Target: FeeEstimator,
@@ -792,11 +792,11 @@ mod tests {
 	use crate::{get_htlc_update_msgs, get_local_commitment_txn, get_revoke_commit_msgs, get_route_and_payment_hash, unwrap_send_err};
 	use crate::chain::{ChannelMonitorUpdateStatus, Confirm, Watch};
 	use crate::chain::channelmonitor::LATENCY_GRACE_PERIOD_BLOCKS;
-	use crate::ln::channelmanager::{self, PaymentSendFailure, PaymentId};
+	use crate::ln::channelmanager::{PaymentSendFailure, PaymentId};
 	use crate::ln::functional_test_utils::*;
 	use crate::ln::msgs::ChannelMessageHandler;
 	use crate::util::errors::APIError;
-	use crate::util::events::{ClosureReason, MessageSendEvent, MessageSendEventsProvider};
+	use crate::util::events::{Event, ClosureReason, MessageSendEvent, MessageSendEventsProvider};
 
 	#[test]
 	fn test_async_ooo_offchain_updates() {
@@ -807,7 +807,7 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes(&nodes, 0, 1);
 
 		// Route two payments to be claimed at the same time.
 		let (payment_preimage_1, payment_hash_1, _) = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
@@ -815,15 +815,12 @@ mod tests {
 
 		chanmon_cfgs[1].persister.offchain_monitor_updates.lock().unwrap().clear();
 		chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+		chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
 
 		nodes[1].node.claim_funds(payment_preimage_1);
 		check_added_monitors!(nodes[1], 1);
-		expect_payment_claimed!(nodes[1], payment_hash_1, 1_000_000);
 		nodes[1].node.claim_funds(payment_preimage_2);
 		check_added_monitors!(nodes[1], 1);
-		expect_payment_claimed!(nodes[1], payment_hash_2, 1_000_000);
-
-		chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
 
 		let persistences = chanmon_cfgs[1].persister.offchain_monitor_updates.lock().unwrap().clone();
 		assert_eq!(persistences.len(), 1);
@@ -851,7 +848,23 @@ mod tests {
 			.find(|(txo, _)| txo == funding_txo).unwrap().1.contains(&next_update));
 		assert!(nodes[1].chain_monitor.release_pending_monitor_events().is_empty());
 		assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 		nodes[1].chain_monitor.chain_monitor.channel_monitor_updated(*funding_txo, update_iter.next().unwrap().clone()).unwrap();
+
+		let claim_events = nodes[1].node.get_and_clear_pending_events();
+		assert_eq!(claim_events.len(), 2);
+		match claim_events[0] {
+			Event::PaymentClaimed { ref payment_hash, amount_msat: 1_000_000, .. } => {
+				assert_eq!(payment_hash_1, *payment_hash);
+			},
+			_ => panic!("Unexpected event"),
+		}
+		match claim_events[1] {
+			Event::PaymentClaimed { ref payment_hash, amount_msat: 1_000_000, .. } => {
+				assert_eq!(payment_hash_2, *payment_hash);
+			},
+			_ => panic!("Unexpected event"),
+		}
 
 		// Now manually walk the commitment signed dance - because we claimed two payments
 		// back-to-back it doesn't fit into the neat walk commitment_signed_dance does.
@@ -898,8 +911,7 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let channel = create_announced_chan_between_nodes(
-			&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 
 		// Get a route for later and rebalance the channel somewhat
 		send_payment(&nodes[0], &[&nodes[1]], 10_000_000);
@@ -975,7 +987,7 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		create_announced_chan_between_nodes(&nodes, 0, 1, channelmanager::provided_init_features(), channelmanager::provided_init_features());
+		create_announced_chan_between_nodes(&nodes, 0, 1);
 
 		chanmon_cfgs[0].persister.chain_sync_monitor_persistences.lock().unwrap().clear();
 		chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::PermanentFailure);
