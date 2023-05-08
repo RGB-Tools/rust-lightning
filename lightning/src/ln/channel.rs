@@ -6510,6 +6510,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 			(25, user_id_high_opt, option),
 			(27, self.channel_keys_id, required),
 			(29, self.consignment_endpoint, required),
+			(31, self.ldk_data_dir, required),
 		});
 
 		Ok(())
