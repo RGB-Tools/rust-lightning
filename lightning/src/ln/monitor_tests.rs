@@ -10,29 +10,41 @@
 //! Further functional tests which test blockchain reorganizations.
 
 #[cfg(anchors)]
-use crate::chain::keysinterface::BaseSign;
+use crate::chain::keysinterface::{ChannelSigner, EcdsaChannelSigner};
 #[cfg(anchors)]
 use crate::chain::channelmonitor::LATENCY_GRACE_PERIOD_BLOCKS;
 use crate::chain::channelmonitor::{ANTI_REORG_DELAY, Balance};
 use crate::chain::transaction::OutPoint;
 use crate::chain::chaininterface::LowerBoundedFeeEstimator;
+#[cfg(anchors)]
+use crate::events::bump_transaction::BumpTransactionEvent;
+use crate::events::{Event, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination};
 use crate::ln::channel;
 #[cfg(anchors)]
 use crate::ln::chan_utils;
-use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, PaymentId};
+#[cfg(anchors)]
+use crate::ln::channelmanager::ChannelManager;
+use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, PaymentId, RecipientOnionFields};
 use crate::ln::msgs::ChannelMessageHandler;
 #[cfg(anchors)]
 use crate::util::config::UserConfig;
 #[cfg(anchors)]
-use crate::util::events::BumpTransactionEvent;
-use crate::util::events::{Event, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination};
+use crate::util::crypto::sign;
+use crate::util::ser::Writeable;
+use crate::util::test_utils;
 
+#[cfg(anchors)]
+use bitcoin::blockdata::transaction::EcdsaSighashType;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::opcodes;
 use bitcoin::secp256k1::Secp256k1;
 #[cfg(anchors)]
-use bitcoin::{Amount, Script, TxIn, TxOut, PackedLockTime};
+use bitcoin::secp256k1::SecretKey;
+#[cfg(anchors)]
+use bitcoin::{Amount, PublicKey, Script, TxIn, TxOut, PackedLockTime, Witness};
 use bitcoin::Transaction;
+#[cfg(anchors)]
+use bitcoin::util::sighash::SighashCache;
 
 use crate::prelude::*;
 
@@ -64,7 +76,8 @@ fn chanmon_fail_from_stale_commitment() {
 	let (update_a, _, chan_id_2, _) = create_announced_chan_between_nodes(&nodes, 1, 2);
 
 	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], 1_000_000);
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let bs_txn = get_local_commitment_txn!(nodes[1], chan_id_2);
@@ -484,7 +497,7 @@ fn do_test_claim_value_force_close(prev_commitment_tx: bool) {
 		nodes[0].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances());
 
 	// When the HTLC timeout output is spendable in the next block, A should broadcast it
-	connect_blocks(&nodes[0], htlc_cltv_timeout - nodes[0].best_block_info().1 - 1);
+	connect_blocks(&nodes[0], htlc_cltv_timeout - nodes[0].best_block_info().1);
 	let a_broadcast_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(a_broadcast_txn.len(), 2);
 	assert_eq!(a_broadcast_txn[0].input.len(), 1);
@@ -611,7 +624,8 @@ fn test_balances_on_local_commitment_htlcs() {
 
 	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], 10_000_000);
 	let htlc_cltv_timeout = nodes[0].best_block_info().1 + TEST_FINAL_CLTV + 1; // Note ChannelManager adds one to CLTV timeouts for safety
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -622,7 +636,8 @@ fn test_balances_on_local_commitment_htlcs() {
 	expect_payment_claimable!(nodes[1], payment_hash, payment_secret, 10_000_000);
 
 	let (route_2, payment_hash_2, payment_preimage_2, payment_secret_2) = get_route_and_payment_hash!(nodes[0], nodes[1], 20_000_000);
-	nodes[0].node.send_payment(&route_2, payment_hash_2, &Some(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route_2, payment_hash_2,
+		RecipientOnionFields::secret_only(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
@@ -872,7 +887,7 @@ fn test_no_preimage_inbound_htlc_balances() {
 	// HTLC has been spent, even after the HTLC expires. We'll also fail the inbound HTLC, but it
 	// won't do anything as the channel is already closed.
 
-	connect_blocks(&nodes[0], TEST_FINAL_CLTV - 1);
+	connect_blocks(&nodes[0], TEST_FINAL_CLTV);
 	let as_htlc_timeout_claim = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(as_htlc_timeout_claim.len(), 1);
 	check_spends!(as_htlc_timeout_claim[0], as_txn[0]);
@@ -893,7 +908,7 @@ fn test_no_preimage_inbound_htlc_balances() {
 
 	// The next few blocks for B look the same as for A, though for the opposite HTLC
 	nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
-	connect_blocks(&nodes[1], TEST_FINAL_CLTV - (ANTI_REORG_DELAY - 1) - 1);
+	connect_blocks(&nodes[1], TEST_FINAL_CLTV - (ANTI_REORG_DELAY - 1));
 	expect_pending_htlcs_forwardable_conditions!(nodes[1],
 		[HTLCDestination::FailedPayment { payment_hash: to_b_failed_payment_hash }]);
 	let bs_htlc_timeout_claim = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
@@ -1307,20 +1322,29 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors!(nodes[1], 1);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed);
-	let revoked_htlc_success_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-
-	assert_eq!(revoked_htlc_success_txn.len(), 1);
-	assert_eq!(revoked_htlc_success_txn[0].input.len(), 1);
-	assert_eq!(revoked_htlc_success_txn[0].input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
-	check_spends!(revoked_htlc_success_txn[0], revoked_local_txn[0]);
+	let revoked_htlc_success = {
+		let mut txn = nodes[1].tx_broadcaster.txn_broadcast();
+		assert_eq!(txn.len(), 1);
+		assert_eq!(txn[0].input.len(), 1);
+		assert_eq!(txn[0].input[0].witness.last().unwrap().len(), ACCEPTED_HTLC_SCRIPT_WEIGHT);
+		check_spends!(txn[0], revoked_local_txn[0]);
+		txn.pop().unwrap()
+	};
 
 	connect_blocks(&nodes[1], TEST_FINAL_CLTV);
-	let revoked_htlc_timeout_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	assert_eq!(revoked_htlc_timeout_txn.len(), 1);
-	check_spends!(revoked_htlc_timeout_txn[0], revoked_local_txn[0]);
-	assert_ne!(revoked_htlc_success_txn[0].input[0].previous_output, revoked_htlc_timeout_txn[0].input[0].previous_output);
-	assert_eq!(revoked_htlc_success_txn[0].lock_time.0, 0);
-	assert_ne!(revoked_htlc_timeout_txn[0].lock_time.0, 0);
+	let revoked_htlc_timeout = {
+		let mut txn = nodes[1].tx_broadcaster.unique_txn_broadcast();
+		assert_eq!(txn.len(), 2);
+		if txn[0].input[0].previous_output == revoked_htlc_success.input[0].previous_output {
+			txn.remove(1)
+		} else {
+			txn.remove(0)
+		}
+	};
+	check_spends!(revoked_htlc_timeout, revoked_local_txn[0]);
+	assert_ne!(revoked_htlc_success.input[0].previous_output, revoked_htlc_timeout.input[0].previous_output);
+	assert_eq!(revoked_htlc_success.lock_time.0, 0);
+	assert_ne!(revoked_htlc_timeout.lock_time.0, 0);
 
 	// A will generate justice tx from B's revoked commitment/HTLC tx
 	mine_transaction(&nodes[0], &revoked_local_txn[0]);
@@ -1352,10 +1376,10 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 	assert_eq!(as_balances,
 		sorted_vec(nodes[0].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances()));
 
-	mine_transaction(&nodes[0], &revoked_htlc_success_txn[0]);
+	mine_transaction(&nodes[0], &revoked_htlc_success);
 	let as_htlc_claim_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(as_htlc_claim_tx.len(), 2);
-	check_spends!(as_htlc_claim_tx[0], revoked_htlc_success_txn[0]);
+	check_spends!(as_htlc_claim_tx[0], revoked_htlc_success);
 	check_spends!(as_htlc_claim_tx[1], revoked_local_txn[0]); // A has to generate a new claim for the remaining revoked
 	                                                          // outputs (which no longer includes the spent HTLC output)
 
@@ -1364,7 +1388,7 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 
 	assert_eq!(as_htlc_claim_tx[0].output.len(), 1);
 	fuzzy_assert_eq(as_htlc_claim_tx[0].output[0].value,
-		3_000 - chan_feerate * (revoked_htlc_success_txn[0].weight() + as_htlc_claim_tx[0].weight()) as u64 / 1000);
+		3_000 - chan_feerate * (revoked_htlc_success.weight() + as_htlc_claim_tx[0].weight()) as u64 / 1000);
 
 	mine_transaction(&nodes[0], &as_htlc_claim_tx[0]);
 	assert_eq!(sorted_vec(vec![Balance::ClaimableAwaitingConfirmations {
@@ -1406,7 +1430,7 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 		}]),
 		sorted_vec(nodes[0].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances()));
 
-	connect_blocks(&nodes[0], revoked_htlc_timeout_txn[0].lock_time.0 - nodes[0].best_block_info().1);
+	connect_blocks(&nodes[0], revoked_htlc_timeout.lock_time.0 - nodes[0].best_block_info().1);
 	expect_pending_htlcs_forwardable_and_htlc_handling_failed_ignore!(&nodes[0],
 		[HTLCDestination::FailedPayment { payment_hash: failed_payment_hash }]);
 	// As time goes on A may split its revocation claim transaction into multiple.
@@ -1423,11 +1447,11 @@ fn test_revoked_counterparty_htlc_tx_balances() {
 		check_spends!(tx, revoked_local_txn[0]);
 	}
 
-	mine_transaction(&nodes[0], &revoked_htlc_timeout_txn[0]);
+	mine_transaction(&nodes[0], &revoked_htlc_timeout);
 	let as_second_htlc_claim_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(as_second_htlc_claim_tx.len(), 2);
 
-	check_spends!(as_second_htlc_claim_tx[0], revoked_htlc_timeout_txn[0]);
+	check_spends!(as_second_htlc_claim_tx[0], revoked_htlc_timeout);
 	check_spends!(as_second_htlc_claim_tx[1], revoked_local_txn[0]);
 
 	// Connect blocks to finalize the HTLC resolution with the HTLC-Timeout transaction. In a
@@ -1678,6 +1702,233 @@ fn test_revoked_counterparty_aggregated_claims() {
 	assert!(nodes[1].chain_monitor.chain_monitor.get_monitor(funding_outpoint).unwrap().get_claimable_balances().is_empty());
 }
 
+fn do_test_restored_packages_retry(check_old_monitor_retries_after_upgrade: bool) {
+	// Tests that we'll retry packages that were previously timelocked after we've restored them.
+	let persister;
+	let new_chain_monitor;
+	let node_deserialized;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	// Open a channel, lock in an HTLC, and immediately broadcast the commitment transaction. This
+	// ensures that the HTLC timeout package is held until we reach its expiration height.
+	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 50_000_000);
+	route_payment(&nodes[0], &[&nodes[1]], 10_000_000);
+
+	nodes[0].node.force_close_broadcasting_latest_txn(&chan_id, &nodes[1].node.get_our_node_id()).unwrap();
+	check_added_monitors(&nodes[0], 1);
+	check_closed_broadcast(&nodes[0], 1, true);
+	check_closed_event(&nodes[0], 1, ClosureReason::HolderForceClosed, false);
+
+	let commitment_tx = {
+		let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
+		assert_eq!(txn.len(), 1);
+		assert_eq!(txn[0].output.len(), 3);
+		check_spends!(txn[0], funding_tx);
+		txn.pop().unwrap()
+	};
+
+	mine_transaction(&nodes[0], &commitment_tx);
+
+	// Connect blocks until the HTLC's expiration is met, expecting a transaction broadcast.
+	connect_blocks(&nodes[0], TEST_FINAL_CLTV);
+	let htlc_timeout_tx = {
+		let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
+		assert_eq!(txn.len(), 1);
+		check_spends!(txn[0], commitment_tx);
+		txn.pop().unwrap()
+	};
+
+	// Check that we can still rebroadcast these packages/transactions if we're upgrading from an
+	// old `ChannelMonitor` that did not exercise said rebroadcasting logic.
+	if check_old_monitor_retries_after_upgrade {
+		let serialized_monitor = hex::decode(
+			"0101fffffffffffffffff9550f22c95100160014d5a9aa98b89acc215fc3d23d6fec0ad59ca3665f00002200204c5f18e5e95b184f34d02ba6de8a2a4e36ae3d4ec87299ad81f3284dc7195c6302d7dde8e10a5a22c9bd0d7ef5494d85683ac050253b917615d4f97af633f0a8e2035f5e9d58b4328566223c107d86cf853e6b9fae1d26ff6d969be0178d1423c4ea0016001467822698d782e8421ebdf96d010de99382b7ec2300160014caf6d80fe2bab80473b021f57588a9c384bf23170000000000000000000000004d49e5da0000000000000000000000000000002a0270b20ad0f2c2bb30a55590fc77778495bc1b38c96476901145dda57491237f0f74c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e00000022002034c0cc0ad0dd5fe61dcf7ef58f995e3d34f8dbd24aa2a6fae68fefe102bf025c21391732ce658e1fe167300bb689a81e7db5399b9ee4095e217b0e997e8dd3d17a0000000000000000004a002103adde8029d3ee281a32e9db929b39f503ff9d7e93cd308eb157955344dc6def84022103205087e2dc1f6b9937e887dfa712c5bdfa950b01dbda3ebac4c85efdde48ee6a04020090004752210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db32103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b52ae00000000000186a0ffffffffffff0291e7c0a3232fb8650a6b4089568a81062b48a768780e5a74bb4a4a74e33aec2c029d5760248ec86c4a76d9df8308555785a06a65472fb995f5b392d520bbd000650090c1c94b11625690c9d84c5daa67b6ad19fcc7f9f23e194384140b08fcab9e8e810000ffffffffffff000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000002391732ce658e1fe167300bb689a81e7db5399b9ee4095e217b0e997e8dd3d17a00000000000000010000000000009896800000005166687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f292505000000009c009900202d704fbfe342a9ff6eaca14d80a24aaed0e680bbbdd36157b6f2798c61d906910120f9fe5e552aa0fc45020f0505efde432a4e373e5d393863973a6899f8c26d33d10208000000000098968004494800210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23020500030241000408000001000000000006020000080800000000009896800a0400000046167c86cc0e598a6b541f7c9bf9ef17222e4a76f636e2d22185aeadd2b02d029c00000000000000000000000000000000000000000000000166687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925fffffffffffe01e3002004f8eda5676356f539169a8e9a1e86c7f125283328d6f4bded1b939b52a6a7e30108000000000000c299022103a1f98e85886df54add6908b4fc1ff515e44aedefe9eb9c02879c89994298fa79042103a650bf03971df0176c7b412247390ef717853e8bd487b204dccc2fe2078bb75206210390bbbcebe9f70ba5dfd98866a79f72f75e0a6ea550ef73b202dd87cd6477350a08210284152d57908488e666e872716a286eb670b3d06cbeebf3f2e4ad350e01ec5e5b0a2102295e2de39eb3dcc2882f8cc266df7882a8b6d2c32aa08799f49b693aad3be28e0c04000000fd0e00fd01fe002045cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d01080000000000009b5e0221035f5e9d58b4328566223c107d86cf853e6b9fae1d26ff6d969be0178d1423c4ea04210230fde9c031f487db95ff55b7c0acbe0c7c26a8d82615e9184416bd350101616706210225afb4e88eac8b47b67adeaf085f5eb5d37d936f56138f0848de3d104edf113208210208e4687a95c172b86b920c3bc5dbd5f023094ec2cb0abdb74f9b624f45740df90a2102d7dde8e10a5a22c9bd0d7ef5494d85683ac050253b917615d4f97af633f0a8e20c04000000fd0efd01193b00010102080000000000989680040400000051062066687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925080400000000417e2650c201383711eed2a7cb8652c3e77ee6a395e81849c5c222217ed68b333c0ca9f1e900662ae68a7359efa7ef9d90613f2a62f7c3ff90f8c25e2cc974c9d39c009900202d704fbfe342a9ff6eaca14d80a24aaed0e680bbbdd36157b6f2798c61d906910120f9fe5e552aa0fc45020f0505efde432a4e373e5d393863973a6899f8c26d33d10208000000000098968004494800210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23020500030241000408000001000000000006020000080800000000009896800a0400000046fffffffffffefffffffffffe000000000000000000000000000000000000000000000000ffe099e83ae3761c7f1b781d22613bd1f6977e9ad59fae12b3eba34462ee8a3d000000500000000000000002fd01da002045cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d01fd01840200000000010174c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e00000000000f55f9800310270000000000002200208309b406e3b96e76cde414fbb8f5159f5b25b24075656c6382cec797854d53495e9b0000000000002200204c5f18e5e95b184f34d02ba6de8a2a4e36ae3d4ec87299ad81f3284dc7195c6350c300000000000016001425df8ec4a074f80579fed67d4707d5ec8ed7e8d304004730440220671c9badf26bd3a1ebd2d17020c6be20587d7822530daacc52c28839875eaec602204b575a21729ed27311f6d79fdf6fe8702b0a798f7d842e39ede1b56f249a613401473044022016a0da36f70cbf5d889586af88f238982889dc161462c56557125c7acfcb69e9022036ae10c6cc8cbc3b27d9e9ef6babb556086585bc819f252208bd175286699fdd014752210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db32103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b52ae50c9222002040000000b03209452ca8c90d4c78928b80ec41398f2a890324d8ad6e6c81408a0cb9b8d977b070406030400020090fd02a1002045cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d01fd01840200000000010174c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e00000000000f55f9800310270000000000002200208309b406e3b96e76cde414fbb8f5159f5b25b24075656c6382cec797854d53495e9b0000000000002200204c5f18e5e95b184f34d02ba6de8a2a4e36ae3d4ec87299ad81f3284dc7195c6350c300000000000016001425df8ec4a074f80579fed67d4707d5ec8ed7e8d304004730440220671c9badf26bd3a1ebd2d17020c6be20587d7822530daacc52c28839875eaec602204b575a21729ed27311f6d79fdf6fe8702b0a798f7d842e39ede1b56f249a613401473044022016a0da36f70cbf5d889586af88f238982889dc161462c56557125c7acfcb69e9022036ae10c6cc8cbc3b27d9e9ef6babb556086585bc819f252208bd175286699fdd014752210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db32103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b52ae50c9222002040000000b03209452ca8c90d4c78928b80ec41398f2a890324d8ad6e6c81408a0cb9b8d977b0704cd01cb00c901c7002245cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d0001022102d7dde8e10a5a22c9bd0d7ef5494d85683ac050253b917615d4f97af633f0a8e204020090062b5e9b0000000000002200204c5f18e5e95b184f34d02ba6de8a2a4e36ae3d4ec87299ad81f3284dc7195c630821035f5e9d58b4328566223c107d86cf853e6b9fae1d26ff6d969be0178d1423c4ea0a200000000000000000000000004d49e5da0000000000000000000000000000002a0c0800000000000186a0000000000000000274c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e0000000000000001000000000022002034c0cc0ad0dd5fe61dcf7ef58f995e3d34f8dbd24aa2a6fae68fefe102bf025c45cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d000000000000000100000000002200208309b406e3b96e76cde414fbb8f5159f5b25b24075656c6382cec797854d5349010100160014d5a9aa98b89acc215fc3d23d6fec0ad59ca3665ffd027100fd01e6fd01e300080000fffffffffffe02080000000000009b5e0408000000000000c3500604000000fd08b0af002102d7dde8e10a5a22c9bd0d7ef5494d85683ac050253b917615d4f97af633f0a8e20221035f5e9d58b4328566223c107d86cf853e6b9fae1d26ff6d969be0178d1423c4ea04210230fde9c031f487db95ff55b7c0acbe0c7c26a8d82615e9184416bd350101616706210225afb4e88eac8b47b67adeaf085f5eb5d37d936f56138f0848de3d104edf113208210208e4687a95c172b86b920c3bc5dbd5f023094ec2cb0abdb74f9b624f45740df90acdcc00a8020000000174c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e00000000000f55f9800310270000000000002200208309b406e3b96e76cde414fbb8f5159f5b25b24075656c6382cec797854d53495e9b0000000000002200204c5f18e5e95b184f34d02ba6de8a2a4e36ae3d4ec87299ad81f3284dc7195c6350c300000000000016001425df8ec4a074f80579fed67d4707d5ec8ed7e8d350c92220022045cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d0c3c3b00010102080000000000989680040400000051062066687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f29250804000000000240671c9badf26bd3a1ebd2d17020c6be20587d7822530daacc52c28839875eaec64b575a21729ed27311f6d79fdf6fe8702b0a798f7d842e39ede1b56f249a613404010006407e2650c201383711eed2a7cb8652c3e77ee6a395e81849c5c222217ed68b333c0ca9f1e900662ae68a7359efa7ef9d90613f2a62f7c3ff90f8c25e2cc974c9d3010000000000000001010000000000000000090b2a953d93a124c600ecb1a0ccfed420169cdd37f538ad94a3e4e6318c93c14adf59cdfbb40bdd40950c9f8dd547d29d75a173e1376a7850743394c46dea2dfd01cefd01ca00fd017ffd017c00080000ffffffffffff0208000000000000c2990408000000000000c3500604000000fd08b0af002102295e2de39eb3dcc2882f8cc266df7882a8b6d2c32aa08799f49b693aad3be28e022103a1f98e85886df54add6908b4fc1ff515e44aedefe9eb9c02879c89994298fa79042103a650bf03971df0176c7b412247390ef717853e8bd487b204dccc2fe2078bb75206210390bbbcebe9f70ba5dfd98866a79f72f75e0a6ea550ef73b202dd87cd6477350a08210284152d57908488e666e872716a286eb670b3d06cbeebf3f2e4ad350e01ec5e5b0aa2a1007d020000000174c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e00000000000f55f9800299c2000000000000220020740e108cfbc93967b6ab242a351ebee7de51814cf78d366adefd78b10281f17e50c300000000000016001425df8ec4a074f80579fed67d4707d5ec8ed7e8d351c92220022004f8eda5676356f539169a8e9a1e86c7f125283328d6f4bded1b939b52a6a7e30c00024045cb2485594bb1ec08e7bb6af4f89c912bd53f006d7876ea956773e04a4aad4a40e2b8d4fc612102f0b54061b3c1239fb78783053e8e6f9d92b1b99f81ae9ec2040100060000fd019600b0af002103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b02210270b20ad0f2c2bb30a55590fc77778495bc1b38c96476901145dda57491237f0f042103b4e59df102747edc3a3e2283b42b88a8c8218ffd0dcfb52f2524b371d64cadaa062103d902b7b8b3434076d2b210e912c76645048b71e28995aad227a465a65ccd817608210301e9a52f923c157941de4a7692e601f758660969dcf5abdb67817efe84cce2ef0202009004010106b7b600b0af00210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db30221034d0f817cb19b4a3bd144b615459bd06cbab3b4bdc96d73e18549a992cee80e8104210380542b59a9679890cba529fe155a9508ef57dac7416d035b23666e3fb98c3814062103adde8029d3ee281a32e9db929b39f503ff9d7e93cd308eb157955344dc6def84082103205087e2dc1f6b9937e887dfa712c5bdfa950b01dbda3ebac4c85efdde48ee6a02020090082274c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e000000000287010108d30df34e3a1e00ecdd03a2c843db062479a81752c4dfd0cc4baef0f81e7bc7ef8820990daf8d8e8d30a3b4b08af12c9f5cd71e45c7238103e0c80ca13850862e4fd2c56b69b7195312518de1bfe9aed63c80bb7760d70b2a870d542d815895fd12423d11e2adb0cdf55d776dac8f487c9b3b7ea12f1b150eb15889cf41333ade465692bf1cdc360b9c2a19bf8c1ca4fed7639d8bc953d36c10d8c6c9a8c0a57608788979bcf145e61b308006896e21d03e92084f93bd78740c20639134a7a8fd019afd019600b0af002103c21e841cbc0b48197d060c71e116c185fa0ac281b7d0aa5924f535154437ca3b02210270b20ad0f2c2bb30a55590fc77778495bc1b38c96476901145dda57491237f0f042103b4e59df102747edc3a3e2283b42b88a8c8218ffd0dcfb52f2524b371d64cadaa062103d902b7b8b3434076d2b210e912c76645048b71e28995aad227a465a65ccd817608210301e9a52f923c157941de4a7692e601f758660969dcf5abdb67817efe84cce2ef0202009004010106b7b600b0af00210307a78def56cba9fc4db22a25928181de538ee59ba1a475ae113af7790acd0db30221034d0f817cb19b4a3bd144b615459bd06cbab3b4bdc96d73e18549a992cee80e8104210380542b59a9679890cba529fe155a9508ef57dac7416d035b23666e3fb98c3814062103adde8029d3ee281a32e9db929b39f503ff9d7e93cd308eb157955344dc6def84082103205087e2dc1f6b9937e887dfa712c5bdfa950b01dbda3ebac4c85efdde48ee6a02020090082274c52ab4f11296d62b66a6dba9513b04a3e7fb5a09a30cee22fce7294ab55b7e000000000000000186a00000000000000000000000004d49e5da0000000000000000000000000000002a000000000000000001b77b61346a2a408afdb01743a2230cb36e55771a0790f67a0910e207fd223fc8000000000000000145cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d00000000041000080000000000989680020400000051160004000000510208000000000000000004040000000b000000000000000145cfd42d0989e55b953f516ac7fd152bd90ec4438a2fc636f97ddd32a0c8fe0d00000000b77b61346a2a408afdb01743a2230cb36e55771a0790f67a0910e207fd223fc80000005000000000000000000000000000000000000101300300050007010109210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c230d000f020000",
+		).unwrap();
+		reload_node!(nodes[0], &nodes[0].node.encode(), &[&serialized_monitor], persister, new_chain_monitor, node_deserialized);
+	}
+
+	// Connecting more blocks should result in the HTLC transactions being rebroadcast.
+	connect_blocks(&nodes[0], 6);
+	if check_old_monitor_retries_after_upgrade {
+		check_added_monitors(&nodes[0], 1);
+	}
+	{
+		let txn = nodes[0].tx_broadcaster.txn_broadcast();
+		if !nodes[0].connect_style.borrow().skips_blocks() {
+			assert_eq!(txn.len(), 6);
+		} else {
+			assert!(txn.len() < 6);
+		}
+		for tx in txn {
+			assert_eq!(tx.input.len(), htlc_timeout_tx.input.len());
+			assert_eq!(tx.output.len(), htlc_timeout_tx.output.len());
+			assert_eq!(tx.input[0].previous_output, htlc_timeout_tx.input[0].previous_output);
+			assert_eq!(tx.output[0], htlc_timeout_tx.output[0]);
+		}
+	}
+}
+
+#[test]
+fn test_restored_packages_retry() {
+	do_test_restored_packages_retry(false);
+	do_test_restored_packages_retry(true);
+}
+
+fn do_test_monitor_rebroadcast_pending_claims(anchors: bool) {
+	// Test that we will retry broadcasting pending claims for a force-closed channel on every
+	// `ChainMonitor::rebroadcast_pending_claims` call.
+	if anchors {
+		assert!(cfg!(anchors));
+	}
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	if anchors {
+		#[cfg(anchors)] {
+			config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+		}
+	}
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let (_, _, _, chan_id, funding_tx) = create_chan_between_nodes_with_value(
+		&nodes[0], &nodes[1], 1_000_000, 500_000_000
+	);
+	const HTLC_AMT_MSAT: u64 = 1_000_000;
+	const HTLC_AMT_SAT: u64 = HTLC_AMT_MSAT / 1000;
+	route_payment(&nodes[0], &[&nodes[1]], HTLC_AMT_MSAT);
+
+	let htlc_expiry = nodes[0].best_block_info().1 + TEST_FINAL_CLTV + 1;
+
+	let commitment_txn = get_local_commitment_txn!(&nodes[0], &chan_id);
+	assert_eq!(commitment_txn.len(), if anchors { 1 /* commitment tx only */} else { 2 /* commitment and htlc timeout tx */ });
+	check_spends!(&commitment_txn[0], &funding_tx);
+	mine_transaction(&nodes[0], &commitment_txn[0]);
+	check_closed_broadcast!(&nodes[0], true);
+	check_closed_event(&nodes[0], 1, ClosureReason::CommitmentTxConfirmed, false);
+	check_added_monitors(&nodes[0], 1);
+
+	// Set up a helper closure we'll use throughout our test. We should only expect retries without
+	// bumps if fees have not increased after a block has been connected (assuming the height timer
+	// re-evaluates at every block) or after `ChainMonitor::rebroadcast_pending_claims` is called.
+	let mut prev_htlc_tx_feerate = None;
+	let mut check_htlc_retry = |should_retry: bool, should_bump: bool| -> Option<Transaction> {
+		let (htlc_tx, htlc_tx_feerate) = if anchors {
+			assert!(nodes[0].tx_broadcaster.txn_broadcast().is_empty());
+			let mut events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
+			assert_eq!(events.len(), if should_retry { 1 } else { 0 });
+			if !should_retry {
+				return None;
+			}
+			#[allow(unused_assignments)]
+			let mut tx = Transaction {
+				version: 2,
+				lock_time: bitcoin::PackedLockTime::ZERO,
+				input: vec![],
+				output: vec![],
+			};
+			#[allow(unused_assignments)]
+			let mut feerate = 0;
+			#[cfg(anchors)] {
+				feerate = if let Event::BumpTransaction(BumpTransactionEvent::HTLCResolution {
+					target_feerate_sat_per_1000_weight, mut htlc_descriptors, tx_lock_time,
+				}) = events.pop().unwrap() {
+					let secp = Secp256k1::new();
+					assert_eq!(htlc_descriptors.len(), 1);
+					let descriptor = htlc_descriptors.pop().unwrap();
+					assert_eq!(descriptor.commitment_txid, commitment_txn[0].txid());
+					let htlc_output_idx = descriptor.htlc.transaction_output_index.unwrap() as usize;
+					assert!(htlc_output_idx < commitment_txn[0].output.len());
+					tx.lock_time = tx_lock_time;
+					// Note that we don't care about actually making the HTLC transaction meet the
+					// feerate for the test, we just want to make sure the feerates we receive from
+					// the events never decrease.
+					tx.input.push(descriptor.unsigned_tx_input());
+					let signer = nodes[0].keys_manager.derive_channel_keys(
+						descriptor.channel_value_satoshis, &descriptor.channel_keys_id,
+					);
+					let per_commitment_point = signer.get_per_commitment_point(
+						descriptor.per_commitment_number, &secp
+					);
+					tx.output.push(descriptor.tx_output(&per_commitment_point, &secp));
+					let our_sig = signer.sign_holder_htlc_transaction(&mut tx, 0, &descriptor, &secp).unwrap();
+					let witness_script = descriptor.witness_script(&per_commitment_point, &secp);
+					tx.input[0].witness = descriptor.tx_input_witness(&our_sig, &witness_script);
+					target_feerate_sat_per_1000_weight as u64
+				} else { panic!("unexpected event"); };
+			}
+			(tx, feerate)
+		} else {
+			assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+			let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
+			assert_eq!(txn.len(), if should_retry { 1 } else { 0 });
+			if !should_retry {
+				return None;
+			}
+			let htlc_tx = txn.pop().unwrap();
+			check_spends!(htlc_tx, commitment_txn[0]);
+			let htlc_tx_fee = HTLC_AMT_SAT - htlc_tx.output[0].value;
+			let htlc_tx_feerate = htlc_tx_fee * 1000 / htlc_tx.weight() as u64;
+			(htlc_tx, htlc_tx_feerate)
+		};
+		if should_bump {
+			assert!(htlc_tx_feerate > prev_htlc_tx_feerate.take().unwrap());
+		} else if let Some(prev_feerate) = prev_htlc_tx_feerate.take() {
+			assert_eq!(htlc_tx_feerate, prev_feerate);
+		}
+		prev_htlc_tx_feerate = Some(htlc_tx_feerate);
+		Some(htlc_tx)
+	};
+
+	// Connect blocks up to one before the HTLC expires. This should not result in a claim/retry.
+	connect_blocks(&nodes[0], htlc_expiry - nodes[0].best_block_info().1 - 1);
+	check_htlc_retry(false, false);
+
+	// Connect one more block, producing our first claim.
+	connect_blocks(&nodes[0], 1);
+	check_htlc_retry(true, false);
+
+	// Connect one more block, expecting a retry with a fee bump. Unfortunately, we cannot bump HTLC
+	// transactions pre-anchors.
+	connect_blocks(&nodes[0], 1);
+	check_htlc_retry(true, anchors);
+
+	// Trigger a call and we should have another retry, but without a bump.
+	nodes[0].chain_monitor.chain_monitor.rebroadcast_pending_claims();
+	check_htlc_retry(true, false);
+
+	// Double the feerate and trigger a call, expecting a fee-bumped retry.
+	*nodes[0].fee_estimator.sat_per_kw.lock().unwrap() *= 2;
+	nodes[0].chain_monitor.chain_monitor.rebroadcast_pending_claims();
+	check_htlc_retry(true, anchors);
+
+	// Connect one more block, expecting a retry with a fee bump. Unfortunately, we cannot bump HTLC
+	// transactions pre-anchors.
+	connect_blocks(&nodes[0], 1);
+	let htlc_tx = check_htlc_retry(true, anchors).unwrap();
+
+	// Mine the HTLC transaction to ensure we don't retry claims while they're confirmed.
+	mine_transaction(&nodes[0], &htlc_tx);
+	// If we have a `ConnectStyle` that advertises the new block first without the transasctions,
+	// we'll receive an extra bumped claim.
+	if nodes[0].connect_style.borrow().updates_best_block_first() {
+		check_htlc_retry(true, anchors);
+	}
+	nodes[0].chain_monitor.chain_monitor.rebroadcast_pending_claims();
+	check_htlc_retry(false, false);
+}
+
+#[test]
+fn test_monitor_timer_based_claim() {
+	do_test_monitor_rebroadcast_pending_claims(false);
+	#[cfg(anchors)]
+	do_test_monitor_rebroadcast_pending_claims(true);
+}
+
 #[cfg(anchors)]
 #[test]
 fn test_yield_anchors_events() {
@@ -1748,7 +1999,7 @@ fn test_yield_anchors_events() {
 
 	let mut holder_events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
 	// Certain block `ConnectStyle`s cause an extra `ChannelClose` event to be emitted since the
-	// best block is being updated prior to the confirmed transactions.
+	// best block is updated before the confirmed transactions are notified.
 	match *nodes[0].connect_style.borrow() {
 		ConnectStyle::BestBlockFirst|ConnectStyle::BestBlockFirstReorgsOnlyTip|ConnectStyle::BestBlockFirstSkippingBlocks => {
 			assert_eq!(holder_events.len(), 3);
@@ -1761,7 +2012,7 @@ fn test_yield_anchors_events() {
 	let mut htlc_txs = Vec::with_capacity(2);
 	for event in holder_events {
 		match event {
-			Event::BumpTransaction(BumpTransactionEvent::HTLCResolution { htlc_descriptors, .. }) => {
+			Event::BumpTransaction(BumpTransactionEvent::HTLCResolution { htlc_descriptors, tx_lock_time, .. }) => {
 				assert_eq!(htlc_descriptors.len(), 1);
 				let htlc_descriptor = &htlc_descriptors[0];
 				let signer = nodes[0].keys_manager.derive_channel_keys(
@@ -1770,11 +2021,7 @@ fn test_yield_anchors_events() {
 				let per_commitment_point = signer.get_per_commitment_point(htlc_descriptor.per_commitment_number, &secp);
 				let mut htlc_tx = Transaction {
 					version: 2,
-					lock_time: if htlc_descriptor.htlc.offered {
-						PackedLockTime(htlc_descriptor.htlc.cltv_expiry)
-					} else {
-						PackedLockTime::ZERO
-					},
+					lock_time: tx_lock_time,
 					input: vec![
 						htlc_descriptor.unsigned_tx_input(), // HTLC input
 						TxIn { ..Default::default() } // Fee input
@@ -1814,4 +2061,359 @@ fn test_yield_anchors_events() {
 
 	// Clear the remaining events as they're not relevant to what we're testing.
 	nodes[0].node.get_and_clear_pending_events();
+}
+
+#[cfg(anchors)]
+#[test]
+fn test_anchors_aggregated_revoked_htlc_tx() {
+	// Test that `ChannelMonitor`s can properly detect and claim funds from a counterparty claiming
+	// multiple HTLCs from multiple channels in a single transaction via the success path from a
+	// revoked commitment.
+	let secp = Secp256k1::new();
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	// Required to sign a revoked commitment transaction
+	chanmon_cfgs[1].keys_manager.disable_revocation_policy_check = true;
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut anchors_config = UserConfig::default();
+	anchors_config.channel_handshake_config.announced_channel = true;
+	anchors_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(anchors_config), Some(anchors_config)]);
+
+	let bob_persister: test_utils::TestPersister;
+	let bob_chain_monitor: test_utils::TestChainMonitor;
+	let bob_deserialized: ChannelManager<
+		&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface,
+		&test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator,
+		&test_utils::TestRouter, &test_utils::TestLogger,
+	>;
+
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let chan_a = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 20_000_000);
+	let chan_b = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 20_000_000);
+
+	// Serialize Bob with the initial state of both channels, which we'll use later.
+	let bob_serialized = nodes[1].node.encode();
+
+	// Route two payments for each channel from Alice to Bob to lock in the HTLCs.
+	let payment_a = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+	let payment_b = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+	let payment_c = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+	let payment_d = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+
+	// Serialize Bob's monitors with the HTLCs locked in. We'll restart Bob later on with the state
+	// at this point such that he broadcasts a revoked commitment transaction with the HTLCs
+	// present.
+	let bob_serialized_monitor_a = get_monitor!(nodes[1], chan_a.2).encode();
+	let bob_serialized_monitor_b = get_monitor!(nodes[1], chan_b.2).encode();
+
+	// Bob claims all the HTLCs...
+	claim_payment(&nodes[0], &[&nodes[1]], payment_a.0);
+	claim_payment(&nodes[0], &[&nodes[1]], payment_b.0);
+	claim_payment(&nodes[0], &[&nodes[1]], payment_c.0);
+	claim_payment(&nodes[0], &[&nodes[1]], payment_d.0);
+
+	// ...and sends one back through each channel such that he has a motive to broadcast his
+	// revoked state.
+	send_payment(&nodes[1], &[&nodes[0]], 30_000_000);
+	send_payment(&nodes[1], &[&nodes[0]], 30_000_000);
+
+	// Restart Bob with the revoked state and provide the HTLC preimages he claimed.
+	reload_node!(
+		nodes[1], anchors_config, bob_serialized, &[&bob_serialized_monitor_a, &bob_serialized_monitor_b],
+		bob_persister, bob_chain_monitor, bob_deserialized
+	);
+	for chan_id in [chan_a.2, chan_b.2].iter() {
+		let monitor = get_monitor!(nodes[1], chan_id);
+		for payment in [payment_a, payment_b, payment_c, payment_d].iter() {
+			monitor.provide_payment_preimage(
+				&payment.1, &payment.0, &node_cfgs[1].tx_broadcaster,
+				&LowerBoundedFeeEstimator::new(node_cfgs[1].fee_estimator), &nodes[1].logger
+			);
+		}
+	}
+
+	// Bob force closes by restarting with the outdated state, prompting the ChannelMonitors to
+	// broadcast the latest commitment transaction known to them, which in our case is the one with
+	// the HTLCs still pending.
+	nodes[1].node.timer_tick_occurred();
+	check_added_monitors(&nodes[1], 2);
+	check_closed_event!(&nodes[1], 2, ClosureReason::OutdatedChannelManager);
+	let (revoked_commitment_a, revoked_commitment_b) = {
+		let txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
+		assert_eq!(txn.len(), 2);
+		assert_eq!(txn[0].output.len(), 6); // 2 HTLC outputs + 1 to_self output + 1 to_remote output + 2 anchor outputs
+		assert_eq!(txn[1].output.len(), 6); // 2 HTLC outputs + 1 to_self output + 1 to_remote output + 2 anchor outputs
+		if txn[0].input[0].previous_output.txid == chan_a.3.txid() {
+			check_spends!(&txn[0], &chan_a.3);
+			check_spends!(&txn[1], &chan_b.3);
+			(txn[0].clone(), txn[1].clone())
+		} else {
+			check_spends!(&txn[1], &chan_a.3);
+			check_spends!(&txn[0], &chan_b.3);
+			(txn[1].clone(), txn[0].clone())
+		}
+	};
+
+	// Bob should now receive two events to bump his revoked commitment transaction fees.
+	assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+	let events = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	assert_eq!(events.len(), 2);
+	let anchor_tx = {
+		let secret_key = SecretKey::from_slice(&[1; 32]).unwrap();
+		let public_key = PublicKey::new(secret_key.public_key(&secp));
+		let fee_utxo_script = Script::new_v0_p2wpkh(&public_key.wpubkey_hash().unwrap());
+		let coinbase_tx = Transaction {
+			version: 2,
+			lock_time: PackedLockTime::ZERO,
+			input: vec![TxIn { ..Default::default() }],
+			output: vec![TxOut { // UTXO to attach fees to `anchor_tx`
+				value: Amount::ONE_BTC.to_sat(),
+				script_pubkey: fee_utxo_script.clone(),
+			}],
+		};
+		let mut anchor_tx = Transaction {
+			version: 2,
+			lock_time: PackedLockTime::ZERO,
+			input: vec![
+				TxIn { // Fee input
+					previous_output: bitcoin::OutPoint { txid: coinbase_tx.txid(), vout: 0 },
+					..Default::default()
+				},
+			],
+			output: vec![TxOut { // Fee input change
+				value: coinbase_tx.output[0].value / 2 ,
+				script_pubkey: Script::new_op_return(&[]),
+			}],
+		};
+		let mut signers = Vec::with_capacity(2);
+		for event in events {
+			match event {
+				Event::BumpTransaction(BumpTransactionEvent::ChannelClose { anchor_descriptor, .. })  => {
+					anchor_tx.input.push(TxIn {
+						previous_output: anchor_descriptor.outpoint,
+						..Default::default()
+					});
+					let signer = nodes[1].keys_manager.derive_channel_keys(
+						anchor_descriptor.channel_value_satoshis, &anchor_descriptor.channel_keys_id,
+					);
+					signers.push(signer);
+				},
+				_ => panic!("Unexpected event"),
+			}
+		}
+		for (i, signer) in signers.into_iter().enumerate() {
+			let anchor_idx = i + 1;
+			let funding_sig = signer.sign_holder_anchor_input(&mut anchor_tx, anchor_idx, &secp).unwrap();
+			anchor_tx.input[anchor_idx].witness = chan_utils::build_anchor_input_witness(
+				&signer.pubkeys().funding_pubkey, &funding_sig
+			);
+		}
+		let fee_utxo_sig = {
+			let witness_script = Script::new_p2pkh(&public_key.pubkey_hash());
+			let sighash = hash_to_message!(&SighashCache::new(&anchor_tx).segwit_signature_hash(
+				0, &witness_script, coinbase_tx.output[0].value, EcdsaSighashType::All
+			).unwrap()[..]);
+			let sig = sign(&secp, &sighash, &secret_key);
+			let mut sig = sig.serialize_der().to_vec();
+			sig.push(EcdsaSighashType::All as u8);
+			sig
+		};
+		anchor_tx.input[0].witness = Witness::from_vec(vec![fee_utxo_sig, public_key.to_bytes()]);
+		check_spends!(anchor_tx, coinbase_tx, revoked_commitment_a, revoked_commitment_b);
+		anchor_tx
+	};
+
+	for node in &nodes {
+		mine_transactions(node, &[&revoked_commitment_a, &revoked_commitment_b, &anchor_tx]);
+	}
+	check_added_monitors!(&nodes[0], 2);
+	check_closed_broadcast(&nodes[0], 2, true);
+	check_closed_event!(&nodes[0], 2, ClosureReason::CommitmentTxConfirmed);
+
+	// Alice should detect the confirmed revoked commitments, and attempt to claim all of the
+	// revoked outputs.
+	{
+		let txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
+		assert_eq!(txn.len(), 2);
+
+		let (revoked_claim_a, revoked_claim_b) = if txn[0].input[0].previous_output.txid == revoked_commitment_a.txid() {
+			(&txn[0], &txn[1])
+		} else {
+			(&txn[1], &txn[0])
+		};
+
+		// TODO: to_self claim must be separate from HTLC claims
+		assert_eq!(revoked_claim_a.input.len(), 3); // Spends both HTLC outputs and to_self output
+		assert_eq!(revoked_claim_a.output.len(), 1);
+		check_spends!(revoked_claim_a, revoked_commitment_a);
+		assert_eq!(revoked_claim_b.input.len(), 3); // Spends both HTLC outputs and to_self output
+		assert_eq!(revoked_claim_b.output.len(), 1);
+		check_spends!(revoked_claim_b, revoked_commitment_b);
+	}
+
+	// Since Bob was able to confirm his revoked commitment, he'll now try to claim the HTLCs
+	// through the success path.
+	assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+	let mut events = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	// Certain block `ConnectStyle`s cause an extra `ChannelClose` event to be emitted since the
+	// best block is updated before the confirmed transactions are notified.
+	match *nodes[1].connect_style.borrow() {
+		ConnectStyle::BestBlockFirst|ConnectStyle::BestBlockFirstReorgsOnlyTip|ConnectStyle::BestBlockFirstSkippingBlocks => {
+			assert_eq!(events.len(), 4);
+			if let Event::BumpTransaction(BumpTransactionEvent::ChannelClose { .. }) = events.remove(0) {}
+			else { panic!("unexpected event"); }
+			if let Event::BumpTransaction(BumpTransactionEvent::ChannelClose { .. }) = events.remove(1) {}
+			else { panic!("unexpected event"); }
+
+		},
+		_ => assert_eq!(events.len(), 2),
+	};
+	let htlc_tx = {
+		let secret_key = SecretKey::from_slice(&[1; 32]).unwrap();
+		let public_key = PublicKey::new(secret_key.public_key(&secp));
+		let fee_utxo_script = Script::new_v0_p2wpkh(&public_key.wpubkey_hash().unwrap());
+		let coinbase_tx = Transaction {
+			version: 2,
+			lock_time: PackedLockTime::ZERO,
+			input: vec![TxIn { ..Default::default() }],
+			output: vec![TxOut { // UTXO to attach fees to `htlc_tx`
+				value: Amount::ONE_BTC.to_sat(),
+				script_pubkey: fee_utxo_script.clone(),
+			}],
+		};
+		let mut htlc_tx = Transaction {
+			version: 2,
+			lock_time: PackedLockTime::ZERO,
+			input: vec![TxIn { // Fee input
+				previous_output: bitcoin::OutPoint { txid: coinbase_tx.txid(), vout: 0 },
+				..Default::default()
+			}],
+			output: vec![TxOut { // Fee input change
+				value: coinbase_tx.output[0].value / 2 ,
+				script_pubkey: Script::new_op_return(&[]),
+			}],
+		};
+		let mut descriptors = Vec::with_capacity(4);
+		for event in events {
+			if let Event::BumpTransaction(BumpTransactionEvent::HTLCResolution { mut htlc_descriptors, tx_lock_time, .. }) = event {
+				assert_eq!(htlc_descriptors.len(), 2);
+				for htlc_descriptor in &htlc_descriptors {
+					assert!(!htlc_descriptor.htlc.offered);
+					let signer = nodes[1].keys_manager.derive_channel_keys(
+						htlc_descriptor.channel_value_satoshis, &htlc_descriptor.channel_keys_id
+					);
+					let per_commitment_point = signer.get_per_commitment_point(htlc_descriptor.per_commitment_number, &secp);
+					htlc_tx.input.push(htlc_descriptor.unsigned_tx_input());
+					htlc_tx.output.push(htlc_descriptor.tx_output(&per_commitment_point, &secp));
+				}
+				descriptors.append(&mut htlc_descriptors);
+				htlc_tx.lock_time = tx_lock_time;
+			} else {
+				panic!("Unexpected event");
+			}
+		}
+		for (idx, htlc_descriptor) in descriptors.into_iter().enumerate() {
+			let htlc_input_idx = idx + 1;
+			let signer = nodes[1].keys_manager.derive_channel_keys(
+				htlc_descriptor.channel_value_satoshis, &htlc_descriptor.channel_keys_id
+			);
+			let our_sig = signer.sign_holder_htlc_transaction(&htlc_tx, htlc_input_idx, &htlc_descriptor, &secp).unwrap();
+			let per_commitment_point = signer.get_per_commitment_point(htlc_descriptor.per_commitment_number, &secp);
+			let witness_script = htlc_descriptor.witness_script(&per_commitment_point, &secp);
+			htlc_tx.input[htlc_input_idx].witness = htlc_descriptor.tx_input_witness(&our_sig, &witness_script);
+		}
+		let fee_utxo_sig = {
+			let witness_script = Script::new_p2pkh(&public_key.pubkey_hash());
+			let sighash = hash_to_message!(&SighashCache::new(&htlc_tx).segwit_signature_hash(
+				0, &witness_script, coinbase_tx.output[0].value, EcdsaSighashType::All
+			).unwrap()[..]);
+			let sig = sign(&secp, &sighash, &secret_key);
+			let mut sig = sig.serialize_der().to_vec();
+			sig.push(EcdsaSighashType::All as u8);
+			sig
+		};
+		htlc_tx.input[0].witness = Witness::from_vec(vec![fee_utxo_sig, public_key.to_bytes()]);
+		check_spends!(htlc_tx, coinbase_tx, revoked_commitment_a, revoked_commitment_b);
+		htlc_tx
+	};
+
+	for node in &nodes {
+		mine_transaction(node, &htlc_tx);
+	}
+
+	// Alice should see that Bob is trying to claim to HTLCs, so she should now try to claim them at
+	// the second level instead.
+	let revoked_claims = {
+		let txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
+		assert_eq!(txn.len(), 4);
+
+		let revoked_to_self_claim_a = txn.iter().find(|tx|
+			tx.input.len() == 1 &&
+			tx.output.len() == 1 &&
+			tx.input[0].previous_output.txid == revoked_commitment_a.txid()
+		).unwrap();
+		check_spends!(revoked_to_self_claim_a, revoked_commitment_a);
+
+		let revoked_to_self_claim_b = txn.iter().find(|tx|
+			tx.input.len() == 1 &&
+			tx.output.len() == 1 &&
+			tx.input[0].previous_output.txid == revoked_commitment_b.txid()
+		).unwrap();
+		check_spends!(revoked_to_self_claim_b, revoked_commitment_b);
+
+		let revoked_htlc_claims = txn.iter().filter(|tx|
+			tx.input.len() == 2 &&
+			tx.output.len() == 1 &&
+			tx.input[0].previous_output.txid == htlc_tx.txid()
+		).collect::<Vec<_>>();
+		assert_eq!(revoked_htlc_claims.len(), 2);
+		for revoked_htlc_claim in revoked_htlc_claims {
+			check_spends!(revoked_htlc_claim, htlc_tx);
+		}
+
+		txn
+	};
+	for node in &nodes {
+		mine_transactions(node, &revoked_claims.iter().collect::<Vec<_>>());
+	}
+
+
+	// Connect one block to make sure the HTLC events are not yielded while ANTI_REORG_DELAY has not
+	// been reached.
+	connect_blocks(&nodes[0], 1);
+	connect_blocks(&nodes[1], 1);
+
+	assert!(nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+	assert!(nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+
+	// Connect the remaining blocks to reach ANTI_REORG_DELAY.
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 2);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 2);
+
+	assert!(nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events().is_empty());
+	let spendable_output_events = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	assert_eq!(spendable_output_events.len(), 4);
+	for (idx, event) in spendable_output_events.iter().enumerate() {
+		if let Event::SpendableOutputs { outputs } = event {
+			assert_eq!(outputs.len(), 1);
+			let spend_tx = nodes[0].keys_manager.backing.spend_spendable_outputs(
+				&[&outputs[0]], Vec::new(), Script::new_op_return(&[]), 253, &Secp256k1::new(),
+			).unwrap();
+			check_spends!(spend_tx, revoked_claims[idx]);
+		} else {
+			panic!("unexpected event");
+		}
+	}
+
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+	assert!(nodes[0].chain_monitor.chain_monitor.get_claimable_balances(&[]).is_empty());
+	// TODO: From Bob's PoV, he still thinks he can claim the outputs from his revoked commitment.
+	// This needs to be fixed before we enable pruning `ChannelMonitor`s once they don't have any
+	// balances to claim.
+	//
+	// The 6 claimable balances correspond to his `to_self` outputs and the 2 HTLC outputs in each
+	// revoked commitment which Bob has the preimage for.
+	assert_eq!(nodes[1].chain_monitor.chain_monitor.get_claimable_balances(&[]).len(), 6);
 }

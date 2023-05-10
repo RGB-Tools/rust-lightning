@@ -14,10 +14,14 @@
 //! future, as well as generate and broadcast funding transactions handle payment preimages and a
 //! few other things.
 
-use crate::chain::keysinterface::SpendableOutputDescriptor;
 #[cfg(anchors)]
-use crate::ln::chan_utils::{self, ChannelTransactionParameters, HTLCOutputInCommitment};
-use crate::ln::channelmanager::{InterceptId, PaymentId};
+pub mod bump_transaction;
+
+#[cfg(anchors)]
+pub use bump_transaction::BumpTransactionEvent;
+
+use crate::chain::keysinterface::SpendableOutputDescriptor;
+use crate::ln::channelmanager::{InterceptId, PaymentId, RecipientOnionFields};
 use crate::ln::channel::FUNDING_CONF_DEADLINE_BLOCKS;
 use crate::ln::features::ChannelTypeFeatures;
 use crate::ln::msgs;
@@ -25,19 +29,16 @@ use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
 use crate::routing::gossip::NetworkUpdate;
 use crate::util::errors::APIError;
 use crate::util::ser::{BigSize, FixedLengthReader, Writeable, Writer, MaybeReadable, Readable, RequiredWrapper, UpgradableRequired, WithoutLength};
-use crate::routing::router::{RouteHop, RouteParameters};
+use crate::util::string::UntrustedString;
+use crate::routing::router::{BlindedTail, Path, RouteHop, RouteParameters};
 
-use bitcoin::{PackedLockTime, Transaction};
+use bitcoin::{PackedLockTime, Transaction, OutPoint};
 #[cfg(anchors)]
-use bitcoin::{OutPoint, Txid, TxIn, TxOut, Witness};
+use bitcoin::{Txid, TxIn, TxOut, Witness};
 use bitcoin::blockdata::script::Script;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::secp256k1::PublicKey;
-#[cfg(anchors)]
-use bitcoin::secp256k1::{self, Secp256k1};
-#[cfg(anchors)]
-use bitcoin::secp256k1::ecdsa::Signature;
 use crate::io;
 use crate::prelude::*;
 use core::time::Duration;
@@ -125,10 +126,12 @@ pub enum ClosureReason {
 	CounterpartyForceClosed {
 		/// The error which the peer sent us.
 		///
-		/// The string should be sanitized before it is used (e.g emitted to logs
-		/// or printed to stdout). Otherwise, a well crafted error message may exploit
+		/// Be careful about printing the peer_msg, a well-crafted message could exploit
 		/// a security vulnerability in the terminal emulator or the logging subsystem.
-		peer_msg: String,
+		/// To be safe, use `Display` on `UntrustedString`
+		/// 
+		/// [`UntrustedString`]: crate::util::string::UntrustedString
+		peer_msg: UntrustedString,
 	},
 	/// Closure generated from [`ChannelManager::force_close_channel`], called by the user.
 	///
@@ -173,8 +176,7 @@ impl core::fmt::Display for ClosureReason {
 		f.write_str("Channel closed because ")?;
 		match self {
 			ClosureReason::CounterpartyForceClosed { peer_msg } => {
-				f.write_str("counterparty force-closed with message ")?;
-				f.write_str(&peer_msg)
+				f.write_fmt(format_args!("counterparty force-closed with message: {}", peer_msg))
 			},
 			ClosureReason::HolderForceClosed => f.write_str("user manually force-closed the channel"),
 			ClosureReason::CooperativeClosure => f.write_str("the channel was cooperatively closed"),
@@ -230,8 +232,11 @@ pub enum HTLCDestination {
 	///
 	/// Some of the reasons may include:
 	/// * HTLC Timeouts
-	/// * Expected MPP amount to claim does not equal HTLC total
-	/// * Claimable amount does not match expected amount
+	/// * Excess HTLCs for a payment that we have already fully received, over-paying for the
+	///   payment,
+	/// * The counterparty node modified the HTLC in transit,
+	/// * A probing attack where an intermediary node is trying to detect if we are the ultimate
+	///   recipient for a payment.
 	FailedPayment {
 		/// The payment hash of the payment we attempted to process.
 		payment_hash: PaymentHash
@@ -254,219 +259,6 @@ impl_writeable_tlv_based_enum_upgradable!(HTLCDestination,
 	},
 );
 
-#[cfg(anchors)]
-/// A descriptor used to sign for a commitment transaction's anchor output.
-#[derive(Clone, Debug)]
-pub struct AnchorDescriptor {
-	/// A unique identifier used along with `channel_value_satoshis` to re-derive the
-	/// [`InMemorySigner`] required to sign `input`.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	pub channel_keys_id: [u8; 32],
-	/// The value in satoshis of the channel we're attempting to spend the anchor output of. This is
-	/// used along with `channel_keys_id` to re-derive the [`InMemorySigner`] required to sign
-	/// `input`.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	pub channel_value_satoshis: u64,
-	/// The transaction input's outpoint corresponding to the commitment transaction's anchor
-	/// output.
-	pub outpoint: OutPoint,
-}
-
-#[cfg(anchors)]
-/// A descriptor used to sign for a commitment transaction's HTLC output.
-#[derive(Clone, Debug)]
-pub struct HTLCDescriptor {
-	/// A unique identifier used along with `channel_value_satoshis` to re-derive the
-	/// [`InMemorySigner`] required to sign `input`.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	pub channel_keys_id: [u8; 32],
-	/// The value in satoshis of the channel we're attempting to spend the anchor output of. This is
-	/// used along with `channel_keys_id` to re-derive the [`InMemorySigner`] required to sign
-	/// `input`.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	pub channel_value_satoshis: u64,
-	/// The necessary channel parameters that need to be provided to the re-derived
-	/// [`InMemorySigner`] through [`BaseSign::provide_channel_parameters`].
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	/// [`BaseSign::provide_channel_parameters`]: crate::chain::keysinterface::BaseSign::provide_channel_parameters
-	pub channel_parameters: ChannelTransactionParameters,
-	/// The txid of the commitment transaction in which the HTLC output lives.
-	pub commitment_txid: Txid,
-	/// The number of the commitment transaction in which the HTLC output lives.
-	pub per_commitment_number: u64,
-	/// The details of the HTLC as it appears in the commitment transaction.
-	pub htlc: HTLCOutputInCommitment,
-	/// The preimage, if `Some`, to claim the HTLC output with. If `None`, the timeout path must be
-	/// taken.
-	pub preimage: Option<PaymentPreimage>,
-	/// The counterparty's signature required to spend the HTLC output.
-	pub counterparty_sig: Signature
-}
-
-#[cfg(anchors)]
-impl HTLCDescriptor {
-	/// Returns the unsigned transaction input spending the HTLC output in the commitment
-	/// transaction.
-	pub fn unsigned_tx_input(&self) -> TxIn {
-		chan_utils::build_htlc_input(&self.commitment_txid, &self.htlc, true /* opt_anchors */)
-	}
-
-	/// Returns the delayed output created as a result of spending the HTLC output in the commitment
-	/// transaction.
-	pub fn tx_output<C: secp256k1::Signing + secp256k1::Verification>(
-		&self, per_commitment_point: &PublicKey, secp: &Secp256k1<C>
-	) -> TxOut {
-		let channel_params = self.channel_parameters.as_holder_broadcastable();
-		let broadcaster_keys = channel_params.broadcaster_pubkeys();
-		let counterparty_keys = channel_params.countersignatory_pubkeys();
-		let broadcaster_delayed_key = chan_utils::derive_public_key(
-			secp, per_commitment_point, &broadcaster_keys.delayed_payment_basepoint
-		);
-		let counterparty_revocation_key = chan_utils::derive_public_revocation_key(
-			secp, per_commitment_point, &counterparty_keys.revocation_basepoint
-		);
-		chan_utils::build_htlc_output(
-			0 /* feerate_per_kw */, channel_params.contest_delay(), &self.htlc, true /* opt_anchors */,
-			false /* use_non_zero_fee_anchors */, &broadcaster_delayed_key, &counterparty_revocation_key
-		)
-	}
-
-	/// Returns the witness script of the HTLC output in the commitment transaction.
-	pub fn witness_script<C: secp256k1::Signing + secp256k1::Verification>(
-		&self, per_commitment_point: &PublicKey, secp: &Secp256k1<C>
-	) -> Script {
-		let channel_params = self.channel_parameters.as_holder_broadcastable();
-		let broadcaster_keys = channel_params.broadcaster_pubkeys();
-		let counterparty_keys = channel_params.countersignatory_pubkeys();
-		let broadcaster_htlc_key = chan_utils::derive_public_key(
-			secp, per_commitment_point, &broadcaster_keys.htlc_basepoint
-		);
-		let counterparty_htlc_key = chan_utils::derive_public_key(
-			secp, per_commitment_point, &counterparty_keys.htlc_basepoint
-		);
-		let counterparty_revocation_key = chan_utils::derive_public_revocation_key(
-			secp, per_commitment_point, &counterparty_keys.revocation_basepoint
-		);
-		chan_utils::get_htlc_redeemscript_with_explicit_keys(
-			&self.htlc, true /* opt_anchors */, &broadcaster_htlc_key, &counterparty_htlc_key,
-			&counterparty_revocation_key,
-		)
-	}
-
-	/// Returns the fully signed witness required to spend the HTLC output in the commitment
-	/// transaction.
-	pub fn tx_input_witness(&self, signature: &Signature, witness_script: &Script) -> Witness {
-		chan_utils::build_htlc_input_witness(
-			signature, &self.counterparty_sig, &self.preimage, witness_script, true /* opt_anchors */
-		)
-	}
-}
-
-#[cfg(anchors)]
-/// Represents the different types of transactions, originating from LDK, to be bumped.
-#[derive(Clone, Debug)]
-pub enum BumpTransactionEvent {
-	/// Indicates that a channel featuring anchor outputs is to be closed by broadcasting the local
-	/// commitment transaction. Since commitment transactions have a static feerate pre-agreed upon,
-	/// they may need additional fees to be attached through a child transaction using the popular
-	/// [Child-Pays-For-Parent](https://bitcoinops.org/en/topics/cpfp) fee bumping technique. This
-	/// child transaction must include the anchor input described within `anchor_descriptor` along
-	/// with additional inputs to meet the target feerate. Failure to meet the target feerate
-	/// decreases the confirmation odds of the transaction package (which includes the commitment
-	/// and child anchor transactions), possibly resulting in a loss of funds. Once the transaction
-	/// is constructed, it must be fully signed for and broadcast by the consumer of the event
-	/// along with the `commitment_tx` enclosed. Note that the `commitment_tx` must always be
-	/// broadcast first, as the child anchor transaction depends on it.
-	///
-	/// The consumer should be able to sign for any of the additional inputs included within the
-	/// child anchor transaction. To sign its anchor input, an [`InMemorySigner`] should be
-	/// re-derived through [`KeysManager::derive_channel_keys`] with the help of
-	/// [`AnchorDescriptor::channel_keys_id`] and [`AnchorDescriptor::channel_value_satoshis`]. The
-	/// anchor input signature can be computed with [`BaseSign::sign_holder_anchor_input`],
-	/// which can then be provided to [`build_anchor_input_witness`] along with the `funding_pubkey`
-	/// to obtain the full witness required to spend.
-	///
-	/// It is possible to receive more than one instance of this event if a valid child anchor
-	/// transaction is never broadcast or is but not with a sufficient fee to be mined. Care should
-	/// be taken by the consumer of the event to ensure any future iterations of the child anchor
-	/// transaction adhere to the [Replace-By-Fee
-	/// rules](https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md)
-	/// for fee bumps to be accepted into the mempool, and eventually the chain. As the frequency of
-	/// these events is not user-controlled, users may ignore/drop the event if they are no longer
-	/// able to commit external confirmed funds to the child anchor transaction.
-	///
-	/// The set of `pending_htlcs` on the commitment transaction to be broadcast can be inspected to
-	/// determine whether a significant portion of the channel's funds are allocated to HTLCs,
-	/// enabling users to make their own decisions regarding the importance of the commitment
-	/// transaction's confirmation. Note that this is not required, but simply exists as an option
-	/// for users to override LDK's behavior. On commitments with no HTLCs (indicated by those with
-	/// an empty `pending_htlcs`), confirmation of the commitment transaction can be considered to
-	/// be not urgent.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	/// [`KeysManager::derive_channel_keys`]: crate::chain::keysinterface::KeysManager::derive_channel_keys
-	/// [`BaseSign::sign_holder_anchor_input`]: crate::chain::keysinterface::BaseSign::sign_holder_anchor_input
-	/// [`build_anchor_input_witness`]: crate::ln::chan_utils::build_anchor_input_witness
-	ChannelClose {
-		/// The target feerate that the transaction package, which consists of the commitment
-		/// transaction and the to-be-crafted child anchor transaction, must meet.
-		package_target_feerate_sat_per_1000_weight: u32,
-		/// The channel's commitment transaction to bump the fee of. This transaction should be
-		/// broadcast along with the anchor transaction constructed as a result of consuming this
-		/// event.
-		commitment_tx: Transaction,
-		/// The absolute fee in satoshis of the commitment transaction. This can be used along the
-		/// with weight of the commitment transaction to determine its feerate.
-		commitment_tx_fee_satoshis: u64,
-		/// The descriptor to sign the anchor input of the anchor transaction constructed as a
-		/// result of consuming this event.
-		anchor_descriptor: AnchorDescriptor,
-		/// The set of pending HTLCs on the commitment transaction that need to be resolved once the
-		/// commitment transaction confirms.
-		pending_htlcs: Vec<HTLCOutputInCommitment>,
-	},
-	/// Indicates that a channel featuring anchor outputs has unilaterally closed on-chain by a
-	/// holder commitment transaction and its HTLC(s) need to be resolved on-chain. With the
-	/// zero-HTLC-transaction-fee variant of anchor outputs, the pre-signed HTLC
-	/// transactions have a zero fee, thus requiring additional inputs and/or outputs to be attached
-	/// for a timely confirmation within the chain. These additional inputs and/or outputs must be
-	/// appended to the resulting HTLC transaction to meet the target feerate. Failure to meet the
-	/// target feerate decreases the confirmation odds of the transaction, possibly resulting in a
-	/// loss of funds. Once the transaction meets the target feerate, it must be signed for and
-	/// broadcast by the consumer of the event.
-	///
-	/// The consumer should be able to sign for any of the non-HTLC inputs added to the resulting
-	/// HTLC transaction. To sign HTLC inputs, an [`InMemorySigner`] should be re-derived through
-	/// [`KeysManager::derive_channel_keys`] with the help of `channel_keys_id` and
-	/// `channel_value_satoshis`. Each HTLC input's signature can be computed with
-	/// [`BaseSign::sign_holder_htlc_transaction`], which can then be provided to
-	/// [`HTLCDescriptor::tx_input_witness`] to obtain the fully signed witness required to spend.
-	///
-	/// It is possible to receive more than one instance of this event if a valid HTLC transaction
-	/// is never broadcast or is but not with a sufficient fee to be mined. Care should be taken by
-	/// the consumer of the event to ensure any future iterations of the HTLC transaction adhere to
-	/// the [Replace-By-Fee
-	/// rules](https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md)
-	/// for fee bumps to be accepted into the mempool, and eventually the chain. As the frequency of
-	/// these events is not user-controlled, users may ignore/drop the event if either they are no
-	/// longer able to commit external confirmed funds to the HTLC transaction or the fee committed
-	/// to the HTLC transaction is greater in value than the HTLCs being claimed.
-	///
-	/// [`InMemorySigner`]: crate::chain::keysinterface::InMemorySigner
-	/// [`KeysManager::derive_channel_keys`]: crate::chain::keysinterface::KeysManager::derive_channel_keys
-	/// [`BaseSign::sign_holder_htlc_transaction`]: crate::chain::keysinterface::BaseSign::sign_holder_htlc_transaction
-	/// [`HTLCDescriptor::tx_input_witness`]: HTLCDescriptor::tx_input_witness
-	HTLCResolution {
-		target_feerate_sat_per_1000_weight: u32,
-		htlc_descriptors: Vec<HTLCDescriptor>,
-	},
-}
-
 /// Will be used in [`Event::HTLCIntercepted`] to identify the next hop in the HTLC's path.
 /// Currently only used in serialization for the sake of maintaining compatibility. More variants
 /// will be added for general-purpose HTLC forward intercepts as well as trampoline forward
@@ -481,6 +273,43 @@ impl_writeable_tlv_based_enum!(InterceptNextHop,
 	(0, FakeScid) => {
 		(0, requested_next_hop_scid, required),
 	};
+);
+
+/// The reason the payment failed. Used in [`Event::PaymentFailed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentFailureReason {
+	/// The intended recipient rejected our payment.
+	RecipientRejected,
+	/// The user chose to abandon this payment by calling [`ChannelManager::abandon_payment`].
+	///
+	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
+	UserAbandoned,
+	/// We exhausted all of our retry attempts while trying to send the payment, or we
+	/// exhausted the [`Retry::Timeout`] if the user set one. If at any point a retry
+	/// attempt failed while being forwarded along the path, an [`Event::PaymentPathFailed`] will
+	/// have come before this.
+	///
+	/// [`Retry::Timeout`]: crate::ln::channelmanager::Retry::Timeout
+	RetriesExhausted,
+	/// The payment expired while retrying, based on the provided
+	/// [`PaymentParameters::expiry_time`].
+	///
+	/// [`PaymentParameters::expiry_time`]: crate::routing::router::PaymentParameters::expiry_time
+	PaymentExpired,
+	/// We failed to find a route while retrying the payment.
+	RouteNotFound,
+	/// This error should generally never happen. This likely means that there is a problem with
+	/// your router.
+	UnexpectedError,
+}
+
+impl_writeable_tlv_based_enum!(PaymentFailureReason,
+	(0, RecipientRejected) => {},
+	(2, UserAbandoned) => {},
+	(4, RetriesExhausted) => {},
+	(6, PaymentExpired) => {},
+	(8, RouteNotFound) => {},
+	(10, UnexpectedError) => {}, ;
 );
 
 /// An Event which you should probably take some action in response to.
@@ -532,7 +361,9 @@ pub enum Event {
 	///
 	/// # Note
 	/// LDK will not stop an inbound payment from being paid multiple times, so multiple
-	/// `PaymentClaimable` events may be generated for the same payment.
+	/// `PaymentClaimable` events may be generated for the same payment. In such a case it is
+	/// polite (and required in the lightning specification) to fail the payment the second time
+	/// and give the sender their money back rather than accepting double payment.
 	///
 	/// # Note
 	/// This event used to be called `PaymentReceived` in LDK versions 0.0.112 and earlier.
@@ -551,6 +382,11 @@ pub enum Event {
 		/// The hash for which the preimage should be handed to the ChannelManager. Note that LDK will
 		/// not stop you from registering duplicate payment hashes for inbound payments.
 		payment_hash: PaymentHash,
+		/// The fields in the onion which were received with each HTLC. Only fields which were
+		/// identical in each HTLC involved in the payment will be included here.
+		///
+		/// Payments received on LDK versions prior to 0.0.115 will have this field unset.
+		onion_fields: Option<RecipientOnionFields>,
 		/// The value, in thousandths of a satoshi, that this payment is for.
 		amount_msat: u64,
 		/// Information for claiming this received payment, based on whether the purpose of the
@@ -560,6 +396,14 @@ pub enum Event {
 		via_channel_id: Option<[u8; 32]>,
 		/// The `user_channel_id` indicating over which channel we received the payment.
 		via_user_channel_id: Option<u128>,
+		/// The block height at which this payment will be failed back and will no longer be
+		/// eligible for claiming.
+		///
+		/// Prior to this height, a call to [`ChannelManager::claim_funds`] is guaranteed to
+		/// succeed, however you should wait for [`Event::PaymentClaimed`] to be sure.
+		///
+		/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
+		claim_deadline: Option<u32>,
 	},
 	/// Indicates a payment has been claimed and we've received money!
 	///
@@ -598,7 +442,7 @@ pub enum Event {
 	/// Note for MPP payments: in rare cases, this event may be preceded by a `PaymentPathFailed`
 	/// event. In this situation, you SHOULD treat this payment as having succeeded.
 	PaymentSent {
-		/// The id returned by [`ChannelManager::send_payment`].
+		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
 		payment_id: Option<PaymentId>,
@@ -631,23 +475,24 @@ pub enum Event {
 	/// [`Retry`]: crate::ln::channelmanager::Retry
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 	PaymentFailed {
-		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::abandon_payment`].
+		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
-		/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 		payment_id: PaymentId,
 		/// The hash that was given to [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
 		payment_hash: PaymentHash,
+		/// The reason the payment failed. This is only `None` for events generated or serialized
+		/// by versions prior to 0.0.115.
+		reason: Option<PaymentFailureReason>,
 	},
 	/// Indicates that a path for an outbound payment was successful.
 	///
 	/// Always generated after [`Event::PaymentSent`] and thus useful for scoring channels. See
 	/// [`Event::PaymentSent`] for obtaining the payment preimage.
 	PaymentPathSuccessful {
-		/// The id returned by [`ChannelManager::send_payment`].
+		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
 		payment_id: PaymentId,
@@ -658,7 +503,7 @@ pub enum Event {
 		/// The payment path that was successful.
 		///
 		/// May contain a closed channel if the HTLC sent along the path was fulfilled on chain.
-		path: Vec<RouteHop>,
+		path: Path,
 	},
 	/// Indicates an outbound HTLC we sent failed, likely due to an intermediary node being unable to
 	/// handle the HTLC.
@@ -671,8 +516,7 @@ pub enum Event {
 	///
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 	PaymentPathFailed {
-		/// The id returned by [`ChannelManager::send_payment`] and used with
-		/// [`ChannelManager::abandon_payment`].
+		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
 		/// [`ChannelManager::send_payment`]: crate::ln::channelmanager::ChannelManager::send_payment
 		/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
@@ -691,7 +535,7 @@ pub enum Event {
 		/// [`NetworkGraph`]: crate::routing::gossip::NetworkGraph
 		failure: PathFailure,
 		/// The payment path that failed.
-		path: Vec<RouteHop>,
+		path: Path,
 		/// The channel responsible for the failed payment path.
 		///
 		/// Note that for route hints or for the first hop in a path this may be an SCID alias and
@@ -701,10 +545,6 @@ pub enum Event {
 		/// If this is `Some`, then the corresponding channel should be avoided when the payment is
 		/// retried. May be `None` for older [`Event`] serializations.
 		short_channel_id: Option<u64>,
-		/// Parameters used by LDK to compute a new [`Route`] when retrying the failed payment path.
-		///
-		/// [`Route`]: crate::routing::router::Route
-		retry: Option<RouteParameters>,
 #[cfg(test)]
 		error_code: Option<u16>,
 #[cfg(test)]
@@ -721,7 +561,7 @@ pub enum Event {
 		/// [`ChannelManager::send_probe`]: crate::ln::channelmanager::ChannelManager::send_probe
 		payment_hash: PaymentHash,
 		/// The payment path that was successful.
-		path: Vec<RouteHop>,
+		path: Path,
 	},
 	/// Indicates that a probe payment we sent failed at an intermediary node on the path.
 	ProbeFailed {
@@ -734,7 +574,7 @@ pub enum Event {
 		/// [`ChannelManager::send_probe`]: crate::ln::channelmanager::ChannelManager::send_probe
 		payment_hash: PaymentHash,
 		/// The payment path that failed.
-		path: Vec<RouteHop>,
+		path: Path,
 		/// The channel responsible for the failed probe.
 		///
 		/// Note that for route hints or for the first hop in a path this may be an SCID alias and
@@ -820,13 +660,19 @@ pub enum Event {
 		/// If this is `true`, the forwarded HTLC was claimed by our counterparty via an on-chain
 		/// transaction.
 		claim_from_onchain_tx: bool,
+		/// The final amount forwarded, in milli-satoshis, after the fee is deducted.
+		///
+		/// The caveat described above the `fee_earned_msat` field applies here as well.
+		outbound_amount_forwarded_msat: Option<u64>,
 	},
-	/// Used to indicate that a channel with the given `channel_id` is ready to
-	/// be used. This event is emitted either when the funding transaction has been confirmed
-	/// on-chain, or, in case of a 0conf channel, when both parties have confirmed the channel
-	/// establishment.
-	ChannelReady {
-		/// The channel_id of the channel that is ready.
+	/// Used to indicate that a channel with the given `channel_id` is being opened and pending
+	/// confirmation on-chain.
+	///
+	/// This event is emitted when the funding transaction has been signed and is broadcast to the
+	/// network. For 0conf channels it will be immediately followed by the corresponding
+	/// [`Event::ChannelReady`] event.
+	ChannelPending {
+		/// The `channel_id` of the channel that is pending confirmation.
 		channel_id: [u8; 32],
 		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
 		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
@@ -837,7 +683,32 @@ pub enum Event {
 		/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
 		/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
 		user_channel_id: u128,
-		/// The node_id of the channel counterparty.
+		/// The `temporary_channel_id` this channel used to be known by during channel establishment.
+		///
+		/// Will be `None` for channels created prior to LDK version 0.0.115.
+		former_temporary_channel_id: Option<[u8; 32]>,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The outpoint of the channel's funding transaction.
+		funding_txo: OutPoint,
+	},
+	/// Used to indicate that a channel with the given `channel_id` is ready to
+	/// be used. This event is emitted either when the funding transaction has been confirmed
+	/// on-chain, or, in case of a 0conf channel, when both parties have confirmed the channel
+	/// establishment.
+	ChannelReady {
+		/// The `channel_id` of the channel that is ready.
+		channel_id: [u8; 32],
+		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
+		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
+		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
+		/// `user_channel_id` will be randomized for an inbound channel.
+		///
+		/// [`ChannelManager::create_channel`]: crate::ln::channelmanager::ChannelManager::create_channel
+		/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+		/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
+		user_channel_id: u128,
+		/// The `node_id` of the channel counterparty.
 		counterparty_node_id: PublicKey,
 		/// The features that this channel will operate with.
 		channel_type: ChannelTypeFeatures,
@@ -845,7 +716,7 @@ pub enum Event {
 	/// Used to indicate that a previously opened channel with the given `channel_id` is in the
 	/// process of closure.
 	ChannelClosed  {
-		/// The channel_id of the channel which has been closed. Note that on-chain transactions
+		/// The `channel_id` of the channel which has been closed. Note that on-chain transactions
 		/// resolving the channel are likely still awaiting confirmation.
 		channel_id: [u8; 32],
 		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
@@ -929,7 +800,7 @@ pub enum Event {
 	/// * Insufficient capacity in the outbound channel
 	/// * While waiting to forward the HTLC, the channel it is meant to be forwarded through closes
 	/// * When an unknown SCID is requested for forwarding a payment.
-	/// * Claiming an amount for an MPP payment that exceeds the HTLC total
+	/// * Expected MPP amount has already been reached
 	/// * The HTLC has timed out
 	///
 	/// This event, however, does not get generated if an HTLC fails to meet the forwarding
@@ -957,7 +828,10 @@ impl Writeable for Event {
 				// We never write out FundingGenerationReady events as, upon disconnection, peers
 				// drop any channels which have not yet exchanged funding_signed.
 			},
-			&Event::PaymentClaimable { ref payment_hash, ref amount_msat, ref purpose, ref receiver_node_id, ref via_channel_id, ref via_user_channel_id } => {
+			&Event::PaymentClaimable { ref payment_hash, ref amount_msat, ref purpose,
+				ref receiver_node_id, ref via_channel_id, ref via_user_channel_id,
+				ref claim_deadline, ref onion_fields
+			} => {
 				1u8.write(writer)?;
 				let mut payment_secret = None;
 				let payment_preimage;
@@ -978,7 +852,9 @@ impl Writeable for Event {
 					(4, amount_msat, required),
 					(5, via_user_channel_id, option),
 					(6, 0u64, required), // user_payment_id required for compatibility with 0.0.103 and earlier
+					(7, claim_deadline, option),
 					(8, payment_preimage, option),
+					(9, onion_fields, option),
 				});
 			},
 			&Event::PaymentSent { ref payment_id, ref payment_preimage, ref payment_hash, ref fee_paid_msat } => {
@@ -992,7 +868,7 @@ impl Writeable for Event {
 			},
 			&Event::PaymentPathFailed {
 				ref payment_id, ref payment_hash, ref payment_failed_permanently, ref failure,
-				ref path, ref short_channel_id, ref retry,
+				ref path, ref short_channel_id,
 				#[cfg(test)]
 				ref error_code,
 				#[cfg(test)]
@@ -1008,9 +884,10 @@ impl Writeable for Event {
 					(1, None::<NetworkUpdate>, option), // network_update in LDK versions prior to 0.0.114
 					(2, payment_failed_permanently, required),
 					(3, false, required), // all_paths_failed in LDK versions prior to 0.0.114
-					(5, *path, vec_type),
+					(4, path.blinded_tail, option),
+					(5, path.hops, vec_type),
 					(7, short_channel_id, option),
-					(9, retry, option),
+					(9, None::<RouteParameters>, option), // retry in LDK versions prior to 0.0.115
 					(11, payment_id, option),
 					(13, failure, required),
 				});
@@ -1037,13 +914,17 @@ impl Writeable for Event {
 					(8, expected_outbound_amount_msat, required),
 				});
 			}
-			&Event::PaymentForwarded { fee_earned_msat, prev_channel_id, claim_from_onchain_tx, next_channel_id } => {
+			&Event::PaymentForwarded {
+				fee_earned_msat, prev_channel_id, claim_from_onchain_tx,
+				next_channel_id, outbound_amount_forwarded_msat
+			} => {
 				7u8.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, fee_earned_msat, option),
 					(1, prev_channel_id, option),
 					(2, claim_from_onchain_tx, required),
 					(3, next_channel_id, option),
+					(5, outbound_amount_forwarded_msat, option),
 				});
 			},
 			&Event::ChannelClosed { ref channel_id, ref user_channel_id, ref reason } => {
@@ -1072,13 +953,15 @@ impl Writeable for Event {
 				write_tlv_fields!(writer, {
 					(0, payment_id, required),
 					(2, payment_hash, option),
-					(4, *path, vec_type)
+					(4, path.hops, vec_type),
+					(6, path.blinded_tail, option),
 				})
 			},
-			&Event::PaymentFailed { ref payment_id, ref payment_hash } => {
+			&Event::PaymentFailed { ref payment_id, ref payment_hash, ref reason } => {
 				15u8.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, payment_id, required),
+					(1, reason, option),
 					(2, payment_hash, required),
 				})
 			},
@@ -1101,7 +984,8 @@ impl Writeable for Event {
 				write_tlv_fields!(writer, {
 					(0, payment_id, required),
 					(2, payment_hash, required),
-					(4, *path, vec_type)
+					(4, path.hops, vec_type),
+					(6, path.blinded_tail, option),
 				})
 			},
 			&Event::ProbeFailed { ref payment_id, ref payment_hash, ref path, ref short_channel_id } => {
@@ -1109,8 +993,9 @@ impl Writeable for Event {
 				write_tlv_fields!(writer, {
 					(0, payment_id, required),
 					(2, payment_hash, required),
-					(4, *path, vec_type),
+					(4, path.hops, vec_type),
 					(6, short_channel_id, option),
+					(8, path.blinded_tail, option),
 				})
 			},
 			&Event::HTLCHandlingFailed { ref prev_channel_id, ref failed_next_destination } => {
@@ -1140,6 +1025,16 @@ impl Writeable for Event {
 					(6, channel_type, required),
 				});
 			},
+			&Event::ChannelPending { ref channel_id, ref user_channel_id, ref former_temporary_channel_id, ref counterparty_node_id, ref funding_txo } => {
+				31u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(0, channel_id, required),
+					(2, user_channel_id, required),
+					(4, former_temporary_channel_id, required),
+					(6, counterparty_node_id, required),
+					(8, funding_txo, required),
+				});
+			},
 			// Note that, going forward, all new events must only write data inside of
 			// `write_tlv_fields`. Versions 0.0.101+ will ignore odd-numbered events that write
 			// data via `write_tlv_fields`.
@@ -1162,7 +1057,9 @@ impl MaybeReadable for Event {
 					let mut receiver_node_id = None;
 					let mut _user_payment_id = None::<u64>; // For compatibility with 0.0.103 and earlier
 					let mut via_channel_id = None;
+					let mut claim_deadline = None;
 					let mut via_user_channel_id = None;
+					let mut onion_fields = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
@@ -1171,7 +1068,9 @@ impl MaybeReadable for Event {
 						(4, amount_msat, required),
 						(5, via_user_channel_id, option),
 						(6, _user_payment_id, option),
+						(7, claim_deadline, option),
 						(8, payment_preimage, option),
+						(9, onion_fields, option),
 					});
 					let purpose = match payment_secret {
 						Some(secret) => PaymentPurpose::InvoicePayment {
@@ -1188,6 +1087,8 @@ impl MaybeReadable for Event {
 						purpose,
 						via_channel_id,
 						via_user_channel_id,
+						claim_deadline,
+						onion_fields,
 					}))
 				};
 				f()
@@ -1225,18 +1126,18 @@ impl MaybeReadable for Event {
 					let mut payment_hash = PaymentHash([0; 32]);
 					let mut payment_failed_permanently = false;
 					let mut network_update = None;
+					let mut blinded_tail: Option<BlindedTail> = None;
 					let mut path: Option<Vec<RouteHop>> = Some(vec![]);
 					let mut short_channel_id = None;
-					let mut retry = None;
 					let mut payment_id = None;
 					let mut failure_opt = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, network_update, upgradable_option),
 						(2, payment_failed_permanently, required),
+						(4, blinded_tail, option),
 						(5, path, vec_type),
 						(7, short_channel_id, option),
-						(9, retry, option),
 						(11, payment_id, option),
 						(13, failure_opt, upgradable_option),
 					});
@@ -1246,9 +1147,8 @@ impl MaybeReadable for Event {
 						payment_hash,
 						payment_failed_permanently,
 						failure,
-						path: path.unwrap(),
+						path: Path { hops: path.unwrap(), blinded_tail },
 						short_channel_id,
-						retry,
 						#[cfg(test)]
 						error_code,
 						#[cfg(test)]
@@ -1298,13 +1198,18 @@ impl MaybeReadable for Event {
 					let mut prev_channel_id = None;
 					let mut claim_from_onchain_tx = false;
 					let mut next_channel_id = None;
+					let mut outbound_amount_forwarded_msat = None;
 					read_tlv_fields!(reader, {
 						(0, fee_earned_msat, option),
 						(1, prev_channel_id, option),
 						(2, claim_from_onchain_tx, required),
 						(3, next_channel_id, option),
+						(5, outbound_amount_forwarded_msat, option),
 					});
-					Ok(Some(Event::PaymentForwarded { fee_earned_msat, prev_channel_id, claim_from_onchain_tx, next_channel_id }))
+					Ok(Some(Event::PaymentForwarded {
+						fee_earned_msat, prev_channel_id, claim_from_onchain_tx, next_channel_id,
+						outbound_amount_forwarded_msat
+					}))
 				};
 				f()
 			},
@@ -1345,18 +1250,16 @@ impl MaybeReadable for Event {
 			},
 			13u8 => {
 				let f = || {
-					let mut payment_id = PaymentId([0; 32]);
-					let mut payment_hash = None;
-					let mut path: Option<Vec<RouteHop>> = Some(vec![]);
-					read_tlv_fields!(reader, {
+					_init_and_read_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, option),
 						(4, path, vec_type),
+						(6, blinded_tail, option),
 					});
 					Ok(Some(Event::PaymentPathSuccessful {
-						payment_id,
+						payment_id: payment_id.0.unwrap(),
 						payment_hash,
-						path: path.unwrap(),
+						path: Path { hops: path.unwrap(), blinded_tail },
 					}))
 				};
 				f()
@@ -1365,13 +1268,16 @@ impl MaybeReadable for Event {
 				let f = || {
 					let mut payment_hash = PaymentHash([0; 32]);
 					let mut payment_id = PaymentId([0; 32]);
+					let mut reason = None;
 					read_tlv_fields!(reader, {
 						(0, payment_id, required),
+						(1, reason, upgradable_option),
 						(2, payment_hash, required),
 					});
 					Ok(Some(Event::PaymentFailed {
 						payment_id,
 						payment_hash,
+						reason,
 					}))
 				};
 				f()
@@ -1403,38 +1309,33 @@ impl MaybeReadable for Event {
 			},
 			21u8 => {
 				let f = || {
-					let mut payment_id = PaymentId([0; 32]);
-					let mut payment_hash = PaymentHash([0; 32]);
-					let mut path: Option<Vec<RouteHop>> = Some(vec![]);
-					read_tlv_fields!(reader, {
+					_init_and_read_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, required),
 						(4, path, vec_type),
+						(6, blinded_tail, option),
 					});
 					Ok(Some(Event::ProbeSuccessful {
-						payment_id,
-						payment_hash,
-						path: path.unwrap(),
+						payment_id: payment_id.0.unwrap(),
+						payment_hash: payment_hash.0.unwrap(),
+						path: Path { hops: path.unwrap(), blinded_tail },
 					}))
 				};
 				f()
 			},
 			23u8 => {
 				let f = || {
-					let mut payment_id = PaymentId([0; 32]);
-					let mut payment_hash = PaymentHash([0; 32]);
-					let mut path: Option<Vec<RouteHop>> = Some(vec![]);
-					let mut short_channel_id = None;
-					read_tlv_fields!(reader, {
+					_init_and_read_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, required),
 						(4, path, vec_type),
 						(6, short_channel_id, option),
+						(8, blinded_tail, option),
 					});
 					Ok(Some(Event::ProbeFailed {
-						payment_id,
-						payment_hash,
-						path: path.unwrap(),
+						payment_id: payment_id.0.unwrap(),
+						payment_hash: payment_hash.0.unwrap(),
+						path: Path { hops: path.unwrap(), blinded_tail },
 						short_channel_id,
 					}))
 				};
@@ -1474,6 +1375,31 @@ impl MaybeReadable for Event {
 						user_channel_id,
 						counterparty_node_id: counterparty_node_id.0.unwrap(),
 						channel_type: channel_type.0.unwrap()
+					}))
+				};
+				f()
+			},
+			31u8 => {
+				let f = || {
+					let mut channel_id = [0; 32];
+					let mut user_channel_id: u128 = 0;
+					let mut former_temporary_channel_id = None;
+					let mut counterparty_node_id = RequiredWrapper(None);
+					let mut funding_txo = RequiredWrapper(None);
+					read_tlv_fields!(reader, {
+						(0, channel_id, required),
+						(2, user_channel_id, required),
+						(4, former_temporary_channel_id, required),
+						(6, counterparty_node_id, required),
+						(8, funding_txo, required),
+					});
+
+					Ok(Some(Event::ChannelPending {
+						channel_id,
+						user_channel_id,
+						former_temporary_channel_id,
+						counterparty_node_id: counterparty_node_id.0.unwrap(),
+						funding_txo: funding_txo.0.unwrap()
 					}))
 				};
 				f()

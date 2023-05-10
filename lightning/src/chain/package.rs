@@ -434,7 +434,6 @@ impl PackageSolvingData {
 				let chan_keys = TxCreationKeys::derive_new(&onchain_handler.secp_ctx, &outp.per_commitment_point, &outp.counterparty_delayed_payment_base_key, &outp.counterparty_htlc_base_key, &onchain_handler.signer.pubkeys().revocation_basepoint, &onchain_handler.signer.pubkeys().htlc_basepoint);
 				let witness_script = chan_utils::get_htlc_redeemscript_with_explicit_keys(&outp.htlc, onchain_handler.opt_anchors(), &chan_keys.broadcaster_htlc_key, &chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key);
 
-				bumped_tx.lock_time = PackedLockTime(outp.htlc.cltv_expiry); // Right now we don't aggregate time-locked transaction, if we do we should set lock_time before to avoid breaking hash computation
 				if let Ok(sig) = onchain_handler.signer.sign_counterparty_htlc_transaction(&bumped_tx, i, &outp.htlc.amount_msat / 1000, &outp.per_commitment_point, &outp.htlc, &onchain_handler.secp_ctx) {
 					let mut ser_sig = sig.serialize_der().to_vec();
 					ser_sig.push(EcdsaSighashType::All as u8);
@@ -460,18 +459,23 @@ impl PackageSolvingData {
 			_ => { panic!("API Error!"); }
 		}
 	}
-	fn absolute_tx_timelock(&self, output_conf_height: u32) -> u32 {
-		// Get the absolute timelock at which this output can be spent given the height at which
-		// this output was confirmed. We use `output_conf_height + 1` as a safe default as we can
-		// be confirmed in the next block and transactions with time lock `current_height + 1`
-		// always propagate.
+	fn absolute_tx_timelock(&self, current_height: u32) -> u32 {
+		// We use `current_height` as our default locktime to discourage fee sniping and because
+		// transactions with it always propagate.
 		let absolute_timelock = match self {
-			PackageSolvingData::RevokedOutput(_) => output_conf_height + 1,
-			PackageSolvingData::RevokedHTLCOutput(_) => output_conf_height + 1,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(_) => output_conf_height + 1,
-			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => cmp::max(outp.htlc.cltv_expiry, output_conf_height + 1),
-			PackageSolvingData::HolderHTLCOutput(ref outp) => cmp::max(outp.cltv_expiry, output_conf_height + 1),
-			PackageSolvingData::HolderFundingOutput(_) => output_conf_height + 1,
+			PackageSolvingData::RevokedOutput(_) => current_height,
+			PackageSolvingData::RevokedHTLCOutput(_) => current_height,
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(_) => current_height,
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => cmp::max(outp.htlc.cltv_expiry, current_height),
+			// HTLC timeout/success transactions rely on a fixed timelock due to the counterparty's
+			// signature.
+			PackageSolvingData::HolderHTLCOutput(ref outp) => {
+				if outp.preimage.is_some() {
+					debug_assert_eq!(outp.cltv_expiry, 0);
+				}
+				outp.cltv_expiry
+			},
+			PackageSolvingData::HolderFundingOutput(_) => current_height,
 		};
 		absolute_timelock
 	}
@@ -534,7 +538,7 @@ pub struct PackageTemplate {
 	feerate_previous: u64,
 	// Cache of next height at which fee-bumping and rebroadcast will be attempted. In
 	// the future, we might abstract it to an observed mempool fluctuation.
-	height_timer: Option<u32>,
+	height_timer: u32,
 	// Confirmation height of the claimed outputs set transaction. In case of reorg reaching
 	// it, we wipe out and forget the package.
 	height_original: u32,
@@ -550,16 +554,16 @@ impl PackageTemplate {
 	pub(crate) fn aggregable(&self) -> bool {
 		self.aggregable
 	}
+	pub(crate) fn previous_feerate(&self) -> u64 {
+		self.feerate_previous
+	}
 	pub(crate) fn set_feerate(&mut self, new_feerate: u64) {
 		self.feerate_previous = new_feerate;
 	}
-	pub(crate) fn timer(&self) -> Option<u32> {
-		if let Some(ref timer) = self.height_timer {
-			return Some(*timer);
-		}
-		None
+	pub(crate) fn timer(&self) -> u32 {
+		self.height_timer
 	}
-	pub(crate) fn set_timer(&mut self, new_timer: Option<u32>) {
+	pub(crate) fn set_timer(&mut self, new_timer: u32) {
 		self.height_timer = new_timer;
 	}
 	pub(crate) fn outpoints(&self) -> Vec<&BitcoinOutPoint> {
@@ -638,9 +642,36 @@ impl PackageTemplate {
 		}
 		amounts
 	}
-	pub(crate) fn package_timelock(&self) -> u32 {
-		self.inputs.iter().map(|(_, outp)| outp.absolute_tx_timelock(self.height_original))
-			.max().expect("There must always be at least one output to spend in a PackageTemplate")
+	pub(crate) fn package_locktime(&self, current_height: u32) -> u32 {
+		let locktime = self.inputs.iter().map(|(_, outp)| outp.absolute_tx_timelock(current_height))
+			.max().expect("There must always be at least one output to spend in a PackageTemplate");
+
+		// If we ever try to aggregate a `HolderHTLCOutput`s with another output type, we'll likely
+		// end up with an incorrect transaction locktime since the counterparty has included it in
+		// its HTLC signature. This should never happen unless we decide to aggregate outputs across
+		// different channel commitments.
+		#[cfg(debug_assertions)] {
+			if self.inputs.iter().any(|(_, outp)|
+				if let PackageSolvingData::HolderHTLCOutput(outp) = outp {
+					outp.preimage.is_some()
+				} else {
+					false
+				}
+			) {
+				debug_assert_eq!(locktime, 0);
+			};
+			for timeout_htlc_expiry in self.inputs.iter().filter_map(|(_, outp)|
+				if let PackageSolvingData::HolderHTLCOutput(outp) = outp {
+					if outp.preimage.is_none() {
+						Some(outp.cltv_expiry)
+					} else { None }
+				} else { None }
+			) {
+				debug_assert_eq!(locktime, timeout_htlc_expiry);
+			}
+		}
+
+		locktime
 	}
 	pub(crate) fn package_weight(&self, destination_script: &Script) -> usize {
 		let mut inputs_weight = 0;
@@ -676,12 +707,13 @@ impl PackageTemplate {
 		htlcs
 	}
 	pub(crate) fn finalize_malleable_package<L: Deref, Signer: WriteableEcdsaChannelSigner>(
-		&self, onchain_handler: &mut OnchainTxHandler<Signer>, value: u64, destination_script: Script, logger: &L
+		&self, current_height: u32, onchain_handler: &mut OnchainTxHandler<Signer>, value: u64,
+		destination_script: Script, logger: &L
 	) -> Option<Transaction> where L::Target: Logger {
 		debug_assert!(self.is_malleable());
 		let mut bumped_tx = Transaction {
 			version: 2,
-			lock_time: PackedLockTime::ZERO,
+			lock_time: PackedLockTime(self.package_locktime(current_height)),
 			input: vec![],
 			output: vec![TxOut {
 				script_pubkey: destination_script,
@@ -733,16 +765,23 @@ impl PackageTemplate {
 	/// Returns value in satoshis to be included as package outgoing output amount and feerate
 	/// which was used to generate the value. Will not return less than `dust_limit_sats` for the
 	/// value.
-	pub(crate) fn compute_package_output<F: Deref, L: Deref>(&self, predicted_weight: usize, dust_limit_sats: u64, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L) -> Option<(u64, u64)>
-		where F::Target: FeeEstimator,
-		      L::Target: Logger,
+	pub(crate) fn compute_package_output<F: Deref, L: Deref>(
+		&self, predicted_weight: usize, dust_limit_sats: u64, force_feerate_bump: bool,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Option<(u64, u64)>
+	where
+		F::Target: FeeEstimator,
+		L::Target: Logger,
 	{
 		debug_assert!(self.malleability == PackageMalleability::Malleable, "The package output is fixed for non-malleable packages");
 		let input_amounts = self.package_amount();
 		assert!(dust_limit_sats as i64 > 0, "Output script must be broadcastable/have a 'real' dust limit.");
 		// If old feerate is 0, first iteration of this claim, use normal fee calculation
 		if self.feerate_previous != 0 {
-			if let Some((new_fee, feerate)) = feerate_bump(predicted_weight, input_amounts, self.feerate_previous, fee_estimator, logger) {
+			if let Some((new_fee, feerate)) = feerate_bump(
+				predicted_weight, input_amounts, self.feerate_previous, force_feerate_bump,
+				fee_estimator, logger,
+			) {
 				return Some((cmp::max(input_amounts as i64 - new_fee as i64, dust_limit_sats as i64) as u64, feerate));
 			}
 		} else {
@@ -755,16 +794,19 @@ impl PackageTemplate {
 
 	#[cfg(anchors)]
 	/// Computes a feerate based on the given confirmation target. If a previous feerate was used,
-	/// and the new feerate is below it, we'll use a 25% increase of the previous feerate instead of
-	/// the new one.
+	/// the new feerate is below it, and `force_feerate_bump` is set, we'll use a 25% increase of
+	/// the previous feerate instead of the new feerate.
 	pub(crate) fn compute_package_feerate<F: Deref>(
 		&self, fee_estimator: &LowerBoundedFeeEstimator<F>, conf_target: ConfirmationTarget,
+		force_feerate_bump: bool,
 	) -> u32 where F::Target: FeeEstimator {
 		let feerate_estimate = fee_estimator.bounded_sat_per_1000_weight(conf_target);
 		if self.feerate_previous != 0 {
 			// If old feerate inferior to actual one given back by Fee Estimator, use it to compute new fee...
 			if feerate_estimate as u64 > self.feerate_previous {
 				feerate_estimate
+			} else if !force_feerate_bump {
+				self.feerate_previous.try_into().unwrap_or(u32::max_value())
 			} else {
 				// ...else just increase the previous feerate by 25% (because that's a nice number)
 				(self.feerate_previous + (self.feerate_previous / 4)).try_into().unwrap_or(u32::max_value())
@@ -805,7 +847,7 @@ impl PackageTemplate {
 			soonest_conf_deadline,
 			aggregable,
 			feerate_previous: 0,
-			height_timer: None,
+			height_timer: height_original,
 			height_original,
 		}
 	}
@@ -822,7 +864,7 @@ impl Writeable for PackageTemplate {
 			(0, self.soonest_conf_deadline, required),
 			(2, self.feerate_previous, required),
 			(4, self.height_original, required),
-			(6, self.height_timer, option)
+			(6, self.height_timer, required)
 		});
 		Ok(())
 	}
@@ -861,13 +903,16 @@ impl Readable for PackageTemplate {
 			(4, height_original, required),
 			(6, height_timer, option),
 		});
+		if height_timer.is_none() {
+			height_timer = Some(height_original);
+		}
 		Ok(PackageTemplate {
 			inputs,
 			malleability,
 			soonest_conf_deadline,
 			aggregable,
 			feerate_previous,
-			height_timer,
+			height_timer: height_timer.unwrap(),
 			height_original,
 		})
 	}
@@ -913,31 +958,46 @@ fn compute_fee_from_spent_amounts<F: Deref, L: Deref>(input_amounts: u64, predic
 
 /// Attempt to propose a bumping fee for a transaction from its spent output's values and predicted
 /// weight. If feerates proposed by the fee-estimator have been increasing since last fee-bumping
-/// attempt, use them. Otherwise, blindly bump the feerate by 25% of the previous feerate. We also
-/// verify that those bumping heuristics respect BIP125 rules 3) and 4) and if required adjust
-/// the new fee to meet the RBF policy requirement.
-fn feerate_bump<F: Deref, L: Deref>(predicted_weight: usize, input_amounts: u64, previous_feerate: u64, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L) -> Option<(u64, u64)>
-	where F::Target: FeeEstimator,
-	      L::Target: Logger,
+/// attempt, use them. If `force_feerate_bump` is set, we bump the feerate by 25% of the previous
+/// feerate, or just use the previous feerate otherwise. If a feerate bump did happen, we also
+/// verify that those bumping heuristics respect BIP125 rules 3) and 4) and if required adjust the
+/// new fee to meet the RBF policy requirement.
+fn feerate_bump<F: Deref, L: Deref>(
+	predicted_weight: usize, input_amounts: u64, previous_feerate: u64, force_feerate_bump: bool,
+	fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+) -> Option<(u64, u64)>
+where
+	F::Target: FeeEstimator,
+	L::Target: Logger,
 {
 	// If old feerate inferior to actual one given back by Fee Estimator, use it to compute new fee...
-	let new_fee = if let Some((new_fee, _)) = compute_fee_from_spent_amounts(input_amounts, predicted_weight, fee_estimator, logger) {
-		let updated_feerate = new_fee / (predicted_weight as u64 * 1000);
-		if updated_feerate > previous_feerate {
-			new_fee
+	let (new_fee, new_feerate) = if let Some((new_fee, new_feerate)) = compute_fee_from_spent_amounts(input_amounts, predicted_weight, fee_estimator, logger) {
+		if new_feerate > previous_feerate {
+			(new_fee, new_feerate)
+		} else if !force_feerate_bump {
+			let previous_fee = previous_feerate * (predicted_weight as u64) / 1000;
+			(previous_fee, previous_feerate)
 		} else {
 			// ...else just increase the previous feerate by 25% (because that's a nice number)
-			let new_fee = previous_feerate * (predicted_weight as u64) / 750;
-			if input_amounts <= new_fee {
+			let bumped_feerate = previous_feerate + (previous_feerate / 4);
+			let bumped_fee = bumped_feerate * (predicted_weight as u64) / 1000;
+			if input_amounts <= bumped_fee {
 				log_warn!(logger, "Can't 25% bump new claiming tx, amount {} is too small", input_amounts);
 				return None;
 			}
-			new_fee
+			(bumped_fee, bumped_feerate)
 		}
 	} else {
 		log_warn!(logger, "Can't new-estimation bump new claiming tx, amount {} is too small", input_amounts);
 		return None;
 	};
+
+	// Our feerates should never decrease. If it hasn't changed though, we just need to
+	// rebroadcast/re-sign the previous claim.
+	debug_assert!(new_feerate >= previous_feerate);
+	if new_feerate == previous_feerate {
+		return Some((new_fee, new_feerate));
+	}
 
 	let previous_fee = previous_feerate * (predicted_weight as u64) / 1000;
 	let min_relay_fee = MIN_RELAY_FEE_SAT_PER_1000_WEIGHT * (predicted_weight as u64) / 1000;
@@ -1145,12 +1205,9 @@ mod tests {
 		let revk_outp = dumb_revk_output!(secp_ctx);
 
 		let mut package = PackageTemplate::build_package(txid, 0, revk_outp, 1000, true, 100);
-		let timer_none = package.timer();
-		assert!(timer_none.is_none());
-		package.set_timer(Some(100));
-		if let Some(timer_some) = package.timer() {
-			assert_eq!(timer_some, 100);
-		} else { panic!() }
+		assert_eq!(package.timer(), 100);
+		package.set_timer(101);
+		assert_eq!(package.timer(), 101);
 	}
 
 	#[test]

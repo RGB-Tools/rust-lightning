@@ -7,19 +7,7 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! High level lightning structs and impls live here.
-//!
-//! You probably want to create a [`ChannelManager`], and a [`P2PGossipSync`] first.
-//! Then, you probably want to pass them both on to a peer_handler::PeerManager and use that to
-//! create/manage connections and call get_and_clear_pending_events after each action, handling
-//! them appropriately.
-//!
-//! When you want to open/close a channel or send a payment, call into your [`ChannelManager`] and
-//! when you want to learn things about the network topology (eg get a route for sending a payment),
-//! call into your [`P2PGossipSync`].
-//!
-//! [`ChannelManager`]: channelmanager::ChannelManager
-//! [`P2PGossipSync`]: crate::routing::gossip::P2PGossipSync
+//! Implementations of various parts of the Lightning protocol are in this module.
 
 #[cfg(any(test, feature = "_test_utils"))]
 #[macro_use]
@@ -82,15 +70,18 @@ mod shutdown_tests;
 pub use self::peer_channel_encryptor::LN_MAX_MSG_LEN;
 
 /// payment_hash type, use to cross-lock hop
-/// (C-not exported) as we just use [u8; 32] directly
+///
+/// This is not exported to bindings users as we just use [u8; 32] directly
 #[derive(Hash, Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PaymentHash(pub [u8; 32]);
 /// payment_preimage type, use to route payment between hop
-/// (C-not exported) as we just use [u8; 32] directly
+///
+/// This is not exported to bindings users as we just use [u8; 32] directly
 #[derive(Hash, Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PaymentPreimage(pub [u8; 32]);
 /// payment_secret type, use to authenticate sender to the receiver and tie MPP HTLCs together
-/// (C-not exported) as we just use [u8; 32] directly
+///
+/// This is not exported to bindings users as we just use [u8; 32] directly
 #[derive(Hash, Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PaymentSecret(pub [u8; 32]);
 

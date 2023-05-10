@@ -32,11 +32,12 @@ use crate::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, Balance, MonitorEvent, TransactionOutputs, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::keysinterface::WriteableEcdsaChannelSigner;
+use crate::events;
+use crate::events::{Event, EventHandler};
 use crate::util::atomic_counter::AtomicCounter;
 use crate::util::logger::Logger;
 use crate::util::errors::APIError;
-use crate::util::events;
-use crate::util::events::{Event, EventHandler};
+use crate::util::wakers::{Future, Notifier};
 use crate::ln::channelmanager::ChannelDetails;
 
 use crate::prelude::*;
@@ -216,8 +217,15 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner> Deref for LockedChannelMonitor<
 /// or used independently to monitor channels remotely. See the [module-level documentation] for
 /// details.
 ///
+/// Note that `ChainMonitor` should regularly trigger rebroadcasts/fee bumps of pending claims from
+/// a force-closed channel. This is crucial in preventing certain classes of pinning attacks,
+/// detecting substantial mempool feerate changes between blocks, and ensuring reliability if
+/// broadcasting fails. We recommend invoking this every 30 seconds, or lower if running in an
+/// environment with spotty connections, like on mobile.
+///
 /// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 /// [module-level documentation]: crate::chain::chainmonitor
+/// [`rebroadcast_pending_claims`]: Self::rebroadcast_pending_claims
 pub struct ChainMonitor<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref>
 	where C::Target: chain::Filter,
         T::Target: BroadcasterInterface,
@@ -240,6 +248,8 @@ pub struct ChainMonitor<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T:
 	pending_monitor_events: Mutex<Vec<(OutPoint, Vec<MonitorEvent>, Option<PublicKey>)>>,
 	/// The best block height seen, used as a proxy for the passage of time.
 	highest_chain_height: AtomicUsize,
+
+	event_notifier: Notifier,
 }
 
 impl<ChannelSigner: WriteableEcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, P: Deref> ChainMonitor<ChannelSigner, C, T, F, L, P>
@@ -300,6 +310,7 @@ where C::Target: chain::Filter,
 					ChannelMonitorUpdateStatus::PermanentFailure => {
 						monitor_state.channel_perm_failed.store(true, Ordering::Release);
 						self.pending_monitor_events.lock().unwrap().push((*funding_outpoint, vec![MonitorEvent::UpdateFailed(*funding_outpoint)], monitor.get_counterparty_node_id()));
+						self.event_notifier.notify();
 					},
 					ChannelMonitorUpdateStatus::InProgress => {
 						log_debug!(self.logger, "Channel Monitor sync for channel {} in progress, holding events until completion!", log_funding_info!(monitor));
@@ -345,6 +356,7 @@ where C::Target: chain::Filter,
 			persister,
 			pending_monitor_events: Mutex::new(Vec::new()),
 			highest_chain_height: AtomicUsize::new(0),
+			event_notifier: Notifier::new(),
 		}
 	}
 
@@ -472,6 +484,7 @@ where C::Target: chain::Filter,
 				}
 			},
 		}
+		self.event_notifier.notify();
 		Ok(())
 	}
 
@@ -486,11 +499,12 @@ where C::Target: chain::Filter,
 			funding_txo,
 			monitor_update_id,
 		}], counterparty_node_id));
+		self.event_notifier.notify();
 	}
 
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	pub fn get_and_clear_pending_events(&self) -> Vec<events::Event> {
-		use crate::util::events::EventsProvider;
+		use crate::events::EventsProvider;
 		let events = core::cell::RefCell::new(Vec::new());
 		let event_handler = |event: events::Event| events.borrow_mut().push(event);
 		self.process_pending_events(&event_handler);
@@ -502,7 +516,7 @@ where C::Target: chain::Filter,
 	///
 	/// See the trait-level documentation of [`EventsProvider`] for requirements.
 	///
-	/// [`EventsProvider`]: crate::util::events::EventsProvider
+	/// [`EventsProvider`]: crate::events::EventsProvider
 	pub async fn process_pending_events_async<Future: core::future::Future, H: Fn(Event) -> Future>(
 		&self, handler: H
 	) {
@@ -512,6 +526,32 @@ where C::Target: chain::Filter,
 		}
 		for event in pending_events {
 			handler(event).await;
+		}
+	}
+
+	/// Gets a [`Future`] that completes when an event is available either via
+	/// [`chain::Watch::release_pending_monitor_events`] or
+	/// [`EventsProvider::process_pending_events`].
+	///
+	/// Note that callbacks registered on the [`Future`] MUST NOT call back into this
+	/// [`ChainMonitor`] and should instead register actions to be taken later.
+	///
+	/// [`EventsProvider::process_pending_events`]: crate::events::EventsProvider::process_pending_events
+	pub fn get_update_future(&self) -> Future {
+		self.event_notifier.get_future()
+	}
+
+	/// Triggers rebroadcasts/fee-bumps of pending claims from a force-closed channel. This is
+	/// crucial in preventing certain classes of pinning attacks, detecting substantial mempool
+	/// feerate changes between blocks, and ensuring reliability if broadcasting fails. We recommend
+	/// invoking this every 30 seconds, or lower if running in an environment with spotty
+	/// connections, like on mobile.
+	pub fn rebroadcast_pending_claims(&self) {
+		let monitors = self.monitors.read().unwrap();
+		for (_, monitor_holder) in &*monitors {
+			monitor_holder.monitor.rebroadcast_pending_claims(
+				&*self.broadcaster, &*self.fee_estimator, &*self.logger
+			)
 		}
 	}
 }
@@ -792,11 +832,11 @@ mod tests {
 	use crate::{get_htlc_update_msgs, get_local_commitment_txn, get_revoke_commit_msgs, get_route_and_payment_hash, unwrap_send_err};
 	use crate::chain::{ChannelMonitorUpdateStatus, Confirm, Watch};
 	use crate::chain::channelmonitor::LATENCY_GRACE_PERIOD_BLOCKS;
-	use crate::ln::channelmanager::{PaymentSendFailure, PaymentId};
+	use crate::events::{Event, ClosureReason, MessageSendEvent, MessageSendEventsProvider};
+	use crate::ln::channelmanager::{PaymentSendFailure, PaymentId, RecipientOnionFields};
 	use crate::ln::functional_test_utils::*;
 	use crate::ln::msgs::ChannelMessageHandler;
 	use crate::util::errors::APIError;
-	use crate::util::events::{Event, ClosureReason, MessageSendEvent, MessageSendEventsProvider};
 
 	#[test]
 	fn test_async_ooo_offchain_updates() {
@@ -945,8 +985,9 @@ mod tests {
 		// If the ChannelManager tries to update the channel, however, the ChainMonitor will pass
 		// the update through to the ChannelMonitor which will refuse it (as the channel is closed).
 		chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
-		unwrap_send_err!(nodes[0].node.send_payment(&route, second_payment_hash, &Some(second_payment_secret), PaymentId(second_payment_hash.0)),
-			true, APIError::ChannelUnavailable { ref err },
+		unwrap_send_err!(nodes[0].node.send_payment_with_route(&route, second_payment_hash,
+				RecipientOnionFields::secret_only(second_payment_secret), PaymentId(second_payment_hash.0)
+			), true, APIError::ChannelUnavailable { ref err },
 			assert!(err.contains("ChannelMonitor storage failure")));
 		check_added_monitors!(nodes[0], 2); // After the failure we generate a close-channel monitor update
 		check_closed_broadcast!(nodes[0], true);

@@ -7,7 +7,7 @@
 #![deny(private_intra_doc_links)]
 
 #![deny(missing_docs)]
-#![deny(unsafe_code)]
+#![cfg_attr(not(feature = "futures"), deny(unsafe_code))]
 
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
@@ -26,6 +26,9 @@ use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::chainmonitor::{ChainMonitor, Persist};
 use lightning::chain::keysinterface::{EntropySource, NodeSigner, SignerProvider};
+use lightning::events::{Event, PathFailure};
+#[cfg(feature = "std")]
+use lightning::events::{EventHandler, EventsProvider};
 use lightning::ln::channelmanager::ChannelManager;
 use lightning::ln::msgs::{ChannelMessageHandler, OnionMessageHandler, RoutingMessageHandler};
 use lightning::ln::peer_handler::{CustomMessageHandler, PeerManager, SocketDescriptor};
@@ -33,11 +36,10 @@ use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 use lightning::routing::utxo::UtxoLookup;
 use lightning::routing::router::Router;
 use lightning::routing::scoring::{Score, WriteableScore};
-use lightning::util::events::{Event, PathFailure};
-#[cfg(feature = "std")]
-use lightning::util::events::{EventHandler, EventsProvider};
 use lightning::util::logger::Logger;
 use lightning::util::persist::Persister;
+#[cfg(feature = "std")]
+use lightning::util::wakers::Sleeper;
 use lightning_rapid_gossip_sync::RapidGossipSync;
 
 use core::ops::Deref;
@@ -52,8 +54,6 @@ use std::thread::{self, JoinHandle};
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-#[cfg(feature = "futures")]
-use futures_util::{select_biased, future::FutureExt, task};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -64,8 +64,8 @@ use alloc::vec::Vec;
 /// * Monitoring whether the [`ChannelManager`] needs to be re-persisted to disk, and if so,
 ///   writing it to disk/backups by invoking the callback given to it at startup.
 ///   [`ChannelManager`] persistence should be done in the background.
-/// * Calling [`ChannelManager::timer_tick_occurred`] and [`PeerManager::timer_tick_occurred`]
-///   at the appropriate intervals.
+/// * Calling [`ChannelManager::timer_tick_occurred`], [`ChainMonitor::rebroadcast_pending_claims`]
+///   and [`PeerManager::timer_tick_occurred`] at the appropriate intervals.
 /// * Calling [`NetworkGraph::remove_stale_channels_and_tracking`] (if a [`GossipSync`] with a
 ///   [`NetworkGraph`] is provided to [`BackgroundProcessor::start`]).
 ///
@@ -80,7 +80,7 @@ use alloc::vec::Vec;
 /// unilateral chain closure fees are at risk.
 ///
 /// [`ChannelMonitor`]: lightning::chain::channelmonitor::ChannelMonitor
-/// [`Event`]: lightning::util::events::Event
+/// [`Event`]: lightning::events::Event
 #[cfg(feature = "std")]
 #[must_use = "BackgroundProcessor will immediately stop on drop. It should be stored until shutdown."]
 pub struct BackgroundProcessor {
@@ -115,6 +115,18 @@ const SCORER_PERSIST_TIMER: u64 = 1;
 const FIRST_NETWORK_PRUNE_TIMER: u64 = 60;
 #[cfg(test)]
 const FIRST_NETWORK_PRUNE_TIMER: u64 = 1;
+
+#[cfg(not(test))]
+const REBROADCAST_TIMER: u64 = 30;
+#[cfg(test)]
+const REBROADCAST_TIMER: u64 = 1;
+
+#[cfg(feature = "futures")]
+/// core::cmp::min is not currently const, so we define a trivial (and equivalent) replacement
+const fn min_u64(a: u64, b: u64) -> u64 { if a < b { a } else { b } }
+#[cfg(feature = "futures")]
+const FASTEST_TIMER: u64 = min_u64(min_u64(FRESHNESS_TIMER, PING_TIMER),
+	min_u64(SCORER_PERSIST_TIMER, min_u64(FIRST_NETWORK_PRUNE_TIMER, REBROADCAST_TIMER)));
 
 /// Either [`P2PGossipSync`] or [`RapidGossipSync`].
 pub enum GossipSync<
@@ -164,7 +176,7 @@ where U::Target: UtxoLookup, L::Target: Logger {
 	}
 }
 
-/// (C-not exported) as the bindings concretize everything and have constructors for us
+/// This is not exported to bindings users as the bindings concretize everything and have constructors for us
 impl<P: Deref<Target = P2PGossipSync<G, U, L>>, G: Deref<Target = NetworkGraph<L>>, U: Deref, L: Deref>
 	GossipSync<P, &RapidGossipSync<G, L>, G, U, L>
 where
@@ -177,7 +189,7 @@ where
 	}
 }
 
-/// (C-not exported) as the bindings concretize everything and have constructors for us
+/// This is not exported to bindings users as the bindings concretize everything and have constructors for us
 impl<'a, R: Deref<Target = RapidGossipSync<G, L>>, G: Deref<Target = NetworkGraph<L>>, L: Deref>
 	GossipSync<
 		&P2PGossipSync<G, &'a (dyn UtxoLookup + Send + Sync), L>,
@@ -195,7 +207,7 @@ where
 	}
 }
 
-/// (C-not exported) as the bindings concretize everything and have constructors for us
+/// This is not exported to bindings users as the bindings concretize everything and have constructors for us
 impl<'a, L: Deref>
 	GossipSync<
 		&P2PGossipSync<&'a NetworkGraph<L>, &'a (dyn UtxoLookup + Send + Sync), L>,
@@ -229,26 +241,21 @@ fn update_scorer<'a, S: 'static + Deref<Target = SC> + Send + Sync, SC: 'a + Wri
 	let mut score = scorer.lock();
 	match event {
 		Event::PaymentPathFailed { ref path, short_channel_id: Some(scid), .. } => {
-			let path = path.iter().collect::<Vec<_>>();
-			score.payment_path_failed(&path, *scid);
+			score.payment_path_failed(path, *scid);
 		},
 		Event::PaymentPathFailed { ref path, payment_failed_permanently: true, .. } => {
 			// Reached if the destination explicitly failed it back. We treat this as a successful probe
 			// because the payment made it all the way to the destination with sufficient liquidity.
-			let path = path.iter().collect::<Vec<_>>();
-			score.probe_successful(&path);
+			score.probe_successful(path);
 		},
 		Event::PaymentPathSuccessful { path, .. } => {
-			let path = path.iter().collect::<Vec<_>>();
-			score.payment_path_successful(&path);
+			score.payment_path_successful(path);
 		},
 		Event::ProbeSuccessful { path, .. } => {
-			let path = path.iter().collect::<Vec<_>>();
-			score.probe_successful(&path);
+			score.probe_successful(path);
 		},
 		Event::ProbeFailed { path, short_channel_id: Some(scid), .. } => {
-			let path = path.iter().collect::<Vec<_>>();
-			score.probe_failed(&path, *scid);
+			score.probe_failed(path, *scid);
 		},
 		_ => {},
 	}
@@ -258,15 +265,19 @@ macro_rules! define_run_body {
 	($persister: ident, $chain_monitor: ident, $process_chain_monitor_events: expr,
 	 $channel_manager: ident, $process_channel_manager_events: expr,
 	 $gossip_sync: ident, $peer_manager: ident, $logger: ident, $scorer: ident,
-	 $loop_exit_check: expr, $await: expr, $get_timer: expr, $timer_elapsed: expr)
+	 $loop_exit_check: expr, $await: expr, $get_timer: expr, $timer_elapsed: expr,
+	 $check_slow_await: expr)
 	=> { {
 		log_trace!($logger, "Calling ChannelManager's timer_tick_occurred on startup");
 		$channel_manager.timer_tick_occurred();
+		log_trace!($logger, "Rebroadcasting monitor's pending claims on startup");
+		$chain_monitor.rebroadcast_pending_claims();
 
 		let mut last_freshness_call = $get_timer(FRESHNESS_TIMER);
 		let mut last_ping_call = $get_timer(PING_TIMER);
 		let mut last_prune_call = $get_timer(FIRST_NETWORK_PRUNE_TIMER);
 		let mut last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
+		let mut last_rebroadcast_call = $get_timer(REBROADCAST_TIMER);
 		let mut have_pruned = false;
 
 		loop {
@@ -286,21 +297,29 @@ macro_rules! define_run_body {
 			// persistence.
 			$peer_manager.process_events();
 
+			// Exit the loop if the background processor was requested to stop.
+			if $loop_exit_check {
+				log_trace!($logger, "Terminating background processor.");
+				break;
+			}
+
 			// We wait up to 100ms, but track how long it takes to detect being put to sleep,
 			// see `await_start`'s use below.
-			let mut await_start = $get_timer(1);
+			let mut await_start = None;
+			if $check_slow_await { await_start = Some($get_timer(1)); }
 			let updates_available = $await;
-			let await_slow = $timer_elapsed(&mut await_start, 1);
+			let await_slow = if $check_slow_await { $timer_elapsed(&mut await_start.unwrap(), 1) } else { false };
+
+			// Exit the loop if the background processor was requested to stop.
+			if $loop_exit_check {
+				log_trace!($logger, "Terminating background processor.");
+				break;
+			}
 
 			if updates_available {
 				log_trace!($logger, "Persisting ChannelManager...");
 				$persister.persist_manager(&*$channel_manager)?;
 				log_trace!($logger, "Done persisting ChannelManager.");
-			}
-			// Exit the loop if the background processor was requested to stop.
-			if $loop_exit_check {
-				log_trace!($logger, "Terminating background processor.");
-				break;
 			}
 			if $timer_elapsed(&mut last_freshness_call, FRESHNESS_TIMER) {
 				log_trace!($logger, "Calling ChannelManager's timer_tick_occurred");
@@ -333,7 +352,8 @@ macro_rules! define_run_body {
 			// falling back to our usual hourly prunes. This avoids short-lived clients never
 			// pruning their network graph. We run once 60 seconds after startup before
 			// continuing our normal cadence.
-			if $timer_elapsed(&mut last_prune_call, if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER }) {
+			let prune_timer = if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER };
+			if $timer_elapsed(&mut last_prune_call, prune_timer) {
 				// The network graph must not be pruned while rapid sync completion is pending
 				if let Some(network_graph) = $gossip_sync.prunable_network_graph() {
 					#[cfg(feature = "std")] {
@@ -349,9 +369,10 @@ macro_rules! define_run_body {
 						log_error!($logger, "Error: Failed to persist network graph, check your disk and permissions {}", e)
 					}
 
-					last_prune_call = $get_timer(NETWORK_PRUNE_TIMER);
 					have_pruned = true;
 				}
+				let prune_timer = if have_pruned { NETWORK_PRUNE_TIMER } else { FIRST_NETWORK_PRUNE_TIMER };
+				last_prune_call = $get_timer(prune_timer);
 			}
 
 			if $timer_elapsed(&mut last_scorer_persist_call, SCORER_PERSIST_TIMER) {
@@ -362,6 +383,12 @@ macro_rules! define_run_body {
 					}
 				}
 				last_scorer_persist_call = $get_timer(SCORER_PERSIST_TIMER);
+			}
+
+			if $timer_elapsed(&mut last_rebroadcast_call, REBROADCAST_TIMER) {
+				log_trace!($logger, "Rebroadcasting monitor's pending claims");
+				$chain_monitor.rebroadcast_pending_claims();
+				last_rebroadcast_call = $get_timer(REBROADCAST_TIMER);
 			}
 		}
 
@@ -384,11 +411,65 @@ macro_rules! define_run_body {
 	} }
 }
 
+#[cfg(feature = "futures")]
+pub(crate) mod futures_util {
+	use core::future::Future;
+	use core::task::{Poll, Waker, RawWaker, RawWakerVTable};
+	use core::pin::Pin;
+	use core::marker::Unpin;
+	pub(crate) struct Selector<
+		A: Future<Output=()> + Unpin, B: Future<Output=()> + Unpin, C: Future<Output=bool> + Unpin
+	> {
+		pub a: A,
+		pub b: B,
+		pub c: C,
+	}
+	pub(crate) enum SelectorOutput {
+		A, B, C(bool),
+	}
+
+	impl<
+		A: Future<Output=()> + Unpin, B: Future<Output=()> + Unpin, C: Future<Output=bool> + Unpin
+	> Future for Selector<A, B, C> {
+		type Output = SelectorOutput;
+		fn poll(mut self: Pin<&mut Self>, ctx: &mut core::task::Context<'_>) -> Poll<SelectorOutput> {
+			match Pin::new(&mut self.a).poll(ctx) {
+				Poll::Ready(()) => { return Poll::Ready(SelectorOutput::A); },
+				Poll::Pending => {},
+			}
+			match Pin::new(&mut self.b).poll(ctx) {
+				Poll::Ready(()) => { return Poll::Ready(SelectorOutput::B); },
+				Poll::Pending => {},
+			}
+			match Pin::new(&mut self.c).poll(ctx) {
+				Poll::Ready(res) => { return Poll::Ready(SelectorOutput::C(res)); },
+				Poll::Pending => {},
+			}
+			Poll::Pending
+		}
+	}
+
+	// If we want to poll a future without an async context to figure out if it has completed or
+	// not without awaiting, we need a Waker, which needs a vtable...we fill it with dummy values
+	// but sadly there's a good bit of boilerplate here.
+	fn dummy_waker_clone(_: *const ()) -> RawWaker { RawWaker::new(core::ptr::null(), &DUMMY_WAKER_VTABLE) }
+	fn dummy_waker_action(_: *const ()) { }
+
+	const DUMMY_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+		dummy_waker_clone, dummy_waker_action, dummy_waker_action, dummy_waker_action);
+	pub(crate) fn dummy_waker() -> Waker { unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &DUMMY_WAKER_VTABLE)) } }
+}
+#[cfg(feature = "futures")]
+use futures_util::{Selector, SelectorOutput, dummy_waker};
+#[cfg(feature = "futures")]
+use core::task;
+
 /// Processes background events in a future.
 ///
 /// `sleeper` should return a future which completes in the given amount of time and returns a
 /// boolean indicating whether the background processing should exit. Once `sleeper` returns a
-/// future which outputs true, the loop will exit and this function's future will complete.
+/// future which outputs `true`, the loop will exit and this function's future will complete.
+/// The `sleeper` future is free to return early after it has triggered the exit condition.
 ///
 /// See [`BackgroundProcessor::start`] for information on which actions this handles.
 ///
@@ -396,6 +477,92 @@ macro_rules! define_run_body {
 /// feature, doing so will skip calling [`NetworkGraph::remove_stale_channels_and_tracking`],
 /// you should call [`NetworkGraph::remove_stale_channels_and_tracking_with_time`] regularly
 /// manually instead.
+///
+/// The `mobile_interruptable_platform` flag should be set if we're currently running on a
+/// mobile device, where we may need to check for interruption of the application regularly. If you
+/// are unsure, you should set the flag, as the performance impact of it is minimal unless there
+/// are hundreds or thousands of simultaneous process calls running.
+///
+/// For example, in order to process background events in a [Tokio](https://tokio.rs/) task, you
+/// could setup `process_events_async` like this:
+/// ```
+/// # struct MyPersister {}
+/// # impl lightning::util::persist::KVStorePersister for MyPersister {
+/// #     fn persist<W: lightning::util::ser::Writeable>(&self, key: &str, object: &W) -> lightning::io::Result<()> { Ok(()) }
+/// # }
+/// # struct MyEventHandler {}
+/// # impl MyEventHandler {
+/// #     async fn handle_event(&self, _: lightning::events::Event) {}
+/// # }
+/// # #[derive(Eq, PartialEq, Clone, Hash)]
+/// # struct MySocketDescriptor {}
+/// # impl lightning::ln::peer_handler::SocketDescriptor for MySocketDescriptor {
+/// #     fn send_data(&mut self, _data: &[u8], _resume_read: bool) -> usize { 0 }
+/// #     fn disconnect_socket(&mut self) {}
+/// # }
+/// # use std::sync::{Arc, Mutex};
+/// # use std::sync::atomic::{AtomicBool, Ordering};
+/// # use lightning_background_processor::{process_events_async, GossipSync};
+/// # type MyBroadcaster = dyn lightning::chain::chaininterface::BroadcasterInterface + Send + Sync;
+/// # type MyFeeEstimator = dyn lightning::chain::chaininterface::FeeEstimator + Send + Sync;
+/// # type MyNodeSigner = dyn lightning::chain::keysinterface::NodeSigner + Send + Sync;
+/// # type MyUtxoLookup = dyn lightning::routing::utxo::UtxoLookup + Send + Sync;
+/// # type MyFilter = dyn lightning::chain::Filter + Send + Sync;
+/// # type MyLogger = dyn lightning::util::logger::Logger + Send + Sync;
+/// # type MyChainMonitor = lightning::chain::chainmonitor::ChainMonitor<lightning::chain::keysinterface::InMemorySigner, Arc<MyFilter>, Arc<MyBroadcaster>, Arc<MyFeeEstimator>, Arc<MyLogger>, Arc<MyPersister>>;
+/// # type MyPeerManager = lightning::ln::peer_handler::SimpleArcPeerManager<MySocketDescriptor, MyChainMonitor, MyBroadcaster, MyFeeEstimator, MyUtxoLookup, MyLogger>;
+/// # type MyNetworkGraph = lightning::routing::gossip::NetworkGraph<Arc<MyLogger>>;
+/// # type MyGossipSync = lightning::routing::gossip::P2PGossipSync<Arc<MyNetworkGraph>, Arc<MyUtxoLookup>, Arc<MyLogger>>;
+/// # type MyChannelManager = lightning::ln::channelmanager::SimpleArcChannelManager<MyChainMonitor, MyBroadcaster, MyFeeEstimator, MyLogger>;
+/// # type MyScorer = Mutex<lightning::routing::scoring::ProbabilisticScorer<Arc<MyNetworkGraph>, Arc<MyLogger>>>;
+///
+/// # async fn setup_background_processing(my_persister: Arc<MyPersister>, my_event_handler: Arc<MyEventHandler>, my_chain_monitor: Arc<MyChainMonitor>, my_channel_manager: Arc<MyChannelManager>, my_gossip_sync: Arc<MyGossipSync>, my_logger: Arc<MyLogger>, my_scorer: Arc<MyScorer>, my_peer_manager: Arc<MyPeerManager>) {
+///	let background_persister = Arc::clone(&my_persister);
+///	let background_event_handler = Arc::clone(&my_event_handler);
+///	let background_chain_mon = Arc::clone(&my_chain_monitor);
+///	let background_chan_man = Arc::clone(&my_channel_manager);
+///	let background_gossip_sync = GossipSync::p2p(Arc::clone(&my_gossip_sync));
+///	let background_peer_man = Arc::clone(&my_peer_manager);
+///	let background_logger = Arc::clone(&my_logger);
+///	let background_scorer = Arc::clone(&my_scorer);
+///
+///	// Setup the sleeper.
+///	let (stop_sender, stop_receiver) = tokio::sync::watch::channel(());
+///
+///	let sleeper = move |d| {
+///		let mut receiver = stop_receiver.clone();
+///		Box::pin(async move {
+///			tokio::select!{
+///				_ = tokio::time::sleep(d) => false,
+///				_ = receiver.changed() => true,
+///			}
+///		})
+///	};
+///
+///	let mobile_interruptable_platform = false;
+///
+///	let handle = tokio::spawn(async move {
+///		process_events_async(
+///			background_persister,
+///			|e| background_event_handler.handle_event(e),
+///			background_chain_mon,
+///			background_chan_man,
+///			background_gossip_sync,
+///			background_peer_man,
+///			background_logger,
+///			Some(background_scorer),
+///			sleeper,
+///			mobile_interruptable_platform,
+///			)
+///			.await
+///			.expect("Failed to process events");
+///	});
+///
+///	// Stop the background processing.
+///	stop_sender.send(()).unwrap();
+///	handle.await.unwrap();
+///	# }
+///```
 #[cfg(feature = "futures")]
 pub async fn process_events_async<
 	'a,
@@ -431,7 +598,7 @@ pub async fn process_events_async<
 >(
 	persister: PS, event_handler: EventHandler, chain_monitor: M, channel_manager: CM,
 	gossip_sync: GossipSync<PGS, RGS, G, UL, L>, peer_manager: PM, logger: L, scorer: Option<S>,
-	sleeper: Sleeper,
+	sleeper: Sleeper, mobile_interruptable_platform: bool,
 ) -> Result<(), lightning::io::Error>
 where
 	UL::Target: 'static + UtxoLookup,
@@ -451,7 +618,7 @@ where
 	UMH::Target: 'static + CustomMessageHandler,
 	PS::Target: 'static + Persister<'a, CW, T, ES, NS, SP, F, R, L, SC>,
 {
-	let mut should_break = true;
+	let mut should_break = false;
 	let async_event_handler = |event| {
 		let network_graph = gossip_sync.network_graph();
 		let event_handler = &event_handler;
@@ -470,19 +637,28 @@ where
 		chain_monitor, chain_monitor.process_pending_events_async(async_event_handler).await,
 		channel_manager, channel_manager.process_pending_events_async(async_event_handler).await,
 		gossip_sync, peer_manager, logger, scorer, should_break, {
-			select_biased! {
-				_ = channel_manager.get_persistable_update_future().fuse() => true,
-				exit = sleeper(Duration::from_millis(100)).fuse() => {
+			let fut = Selector {
+				a: channel_manager.get_persistable_update_future(),
+				b: chain_monitor.get_update_future(),
+				c: sleeper(if mobile_interruptable_platform { Duration::from_millis(100) } else { Duration::from_secs(FASTEST_TIMER) }),
+			};
+			match fut.await {
+				SelectorOutput::A => true,
+				SelectorOutput::B => false,
+				SelectorOutput::C(exit) => {
 					should_break = exit;
 					false
 				}
 			}
 		}, |t| sleeper(Duration::from_secs(t)),
 		|fut: &mut SleepFuture, _| {
-			let mut waker = task::noop_waker();
+			let mut waker = dummy_waker();
 			let mut ctx = task::Context::from_waker(&mut waker);
-			core::pin::Pin::new(fut).poll(&mut ctx).is_ready()
-		})
+			match core::pin::Pin::new(fut).poll(&mut ctx) {
+				task::Poll::Ready(exit) => { should_break = exit; true },
+				task::Poll::Pending => false,
+			}
+		}, mobile_interruptable_platform)
 }
 
 #[cfg(feature = "std")]
@@ -597,8 +773,11 @@ impl BackgroundProcessor {
 			define_run_body!(persister, chain_monitor, chain_monitor.process_pending_events(&event_handler),
 				channel_manager, channel_manager.process_pending_events(&event_handler),
 				gossip_sync, peer_manager, logger, scorer, stop_thread.load(Ordering::Acquire),
-				channel_manager.await_persistable_update_timeout(Duration::from_millis(100)),
-				|_| Instant::now(), |time: &Instant, dur| time.elapsed().as_secs() > dur)
+				Sleeper::from_two_futures(
+					channel_manager.get_persistable_update_future(),
+					chain_monitor.get_update_future()
+				).wait_timeout(Duration::from_millis(100)),
+				|_| Instant::now(), |time: &Instant, dur| time.elapsed().as_secs() > dur, false)
 		});
 		Self { stop_thread: stop_thread_clone, thread_handle: Some(handle) }
 	}
@@ -663,7 +842,8 @@ mod tests {
 	use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 	use lightning::chain::keysinterface::{InMemorySigner, KeysManager};
 	use lightning::chain::transaction::OutPoint;
-	use lightning::get_event_msg;
+	use lightning::events::{Event, PathFailure, MessageSendEventsProvider, MessageSendEvent};
+	use lightning::{get_event_msg, get_event};
 	use lightning::ln::PaymentHash;
 	use lightning::ln::channelmanager;
 	use lightning::ln::channelmanager::{BREAKDOWN_TIMEOUT, ChainParameters, MIN_CLTV_EXPIRY_DELTA, PaymentId};
@@ -671,10 +851,9 @@ mod tests {
 	use lightning::ln::msgs::{ChannelMessageHandler, Init};
 	use lightning::ln::peer_handler::{PeerManager, MessageHandler, SocketDescriptor, IgnoringMessageHandler};
 	use lightning::routing::gossip::{NetworkGraph, NodeId, P2PGossipSync};
-	use lightning::routing::router::{DefaultRouter, RouteHop};
+	use lightning::routing::router::{DefaultRouter, Path, RouteHop};
 	use lightning::routing::scoring::{ChannelUsage, Score};
 	use lightning::util::config::UserConfig;
-	use lightning::util::events::{Event, PathFailure, MessageSendEventsProvider, MessageSendEvent};
 	use lightning::util::ser::Writeable;
 	use lightning::util::test_utils;
 	use lightning::util::persist::KVStorePersister;
@@ -757,7 +936,7 @@ mod tests {
 
 	impl Persister {
 		fn new(data_dir: String) -> Self {
-			let filesystem_persister = FilesystemPersister::new(data_dir.clone());
+			let filesystem_persister = FilesystemPersister::new(data_dir);
 			Self { graph_error: None, graph_persistence_notifier: None, manager_error: None, scorer_error: None, filesystem_persister }
 		}
 
@@ -788,7 +967,10 @@ mod tests {
 
 			if key == "network_graph" {
 				if let Some(sender) = &self.graph_persistence_notifier {
-					sender.send(()).unwrap();
+					match sender.send(()) {
+						Ok(()) => {},
+						Err(std::sync::mpsc::SendError(())) => println!("Persister failed to notify as receiver went away."),
+					}
 				};
 
 				if let Some((error, message)) = self.graph_error {
@@ -812,10 +994,10 @@ mod tests {
 
 	#[derive(Debug)]
 	enum TestResult {
-		PaymentFailure { path: Vec<RouteHop>, short_channel_id: u64 },
-		PaymentSuccess { path: Vec<RouteHop> },
-		ProbeFailure { path: Vec<RouteHop> },
-		ProbeSuccess { path: Vec<RouteHop> },
+		PaymentFailure { path: Path, short_channel_id: u64 },
+		PaymentSuccess { path: Path },
+		ProbeFailure { path: Path },
+		ProbeSuccess { path: Path },
 	}
 
 	impl TestScorer {
@@ -824,7 +1006,7 @@ mod tests {
 		}
 
 		fn expect(&mut self, expectation: TestResult) {
-			self.event_expectations.get_or_insert_with(|| VecDeque::new()).push_back(expectation);
+			self.event_expectations.get_or_insert_with(VecDeque::new).push_back(expectation);
 		}
 	}
 
@@ -837,11 +1019,11 @@ mod tests {
 			&self, _short_channel_id: u64, _source: &NodeId, _target: &NodeId, _usage: ChannelUsage
 		) -> u64 { unimplemented!(); }
 
-		fn payment_path_failed(&mut self, actual_path: &[&RouteHop], actual_short_channel_id: u64) {
+		fn payment_path_failed(&mut self, actual_path: &Path, actual_short_channel_id: u64) {
 			if let Some(expectations) = &mut self.event_expectations {
 				match expectations.pop_front().unwrap() {
 					TestResult::PaymentFailure { path, short_channel_id } => {
-						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+						assert_eq!(actual_path, &path);
 						assert_eq!(actual_short_channel_id, short_channel_id);
 					},
 					TestResult::PaymentSuccess { path } => {
@@ -857,14 +1039,14 @@ mod tests {
 			}
 		}
 
-		fn payment_path_successful(&mut self, actual_path: &[&RouteHop]) {
+		fn payment_path_successful(&mut self, actual_path: &Path) {
 			if let Some(expectations) = &mut self.event_expectations {
 				match expectations.pop_front().unwrap() {
 					TestResult::PaymentFailure { path, .. } => {
 						panic!("Unexpected payment path failure: {:?}", path)
 					},
 					TestResult::PaymentSuccess { path } => {
-						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+						assert_eq!(actual_path, &path);
 					},
 					TestResult::ProbeFailure { path } => {
 						panic!("Unexpected probe failure: {:?}", path)
@@ -876,7 +1058,7 @@ mod tests {
 			}
 		}
 
-		fn probe_failed(&mut self, actual_path: &[&RouteHop], _: u64) {
+		fn probe_failed(&mut self, actual_path: &Path, _: u64) {
 			if let Some(expectations) = &mut self.event_expectations {
 				match expectations.pop_front().unwrap() {
 					TestResult::PaymentFailure { path, .. } => {
@@ -886,7 +1068,7 @@ mod tests {
 						panic!("Unexpected payment path success: {:?}", path)
 					},
 					TestResult::ProbeFailure { path } => {
-						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+						assert_eq!(actual_path, &path);
 					},
 					TestResult::ProbeSuccess { path } => {
 						panic!("Unexpected probe success: {:?}", path)
@@ -894,7 +1076,7 @@ mod tests {
 				}
 			}
 		}
-		fn probe_successful(&mut self, actual_path: &[&RouteHop]) {
+		fn probe_successful(&mut self, actual_path: &Path) {
 			if let Some(expectations) = &mut self.event_expectations {
 				match expectations.pop_front().unwrap() {
 					TestResult::PaymentFailure { path, .. } => {
@@ -907,7 +1089,7 @@ mod tests {
 						panic!("Unexpected probe failure: {:?}", path)
 					},
 					TestResult::ProbeSuccess { path } => {
-						assert_eq!(actual_path, &path.iter().collect::<Vec<_>>()[..]);
+						assert_eq!(actual_path, &path);
 					}
 				}
 			}
@@ -935,12 +1117,12 @@ mod tests {
 	}
 
 	fn create_nodes(num_nodes: usize, persist_dir: String) -> Vec<Node> {
+		let network = Network::Testnet;
 		let mut nodes = Vec::new();
 		for i in 0..num_nodes {
-			let tx_broadcaster = Arc::new(test_utils::TestBroadcaster{txn_broadcasted: Mutex::new(Vec::new()), blocks: Arc::new(Mutex::new(Vec::new()))});
+			let tx_broadcaster = Arc::new(test_utils::TestBroadcaster::new(network));
 			let fee_estimator = Arc::new(test_utils::TestFeeEstimator { sat_per_kw: Mutex::new(253) });
 			let logger = Arc::new(test_utils::TestLogger::with_id(format!("node {}", i)));
-			let network = Network::Testnet;
 			let genesis_block = genesis_block(network);
 			let network_graph = Arc::new(NetworkGraph::new(network, logger.clone()));
 			let scorer = Arc::new(Mutex::new(TestScorer::new()));
@@ -978,7 +1160,11 @@ mod tests {
 			let events = $node_a.node.get_and_clear_pending_events();
 			assert_eq!(events.len(), 1);
 			let (temporary_channel_id, tx) = handle_funding_generation_ready!(events[0], $channel_value);
-			end_open_channel!($node_a, $node_b, temporary_channel_id, tx);
+			$node_a.node.funding_transaction_generated(&temporary_channel_id, &$node_b.node.get_our_node_id(), tx.clone()).unwrap();
+			$node_b.node.handle_funding_created(&$node_a.node.get_our_node_id(), &get_event_msg!($node_a, MessageSendEvent::SendFundingCreated, $node_b.node.get_our_node_id()));
+			get_event!($node_b, Event::ChannelPending);
+			$node_a.node.handle_funding_signed(&$node_b.node.get_our_node_id(), &get_event_msg!($node_b, MessageSendEvent::SendFundingSigned, $node_a.node.get_our_node_id()));
+			get_event!($node_a, Event::ChannelPending);
 			tx
 		}}
 	}
@@ -1005,14 +1191,6 @@ mod tests {
 				},
 				_ => panic!("Unexpected event"),
 			}
-		}}
-	}
-
-	macro_rules! end_open_channel {
-		($node_a: expr, $node_b: expr, $temporary_channel_id: expr, $tx: expr) => {{
-			$node_a.node.funding_transaction_generated(&$temporary_channel_id, &$node_b.node.get_our_node_id(), $tx.clone()).unwrap();
-			$node_b.node.handle_funding_created(&$node_a.node.get_our_node_id(), &get_event_msg!($node_a, MessageSendEvent::SendFundingCreated, $node_b.node.get_our_node_id()));
-			$node_a.node.handle_funding_signed(&$node_b.node.get_our_node_id(), &get_event_msg!($node_b, MessageSendEvent::SendFundingSigned, $node_a.node.get_our_node_id()));
 		}}
 	}
 
@@ -1107,13 +1285,16 @@ mod tests {
 		let filepath = get_full_filepath("test_background_processor_persister_0".to_string(), "scorer".to_string());
 		check_persisted_data!(nodes[0].scorer, filepath.clone());
 
-		assert!(bg_processor.stop().is_ok());
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
 	}
 
 	#[test]
 	fn test_timer_tick_called() {
-		// Test that ChannelManager's and PeerManager's `timer_tick_occurred` is called every
-		// `FRESHNESS_TIMER`.
+		// Test that `ChannelManager::timer_tick_occurred` is called every `FRESHNESS_TIMER`,
+		// `ChainMonitor::rebroadcast_pending_claims` is called every `REBROADCAST_TIMER`, and
+		// `PeerManager::timer_tick_occurred` every `PING_TIMER`.
 		let nodes = create_nodes(1, "test_timer_tick_called".to_string());
 		let data_dir = nodes[0].persister.get_data_dir();
 		let persister = Arc::new(Persister::new(data_dir));
@@ -1121,15 +1302,19 @@ mod tests {
 		let bg_processor = BackgroundProcessor::start(persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(), nodes[0].no_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(), Some(nodes[0].scorer.clone()));
 		loop {
 			let log_entries = nodes[0].logger.lines.lock().unwrap();
-			let desired_log = "Calling ChannelManager's timer_tick_occurred".to_string();
-			let second_desired_log = "Calling PeerManager's timer_tick_occurred".to_string();
-			if log_entries.get(&("lightning_background_processor".to_string(), desired_log)).is_some() &&
-					log_entries.get(&("lightning_background_processor".to_string(), second_desired_log)).is_some() {
+			let desired_log_1 = "Calling ChannelManager's timer_tick_occurred".to_string();
+			let desired_log_2 = "Calling PeerManager's timer_tick_occurred".to_string();
+			let desired_log_3 = "Rebroadcasting monitor's pending claims".to_string();
+			if log_entries.get(&("lightning_background_processor".to_string(), desired_log_1)).is_some() &&
+				log_entries.get(&("lightning_background_processor".to_string(), desired_log_2)).is_some() &&
+				log_entries.get(&("lightning_background_processor".to_string(), desired_log_3)).is_some() {
 				break
 			}
 		}
 
-		assert!(bg_processor.stop().is_ok());
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
 	}
 
 	#[test]
@@ -1143,6 +1328,35 @@ mod tests {
 		let event_handler = |_: _| {};
 		let bg_processor = BackgroundProcessor::start(persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(), nodes[0].no_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(), Some(nodes[0].scorer.clone()));
 		match bg_processor.join() {
+			Ok(_) => panic!("Expected error persisting manager"),
+			Err(e) => {
+				assert_eq!(e.kind(), std::io::ErrorKind::Other);
+				assert_eq!(e.get_ref().unwrap().to_string(), "test");
+			},
+		}
+	}
+
+	#[tokio::test]
+	#[cfg(feature = "futures")]
+	async fn test_channel_manager_persist_error_async() {
+		// Test that if we encounter an error during manager persistence, the thread panics.
+		let nodes = create_nodes(2, "test_persist_error_sync".to_string());
+		open_channel!(nodes[0], nodes[1], 100000);
+
+		let data_dir = nodes[0].persister.get_data_dir();
+		let persister = Arc::new(Persister::new(data_dir).with_manager_error(std::io::ErrorKind::Other, "test"));
+
+		let bp_future = super::process_events_async(
+			persister, |_: _| {async {}}, nodes[0].chain_monitor.clone(), nodes[0].node.clone(),
+			nodes[0].rapid_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(),
+			Some(nodes[0].scorer.clone()), move |dur: Duration| {
+				Box::pin(async move {
+					tokio::time::sleep(dur).await;
+					false // Never exit
+				})
+			}, false,
+		);
+		match bp_future.await {
 			Ok(_) => panic!("Expected error persisting manager"),
 			Err(e) => {
 				assert_eq!(e.kind(), std::io::ErrorKind::Other);
@@ -1195,9 +1409,11 @@ mod tests {
 		let persister = Arc::new(Persister::new(data_dir.clone()));
 
 		// Set up a background event handler for FundingGenerationReady events.
-		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+		let (funding_generation_send, funding_generation_recv) = std::sync::mpsc::sync_channel(1);
+		let (channel_pending_send, channel_pending_recv) = std::sync::mpsc::sync_channel(1);
 		let event_handler = move |event: Event| match event {
-			Event::FundingGenerationReady { .. } => sender.send(handle_funding_generation_ready!(event, channel_value)).unwrap(),
+			Event::FundingGenerationReady { .. } => funding_generation_send.send(handle_funding_generation_ready!(event, channel_value)).unwrap(),
+			Event::ChannelPending { .. } => channel_pending_send.send(()).unwrap(),
 			Event::ChannelReady { .. } => {},
 			_ => panic!("Unexpected event: {:?}", event),
 		};
@@ -1206,10 +1422,15 @@ mod tests {
 
 		// Open a channel and check that the FundingGenerationReady event was handled.
 		begin_open_channel!(nodes[0], nodes[1], channel_value);
-		let (temporary_channel_id, funding_tx) = receiver
+		let (temporary_channel_id, funding_tx) = funding_generation_recv
 			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
 			.expect("FundingGenerationReady not handled within deadline");
-		end_open_channel!(nodes[0], nodes[1], temporary_channel_id, funding_tx);
+		nodes[0].node.funding_transaction_generated(&temporary_channel_id, &nodes[1].node.get_our_node_id(), funding_tx.clone()).unwrap();
+		nodes[1].node.handle_funding_created(&nodes[0].node.get_our_node_id(), &get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, nodes[1].node.get_our_node_id()));
+		get_event!(nodes[1], Event::ChannelPending);
+		nodes[0].node.handle_funding_signed(&nodes[1].node.get_our_node_id(), &get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, nodes[0].node.get_our_node_id()));
+		let _ = channel_pending_recv.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
+			.expect("ChannelPending not handled within deadline");
 
 		// Confirm the funding transaction.
 		confirm_transaction(&mut nodes[0], &funding_tx);
@@ -1221,12 +1442,14 @@ mod tests {
 		nodes[1].node.handle_channel_ready(&nodes[0].node.get_our_node_id(), &as_funding);
 		let _bs_channel_update = get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, nodes[0].node.get_our_node_id());
 
-		assert!(bg_processor.stop().is_ok());
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
 
 		// Set up a background event handler for SpendableOutputs events.
 		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 		let event_handler = move |event: Event| match event {
-			Event::SpendableOutputs { .. } => sender.send(event.clone()).unwrap(),
+			Event::SpendableOutputs { .. } => sender.send(event).unwrap(),
 			Event::ChannelReady { .. } => {},
 			Event::ChannelClosed { .. } => {},
 			_ => panic!("Unexpected event: {:?}", event),
@@ -1247,7 +1470,9 @@ mod tests {
 			_ => panic!("Unexpected event: {:?}", event),
 		}
 
-		assert!(bg_processor.stop().is_ok());
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
 	}
 
 	#[test]
@@ -1266,73 +1491,214 @@ mod tests {
 			}
 		}
 
-		assert!(bg_processor.stop().is_ok());
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
+		}
+	}
+
+	macro_rules! do_test_not_pruning_network_graph_until_graph_sync_completion {
+		($nodes: expr, $receive: expr, $sleep: expr) => {
+			let features = ChannelFeatures::empty();
+			$nodes[0].network_graph.add_channel_from_partial_announcement(
+				42, 53, features, $nodes[0].node.get_our_node_id(), $nodes[1].node.get_our_node_id()
+			).expect("Failed to update channel from partial announcement");
+			let original_graph_description = $nodes[0].network_graph.to_string();
+			assert!(original_graph_description.contains("42: features: 0000, node_one:"));
+			assert_eq!($nodes[0].network_graph.read_only().channels().len(), 1);
+
+			loop {
+				$sleep;
+				let log_entries = $nodes[0].logger.lines.lock().unwrap();
+				let loop_counter = "Calling ChannelManager's timer_tick_occurred".to_string();
+				if *log_entries.get(&("lightning_background_processor".to_string(), loop_counter))
+					.unwrap_or(&0) > 1
+				{
+					// Wait until the loop has gone around at least twice.
+					break
+				}
+			}
+
+			let initialization_input = vec![
+				76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
+				79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
+				0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
+				187, 172, 38, 46, 79, 247, 108, 44, 155, 48, 219, 238, 252, 53, 192, 6, 67, 2, 36, 125,
+				157, 176, 223, 175, 234, 116, 94, 248, 201, 225, 97, 235, 50, 47, 115, 172, 63, 136,
+				88, 216, 115, 11, 111, 217, 114, 84, 116, 124, 231, 107, 2, 158, 1, 242, 121, 152, 106,
+				204, 131, 186, 35, 93, 70, 216, 10, 237, 224, 183, 89, 95, 65, 3, 83, 185, 58, 138,
+				181, 64, 187, 103, 127, 68, 50, 2, 201, 19, 17, 138, 136, 149, 185, 226, 156, 137, 175,
+				110, 32, 237, 0, 217, 90, 31, 100, 228, 149, 46, 219, 175, 168, 77, 4, 143, 38, 128,
+				76, 97, 0, 0, 0, 2, 0, 0, 255, 8, 153, 192, 0, 2, 27, 0, 0, 0, 1, 0, 0, 255, 2, 68,
+				226, 0, 6, 11, 0, 1, 2, 3, 0, 0, 0, 2, 0, 40, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 3, 232,
+				0, 0, 0, 1, 0, 0, 0, 0, 58, 85, 116, 216, 255, 8, 153, 192, 0, 2, 27, 0, 0, 25, 0, 0,
+				0, 1, 0, 0, 0, 125, 255, 2, 68, 226, 0, 6, 11, 0, 1, 5, 0, 0, 0, 0, 29, 129, 25, 192,
+			];
+			$nodes[0].rapid_gossip_sync.update_network_graph_no_std(&initialization_input[..], Some(1642291930)).unwrap();
+
+			// this should have added two channels and pruned the previous one.
+			assert_eq!($nodes[0].network_graph.read_only().channels().len(), 2);
+
+			$receive.expect("Network graph not pruned within deadline");
+
+			// all channels should now be pruned
+			assert_eq!($nodes[0].network_graph.read_only().channels().len(), 0);
+		}
 	}
 
 	#[test]
 	fn test_not_pruning_network_graph_until_graph_sync_completion() {
+		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
 		let nodes = create_nodes(2, "test_not_pruning_network_graph_until_graph_sync_completion".to_string());
 		let data_dir = nodes[0].persister.get_data_dir();
-		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-		let persister = Arc::new(Persister::new(data_dir.clone()).with_graph_persistence_notifier(sender));
-		let network_graph = nodes[0].network_graph.clone();
-		let features = ChannelFeatures::empty();
-		network_graph.add_channel_from_partial_announcement(42, 53, features, nodes[0].node.get_our_node_id(), nodes[1].node.get_our_node_id())
-			.expect("Failed to update channel from partial announcement");
-		let original_graph_description = network_graph.to_string();
-		assert!(original_graph_description.contains("42: features: 0000, node_one:"));
-		assert_eq!(network_graph.read_only().channels().len(), 1);
+		let persister = Arc::new(Persister::new(data_dir).with_graph_persistence_notifier(sender));
 
 		let event_handler = |_: _| {};
 		let background_processor = BackgroundProcessor::start(persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(), nodes[0].rapid_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(), Some(nodes[0].scorer.clone()));
 
-		loop {
-			let log_entries = nodes[0].logger.lines.lock().unwrap();
-			let loop_counter = "Calling ChannelManager's timer_tick_occurred".to_string();
-			if *log_entries.get(&("lightning_background_processor".to_string(), loop_counter))
-				.unwrap_or(&0) > 1
-			{
-				// Wait until the loop has gone around at least twice.
-				break
-			}
-		}
-
-		let initialization_input = vec![
-			76, 68, 75, 1, 111, 226, 140, 10, 182, 241, 179, 114, 193, 166, 162, 70, 174, 99, 247,
-			79, 147, 30, 131, 101, 225, 90, 8, 156, 104, 214, 25, 0, 0, 0, 0, 0, 97, 227, 98, 218,
-			0, 0, 0, 4, 2, 22, 7, 207, 206, 25, 164, 197, 231, 230, 231, 56, 102, 61, 250, 251,
-			187, 172, 38, 46, 79, 247, 108, 44, 155, 48, 219, 238, 252, 53, 192, 6, 67, 2, 36, 125,
-			157, 176, 223, 175, 234, 116, 94, 248, 201, 225, 97, 235, 50, 47, 115, 172, 63, 136,
-			88, 216, 115, 11, 111, 217, 114, 84, 116, 124, 231, 107, 2, 158, 1, 242, 121, 152, 106,
-			204, 131, 186, 35, 93, 70, 216, 10, 237, 224, 183, 89, 95, 65, 3, 83, 185, 58, 138,
-			181, 64, 187, 103, 127, 68, 50, 2, 201, 19, 17, 138, 136, 149, 185, 226, 156, 137, 175,
-			110, 32, 237, 0, 217, 90, 31, 100, 228, 149, 46, 219, 175, 168, 77, 4, 143, 38, 128,
-			76, 97, 0, 0, 0, 2, 0, 0, 255, 8, 153, 192, 0, 2, 27, 0, 0, 0, 1, 0, 0, 255, 2, 68,
-			226, 0, 6, 11, 0, 1, 2, 3, 0, 0, 0, 2, 0, 40, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 3, 232,
-			0, 0, 0, 1, 0, 0, 0, 0, 58, 85, 116, 216, 255, 8, 153, 192, 0, 2, 27, 0, 0, 25, 0, 0,
-			0, 1, 0, 0, 0, 125, 255, 2, 68, 226, 0, 6, 11, 0, 1, 5, 0, 0, 0, 0, 29, 129, 25, 192,
-		];
-		nodes[0].rapid_gossip_sync.update_network_graph_no_std(&initialization_input[..], Some(1642291930)).unwrap();
-
-		// this should have added two channels
-		assert_eq!(network_graph.read_only().channels().len(), 3);
-
-		let _ = receiver
-			.recv_timeout(Duration::from_secs(super::FIRST_NETWORK_PRUNE_TIMER * 5))
-			.expect("Network graph not pruned within deadline");
+		do_test_not_pruning_network_graph_until_graph_sync_completion!(nodes,
+			receiver.recv_timeout(Duration::from_secs(super::FIRST_NETWORK_PRUNE_TIMER * 5)),
+			std::thread::sleep(Duration::from_millis(1)));
 
 		background_processor.stop().unwrap();
+	}
 
-		// all channels should now be pruned
-		assert_eq!(network_graph.read_only().channels().len(), 0);
+	#[tokio::test]
+	#[cfg(feature = "futures")]
+	async fn test_not_pruning_network_graph_until_graph_sync_completion_async() {
+		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+		let nodes = create_nodes(2, "test_not_pruning_network_graph_until_graph_sync_completion_async".to_string());
+		let data_dir = nodes[0].persister.get_data_dir();
+		let persister = Arc::new(Persister::new(data_dir).with_graph_persistence_notifier(sender));
+
+		let (exit_sender, exit_receiver) = tokio::sync::watch::channel(());
+		let bp_future = super::process_events_async(
+			persister, |_: _| {async {}}, nodes[0].chain_monitor.clone(), nodes[0].node.clone(),
+			nodes[0].rapid_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(),
+			Some(nodes[0].scorer.clone()), move |dur: Duration| {
+				let mut exit_receiver = exit_receiver.clone();
+				Box::pin(async move {
+					tokio::select! {
+						_ = tokio::time::sleep(dur) => false,
+						_ = exit_receiver.changed() => true,
+					}
+				})
+			}, false,
+		);
+
+		let t1 = tokio::spawn(bp_future);
+		let t2 = tokio::spawn(async move {
+			do_test_not_pruning_network_graph_until_graph_sync_completion!(nodes, {
+				let mut i = 0;
+				loop {
+					tokio::time::sleep(Duration::from_secs(super::FIRST_NETWORK_PRUNE_TIMER)).await;
+					if let Ok(()) = receiver.try_recv() { break Ok::<(), ()>(()); }
+					assert!(i < 5);
+					i += 1;
+				}
+			}, tokio::time::sleep(Duration::from_millis(1)).await);
+			exit_sender.send(()).unwrap();
+		});
+		let (r1, r2) = tokio::join!(t1, t2);
+		r1.unwrap().unwrap();
+		r2.unwrap()
+	}
+
+	macro_rules! do_test_payment_path_scoring {
+		($nodes: expr, $receive: expr) => {
+			// Ensure that we update the scorer when relevant events are processed. In this case, we ensure
+			// that we update the scorer upon a payment path succeeding (note that the channel must be
+			// public or else we won't score it).
+			// A background event handler for FundingGenerationReady events must be hooked up to a
+			// running background processor.
+			let scored_scid = 4242;
+			let secp_ctx = Secp256k1::new();
+			let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+			let node_1_id = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+
+			let path = Path { hops: vec![RouteHop {
+				pubkey: node_1_id,
+				node_features: NodeFeatures::empty(),
+				short_channel_id: scored_scid,
+				channel_features: ChannelFeatures::empty(),
+				fee_msat: 0,
+				cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA as u32,
+			}], blinded_tail: None };
+
+			$nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentFailure { path: path.clone(), short_channel_id: scored_scid });
+			$nodes[0].node.push_pending_event(Event::PaymentPathFailed {
+				payment_id: None,
+				payment_hash: PaymentHash([42; 32]),
+				payment_failed_permanently: false,
+				failure: PathFailure::OnPath { network_update: None },
+				path: path.clone(),
+				short_channel_id: Some(scored_scid),
+			});
+			let event = $receive.expect("PaymentPathFailed not handled within deadline");
+			match event {
+				Event::PaymentPathFailed { .. } => {},
+				_ => panic!("Unexpected event"),
+			}
+
+			// Ensure we'll score payments that were explicitly failed back by the destination as
+			// ProbeSuccess.
+			$nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
+			$nodes[0].node.push_pending_event(Event::PaymentPathFailed {
+				payment_id: None,
+				payment_hash: PaymentHash([42; 32]),
+				payment_failed_permanently: true,
+				failure: PathFailure::OnPath { network_update: None },
+				path: path.clone(),
+				short_channel_id: None,
+			});
+			let event = $receive.expect("PaymentPathFailed not handled within deadline");
+			match event {
+				Event::PaymentPathFailed { .. } => {},
+				_ => panic!("Unexpected event"),
+			}
+
+			$nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentSuccess { path: path.clone() });
+			$nodes[0].node.push_pending_event(Event::PaymentPathSuccessful {
+				payment_id: PaymentId([42; 32]),
+				payment_hash: None,
+				path: path.clone(),
+			});
+			let event = $receive.expect("PaymentPathSuccessful not handled within deadline");
+			match event {
+				Event::PaymentPathSuccessful { .. } => {},
+				_ => panic!("Unexpected event"),
+			}
+
+			$nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
+			$nodes[0].node.push_pending_event(Event::ProbeSuccessful {
+				payment_id: PaymentId([42; 32]),
+				payment_hash: PaymentHash([42; 32]),
+				path: path.clone(),
+			});
+			let event = $receive.expect("ProbeSuccessful not handled within deadline");
+			match event {
+				Event::ProbeSuccessful  { .. } => {},
+				_ => panic!("Unexpected event"),
+			}
+
+			$nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeFailure { path: path.clone() });
+			$nodes[0].node.push_pending_event(Event::ProbeFailed {
+				payment_id: PaymentId([42; 32]),
+				payment_hash: PaymentHash([42; 32]),
+				path,
+				short_channel_id: Some(scored_scid),
+			});
+			let event = $receive.expect("ProbeFailure not handled within deadline");
+			match event {
+				Event::ProbeFailed { .. } => {},
+				_ => panic!("Unexpected event"),
+			}
+		}
 	}
 
 	#[test]
 	fn test_payment_path_scoring() {
-		// Ensure that we update the scorer when relevant events are processed. In this case, we ensure
-		// that we update the scorer upon a payment path succeeding (note that the channel must be
-		// public or else we won't score it).
-		// Set up a background event handler for FundingGenerationReady events.
 		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 		let event_handler = move |event: Event| match event {
 			Event::PaymentPathFailed { .. } => sender.send(event).unwrap(),
@@ -1344,104 +1710,60 @@ mod tests {
 
 		let nodes = create_nodes(1, "test_payment_path_scoring".to_string());
 		let data_dir = nodes[0].persister.get_data_dir();
-		let persister = Arc::new(Persister::new(data_dir.clone()));
+		let persister = Arc::new(Persister::new(data_dir));
 		let bg_processor = BackgroundProcessor::start(persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(), nodes[0].no_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(), Some(nodes[0].scorer.clone()));
 
-		let scored_scid = 4242;
-		let secp_ctx = Secp256k1::new();
-		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
-		let node_1_id = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		do_test_payment_path_scoring!(nodes, receiver.recv_timeout(Duration::from_secs(EVENT_DEADLINE)));
 
-		let path = vec![RouteHop {
-			pubkey: node_1_id,
-			node_features: NodeFeatures::empty(),
-			short_channel_id: scored_scid,
-			channel_features: ChannelFeatures::empty(),
-			fee_msat: 0,
-			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA as u32,
-		}];
-
-		nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentFailure { path: path.clone(), short_channel_id: scored_scid });
-		nodes[0].node.push_pending_event(Event::PaymentPathFailed {
-			payment_id: None,
-			payment_hash: PaymentHash([42; 32]),
-			payment_failed_permanently: false,
-			failure: PathFailure::OnPath { network_update: None },
-			path: path.clone(),
-			short_channel_id: Some(scored_scid),
-			retry: None,
-		});
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("PaymentPathFailed not handled within deadline");
-		match event {
-			Event::PaymentPathFailed { .. } => {},
-			_ => panic!("Unexpected event"),
+		if !std::thread::panicking() {
+			bg_processor.stop().unwrap();
 		}
+	}
 
-		// Ensure we'll score payments that were explicitly failed back by the destination as
-		// ProbeSuccess.
-		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
-		nodes[0].node.push_pending_event(Event::PaymentPathFailed {
-			payment_id: None,
-			payment_hash: PaymentHash([42; 32]),
-			payment_failed_permanently: true,
-			failure: PathFailure::OnPath { network_update: None },
-			path: path.clone(),
-			short_channel_id: None,
-			retry: None,
+	#[tokio::test]
+	#[cfg(feature = "futures")]
+	async fn test_payment_path_scoring_async() {
+		let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+		let event_handler = move |event: Event| {
+			let sender_ref = sender.clone();
+			async move {
+				match event {
+					Event::PaymentPathFailed { .. } => { sender_ref.send(event).await.unwrap() },
+					Event::PaymentPathSuccessful { .. } => { sender_ref.send(event).await.unwrap() },
+					Event::ProbeSuccessful { .. } => { sender_ref.send(event).await.unwrap() },
+					Event::ProbeFailed { .. } => { sender_ref.send(event).await.unwrap() },
+					_ => panic!("Unexpected event: {:?}", event),
+				}
+			}
+		};
+
+		let nodes = create_nodes(1, "test_payment_path_scoring_async".to_string());
+		let data_dir = nodes[0].persister.get_data_dir();
+		let persister = Arc::new(Persister::new(data_dir));
+
+		let (exit_sender, exit_receiver) = tokio::sync::watch::channel(());
+
+		let bp_future = super::process_events_async(
+			persister, event_handler, nodes[0].chain_monitor.clone(), nodes[0].node.clone(),
+			nodes[0].no_gossip_sync(), nodes[0].peer_manager.clone(), nodes[0].logger.clone(),
+			Some(nodes[0].scorer.clone()), move |dur: Duration| {
+				let mut exit_receiver = exit_receiver.clone();
+				Box::pin(async move {
+					tokio::select! {
+						_ = tokio::time::sleep(dur) => false,
+						_ = exit_receiver.changed() => true,
+					}
+				})
+			}, false,
+		);
+		let t1 = tokio::spawn(bp_future);
+		let t2 = tokio::spawn(async move {
+			do_test_payment_path_scoring!(nodes, receiver.recv().await);
+			exit_sender.send(()).unwrap();
 		});
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("PaymentPathFailed not handled within deadline");
-		match event {
-			Event::PaymentPathFailed { .. } => {},
-			_ => panic!("Unexpected event"),
-		}
 
-		nodes[0].scorer.lock().unwrap().expect(TestResult::PaymentSuccess { path: path.clone() });
-		nodes[0].node.push_pending_event(Event::PaymentPathSuccessful {
-			payment_id: PaymentId([42; 32]),
-			payment_hash: None,
-			path: path.clone(),
-		});
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("PaymentPathSuccessful not handled within deadline");
-		match event {
-			Event::PaymentPathSuccessful { .. } => {},
-			_ => panic!("Unexpected event"),
-		}
-
-		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeSuccess { path: path.clone() });
-		nodes[0].node.push_pending_event(Event::ProbeSuccessful {
-			payment_id: PaymentId([42; 32]),
-			payment_hash: PaymentHash([42; 32]),
-			path: path.clone(),
-		});
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("ProbeSuccessful not handled within deadline");
-		match event {
-			Event::ProbeSuccessful  { .. } => {},
-			_ => panic!("Unexpected event"),
-		}
-
-		nodes[0].scorer.lock().unwrap().expect(TestResult::ProbeFailure { path: path.clone() });
-		nodes[0].node.push_pending_event(Event::ProbeFailed {
-			payment_id: PaymentId([42; 32]),
-			payment_hash: PaymentHash([42; 32]),
-			path: path.clone(),
-			short_channel_id: Some(scored_scid),
-		});
-		let event = receiver
-			.recv_timeout(Duration::from_secs(EVENT_DEADLINE))
-			.expect("ProbeFailure not handled within deadline");
-		match event {
-			Event::ProbeFailed { .. } => {},
-			_ => panic!("Unexpected event"),
-		}
-
-		assert!(bg_processor.stop().is_ok());
+		let (r1, r2) = tokio::join!(t1, t2);
+		r1.unwrap().unwrap();
+		r2.unwrap()
 	}
 }

@@ -47,7 +47,7 @@ impl<'a, W: WriteBase32> BytesToBase32<'a, W> {
 			self.writer.write_u5(
 				u5::try_from_u8((self.buffer & 0b11111000) >> 3 ).expect("<32")
 			)?;
-			self.buffer = self.buffer << 5;
+			self.buffer <<= 5;
 			self.buffer_bits -= 5;
 		}
 
@@ -58,7 +58,7 @@ impl<'a, W: WriteBase32> BytesToBase32<'a, W> {
 
 		self.writer.write_u5(u5::try_from_u8(from_buffer | from_byte).expect("<32"))?;
 		self.buffer = byte << (5 - self.buffer_bits);
-		self.buffer_bits = 3 + self.buffer_bits;
+		self.buffer_bits += 3;
 
 		Ok(())
 	}
@@ -75,7 +75,7 @@ impl<'a, W: WriteBase32> BytesToBase32<'a, W> {
 			self.writer.write_u5(
 				u5::try_from_u8((self.buffer & 0b11111000) >> 3).expect("<32")
 			)?;
-			self.buffer = self.buffer << 5;
+			self.buffer <<= 5;
 			self.buffer_bits -= 5;
 		}
 
@@ -124,7 +124,7 @@ impl Display for SignedRawInvoice {
 	}
 }
 
-/// (C-not exported)
+/// This is not exported to bindings users
 impl Display for RawHrp {
 	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
 		let amount = match self.raw_amount {
@@ -329,7 +329,7 @@ impl ToBase32 for Fallback {
 	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
 		match *self {
 			Fallback::SegWitProgram {version: v, program: ref p} => {
-				writer.write_u5(v)?;
+				writer.write_u5(Into::<u5>::into(v))?;
 				p.write_base32(writer)
 			},
 			Fallback::PubKeyHash(ref hash) => {
@@ -469,6 +469,9 @@ impl ToBase32 for TaggedField {
 			},
 			TaggedField::PaymentSecret(ref payment_secret) => {
 				  write_tagged_field(writer, constants::TAG_PAYMENT_SECRET, payment_secret)
+			},
+			TaggedField::PaymentMetadata(ref payment_metadata) => {
+				  write_tagged_field(writer, constants::TAG_PAYMENT_METADATA, payment_metadata)
 			},
 			TaggedField::Features(ref features) => {
 				write_tagged_field(writer, constants::TAG_FEATURES, features)

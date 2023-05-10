@@ -13,14 +13,14 @@
 
 use crate::chain::ChannelMonitorUpdateStatus;
 use crate::chain::keysinterface::NodeSigner;
-use crate::ln::channelmanager::{ChannelManager, MIN_CLTV_EXPIRY_DELTA, PaymentId};
+use crate::events::{ClosureReason, Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
+use crate::ln::channelmanager::{ChannelManager, MIN_CLTV_EXPIRY_DELTA, PaymentId, RecipientOnionFields};
 use crate::routing::gossip::RoutingFees;
 use crate::routing::router::{PaymentParameters, RouteHint, RouteHintHop};
 use crate::ln::features::ChannelTypeFeatures;
 use crate::ln::msgs;
 use crate::ln::msgs::{ChannelMessageHandler, RoutingMessageHandler, ChannelUpdate, ErrorAction};
 use crate::ln::wire::Encode;
-use crate::util::events::{ClosureReason, Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
 use crate::util::config::UserConfig;
 use crate::util::ser::Writeable;
 use crate::util::test_utils;
@@ -71,7 +71,8 @@ fn test_priv_forwarding_rejection() {
 		.with_route_hints(last_hops);
 	let (route, our_payment_hash, our_payment_preimage, our_payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 10_000, TEST_FINAL_CLTV);
 
-	nodes[0].node.send_payment(&route, our_payment_hash, &Some(our_payment_secret), PaymentId(our_payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, our_payment_hash,
+		RecipientOnionFields::secret_only(our_payment_secret), PaymentId(our_payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let payment_event = SendEvent::from_event(nodes[0].node.get_and_clear_pending_msg_events().remove(0));
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &payment_event.msgs[0]);
@@ -118,7 +119,8 @@ fn test_priv_forwarding_rejection() {
 	get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, nodes[2].node.get_our_node_id());
 	get_event_msg!(nodes[2], MessageSendEvent::SendChannelUpdate, nodes[1].node.get_our_node_id());
 
-	nodes[0].node.send_payment(&route, our_payment_hash, &Some(our_payment_secret), PaymentId(our_payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, our_payment_hash,
+		RecipientOnionFields::secret_only(our_payment_secret), PaymentId(our_payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 10_000, our_payment_hash, our_payment_secret);
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], our_payment_preimage);
@@ -237,8 +239,9 @@ fn test_routed_scid_alias() {
 		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 100_000, 42);
-	assert_eq!(route.paths[0][1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	assert_eq!(route.paths[0].hops[1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 100_000, payment_hash, payment_secret);
@@ -285,7 +288,7 @@ fn test_scid_privacy_on_pub_channel() {
 	assert_eq!(open_channel.channel_flags & 1, 1); // The `announce_channel` bit is set.
 
 	nodes[1].node.handle_open_channel(&nodes[0].node.get_our_node_id(), &open_channel);
-	let err = get_err_msg!(nodes[1], nodes[0].node.get_our_node_id());
+	let err = get_err_msg(&nodes[1], &nodes[0].node.get_our_node_id());
 	assert_eq!(err.data, "SCID Alias/Privacy Channel Type cannot be set on a public channel");
 }
 
@@ -362,7 +365,10 @@ fn test_inbound_scid_privacy() {
 	check_added_monitors!(nodes[2], 1);
 
 	let cs_funding_signed = get_event_msg!(nodes[2], MessageSendEvent::SendFundingSigned, nodes[1].node.get_our_node_id());
+	expect_channel_pending_event(&nodes[2], &nodes[1].node.get_our_node_id());
+
 	nodes[1].node.handle_funding_signed(&nodes[2].node.get_our_node_id(), &cs_funding_signed);
+	expect_channel_pending_event(&nodes[1], &nodes[2].node.get_our_node_id());
 	check_added_monitors!(nodes[1], 1);
 
 	let conf_height = core::cmp::max(nodes[1].best_block_info().1 + 1, nodes[2].best_block_info().1 + 1);
@@ -399,8 +405,9 @@ fn test_inbound_scid_privacy() {
 		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints.clone());
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 100_000, 42);
-	assert_eq!(route.paths[0][1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	assert_eq!(route.paths[0].hops[1].short_channel_id, last_hop[0].inbound_scid_alias.unwrap());
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 100_000, payment_hash, payment_secret);
@@ -414,8 +421,9 @@ fn test_inbound_scid_privacy() {
 		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (route_2, payment_hash_2, _, payment_secret_2) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params_2, 100_000, 42);
-	assert_eq!(route_2.paths[0][1].short_channel_id, last_hop[0].short_channel_id.unwrap());
-	nodes[0].node.send_payment(&route_2, payment_hash_2, &Some(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
+	assert_eq!(route_2.paths[0].hops[1].short_channel_id, last_hop[0].short_channel_id.unwrap());
+	nodes[0].node.send_payment_with_route(&route_2, payment_hash_2,
+		RecipientOnionFields::secret_only(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let payment_event = SendEvent::from_node(&nodes[0]);
@@ -423,7 +431,7 @@ fn test_inbound_scid_privacy() {
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &payment_event.msgs[0]);
 	commitment_signed_dance!(nodes[1], nodes[0], payment_event.commitment_msg, true, true);
 
-	nodes[1].logger.assert_log_regex("lightning::ln::channelmanager".to_string(), regex::Regex::new(r"Refusing to forward over real channel SCID as our counterparty requested").unwrap(), 1);
+	nodes[1].logger.assert_log_regex("lightning::ln::channelmanager", regex::Regex::new(r"Refusing to forward over real channel SCID as our counterparty requested").unwrap(), 1);
 
 	let mut updates = get_htlc_update_msgs!(nodes[1], nodes[0].node.get_our_node_id());
 	nodes[0].node.handle_update_fail_htlc(&nodes[1].node.get_our_node_id(), &updates.update_fail_htlcs[0]);
@@ -465,12 +473,13 @@ fn test_scid_alias_returned() {
 		.with_features(nodes[2].node.invoice_features())
 		.with_route_hints(hop_hints);
 	let (mut route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 10_000, 42);
-	assert_eq!(route.paths[0][1].short_channel_id, nodes[2].node.list_usable_channels()[0].inbound_scid_alias.unwrap());
+	assert_eq!(route.paths[0].hops[1].short_channel_id, nodes[2].node.list_usable_channels()[0].inbound_scid_alias.unwrap());
 
-	route.paths[0][1].fee_msat = 10_000_000; // Overshoot the last channel's value
+	route.paths[0].hops[1].fee_msat = 10_000_000; // Overshoot the last channel's value
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let as_updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &as_updates.update_add_htlcs[0]);
@@ -509,11 +518,12 @@ fn test_scid_alias_returned() {
 		PaymentFailedConditions::new().blamed_scid(last_hop[0].inbound_scid_alias.unwrap())
 			.blamed_chan_closed(false).expected_htlc_error_data(0x1000|7, &err_data));
 
-	route.paths[0][1].fee_msat = 10_000; // Reset to the correct payment amount
-	route.paths[0][0].fee_msat = 0; // But set fee paid to the middle hop to 0
+	route.paths[0].hops[1].fee_msat = 10_000; // Reset to the correct payment amount
+	route.paths[0].hops[0].fee_msat = 0; // But set fee paid to the middle hop to 0
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let as_updates = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &as_updates.update_add_htlcs[0]);
@@ -599,6 +609,7 @@ fn test_0conf_channel_with_async_monitor() {
 
 	let channel_id = funding_output.to_channel_id();
 	nodes[1].chain_monitor.complete_sole_pending_chan_update(&channel_id);
+	expect_channel_pending_event(&nodes[1], &nodes[0].node.get_our_node_id());
 
 	let bs_signed_locked = nodes[1].node.get_and_clear_pending_msg_events();
 	assert_eq!(bs_signed_locked.len(), 2);
@@ -624,6 +635,22 @@ fn test_0conf_channel_with_async_monitor() {
 
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 	nodes[0].chain_monitor.complete_sole_pending_chan_update(&channel_id);
+
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 2);
+	match events[0] {
+		crate::events::Event::ChannelPending { ref counterparty_node_id, .. } => {
+			assert_eq!(nodes[1].node.get_our_node_id(), *counterparty_node_id);
+		},
+		_ => panic!("Unexpected event"),
+	}
+	match events[1] {
+		crate::events::Event::ChannelReady { ref counterparty_node_id, .. } => {
+			assert_eq!(nodes[1].node.get_our_node_id(), *counterparty_node_id);
+		},
+		_ => panic!("Unexpected event"),
+	}
+
 	let as_locked_update = nodes[0].node.get_and_clear_pending_msg_events();
 
 	// Note that the funding transaction is actually released when
@@ -638,7 +665,6 @@ fn test_0conf_channel_with_async_monitor() {
 		}
 		_ => panic!("Unexpected event"),
 	}
-	expect_channel_ready_event(&nodes[0], &nodes[1].node.get_our_node_id());
 	expect_channel_ready_event(&nodes[1], &nodes[0].node.get_our_node_id());
 
 	let bs_channel_update = get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, nodes[0].node.get_our_node_id());
@@ -666,7 +692,8 @@ fn test_0conf_channel_with_async_monitor() {
 	// failure before we've ever confirmed the funding transaction. This previously caused a panic.
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], 1_000_000);
 
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let as_send = SendEvent::from_node(&nodes[0]);
@@ -728,7 +755,7 @@ fn test_0conf_close_no_early_chan_update() {
 	nodes[0].node.force_close_all_channels_broadcasting_latest_txn();
 	check_added_monitors!(nodes[0], 1);
 	check_closed_event!(&nodes[0], 1, ClosureReason::HolderForceClosed);
-	let _ = get_err_msg!(nodes[0], nodes[1].node.get_our_node_id());
+	let _ = get_err_msg(&nodes[0], &nodes[1].node.get_our_node_id());
 }
 
 #[test]
@@ -812,7 +839,7 @@ fn test_0conf_channel_reorg() {
 	assert_eq!(nodes[1].node.list_usable_channels()[0].short_channel_id.unwrap(), real_scid);
 
 	let (mut route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], 10_000);
-	assert_eq!(route.paths[0][0].short_channel_id, real_scid);
+	assert_eq!(route.paths[0].hops[0].short_channel_id, real_scid);
 	send_along_route_with_secret(&nodes[0], route, &[&[&nodes[1]]], 10_000, payment_hash, payment_secret);
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage);
 

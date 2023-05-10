@@ -39,7 +39,7 @@ use core::time::Duration;
 ///
 /// `invoice_expiry_delta_secs` describes the number of seconds that the invoice is valid for
 /// in excess of the current time.
-/// 
+///
 /// `duration_since_epoch` is the current time since epoch in seconds.
 ///
 /// You can specify a custom `min_final_cltv_expiry_delta`, or let LDK default it to
@@ -57,7 +57,7 @@ use core::time::Duration;
 /// [`ChannelManager::create_inbound_payment_for_hash`]: lightning::ln::channelmanager::ChannelManager::create_inbound_payment_for_hash
 /// [`PhantomRouteHints::channels`]: lightning::ln::channelmanager::PhantomRouteHints::channels
 /// [`MIN_FINAL_CLTV_EXPIRY_DETLA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
-/// 
+///
 /// This can be used in a `no_std` environment, where [`std::time::SystemTime`] is not
 /// available and the current time is supplied by the caller.
 pub fn create_phantom_invoice<ES: Deref, NS: Deref, L: Deref>(
@@ -99,7 +99,7 @@ where
 ///
 /// `invoice_expiry_delta_secs` describes the number of seconds that the invoice is valid for
 /// in excess of the current time.
-/// 
+///
 /// `duration_since_epoch` is the current time since epoch in seconds.
 ///
 /// Note that the provided `keys_manager`'s `NodeSigner` implementation must support phantom
@@ -111,7 +111,7 @@ where
 /// [`ChannelManager::create_inbound_payment`]: lightning::ln::channelmanager::ChannelManager::create_inbound_payment
 /// [`ChannelManager::create_inbound_payment_for_hash`]: lightning::ln::channelmanager::ChannelManager::create_inbound_payment_for_hash
 /// [`PhantomRouteHints::channels`]: lightning::ln::channelmanager::PhantomRouteHints::channels
-/// 
+///
 /// This can be used in a `no_std` environment, where [`std::time::SystemTime`] is not
 /// available and the current time is supplied by the caller.
 pub fn create_phantom_invoice_with_description_hash<ES: Deref, NS: Deref, L: Deref>(
@@ -142,7 +142,7 @@ where
 	L::Target: Logger,
 {
 
-	if phantom_route_hints.len() == 0 {
+	if phantom_route_hints.is_empty() {
 		return Err(SignOrCreationError::CreationError(
 			CreationError::MissingRouteHints,
 		));
@@ -519,8 +519,10 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 /// * Always select the channel with the highest inbound capacity per counterparty node
 /// * Prefer channels with capacity at least `min_inbound_capacity_msat` and where the channel
 ///   `is_usable` (i.e. the peer is connected).
-/// * If any public channel exists, the returned `RouteHint`s will be empty, and the sender will
-///   need to find the path by looking at the public channels instead
+/// * If any public channel exists, only public [`RouteHint`]s will be returned.
+/// * If any public, announced, channel exists (i.e. a channel with 7+ confs, to ensure the
+///   announcement has had a chance to propagate), no [`RouteHint`]s will be returned, as the
+///   sender is expected to find the path by looking at the public channels instead.
 fn filter_channels<L: Deref>(
 	channels: Vec<ChannelDetails>, min_inbound_capacity_msat: Option<u64>, logger: &L
 ) -> Vec<RouteHint> where L::Target: Logger {
@@ -529,6 +531,7 @@ fn filter_channels<L: Deref>(
 	let mut min_capacity_channel_exists = false;
 	let mut online_channel_exists = false;
 	let mut online_min_capacity_channel_exists = false;
+	let mut has_pub_unconf_chan = false;
 
 	log_trace!(logger, "Considering {} channels for invoice route hints", channels.len());
 	for channel in channels.into_iter().filter(|chan| chan.is_channel_ready) {
@@ -538,11 +541,18 @@ fn filter_channels<L: Deref>(
 		}
 
 		if channel.is_public {
-			// If any public channel exists, return no hints and let the sender
-			// look at the public channels instead.
-			log_trace!(logger, "Not including channels in invoice route hints on account of public channel {}",
-				log_bytes!(channel.channel_id));
-			return vec![]
+			if channel.confirmations.is_some() && channel.confirmations < Some(7) {
+				// If we have a public channel, but it doesn't have enough confirmations to (yet)
+				// be in the public network graph (and have gotten a chance to propagate), include
+				// route hints but only for public channels to protect private channel privacy.
+				has_pub_unconf_chan = true;
+			} else {
+				// If any public channel exists, return no hints and let the sender
+				// look at the public channels instead.
+				log_trace!(logger, "Not including channels in invoice route hints on account of public channel {}",
+					log_bytes!(channel.channel_id));
+				return vec![]
+			}
 		}
 
 		if channel.inbound_capacity_msat >= min_inbound_capacity {
@@ -556,30 +566,40 @@ fn filter_channels<L: Deref>(
 			}
 		}
 
-		if channel.is_usable {
-			if !online_channel_exists {
-				log_trace!(logger, "Channel with connected peer exists for invoice route hints");
-				online_channel_exists = true;
-			}
+		if channel.is_usable && !online_channel_exists {
+			log_trace!(logger, "Channel with connected peer exists for invoice route hints");
+			online_channel_exists = true;
 		}
 
 		match filtered_channels.entry(channel.counterparty.node_id) {
 			hash_map::Entry::Occupied(mut entry) => {
 				let current_max_capacity = entry.get().inbound_capacity_msat;
-				if channel.inbound_capacity_msat < current_max_capacity {
+				// If this channel is public and the previous channel is not, ensure we replace the
+				// previous channel to avoid announcing non-public channels.
+				let new_now_public = channel.is_public && !entry.get().is_public;
+				// If the public-ness of the channel has not changed (in which case simply defer to
+				// `new_now_public), and this channel has a greater capacity, prefer to announce
+				// this channel.
+				let new_higher_capacity = channel.is_public == entry.get().is_public &&
+					channel.inbound_capacity_msat > current_max_capacity;
+				if new_now_public || new_higher_capacity {
 					log_trace!(logger,
-						"Preferring counterparty {} channel {} ({} msats) over {} ({} msats) for invoice route hints",
+						"Preferring counterparty {} channel {} (SCID {:?}, {} msats) over {} (SCID {:?}, {} msats) for invoice route hints",
 						log_pubkey!(channel.counterparty.node_id),
-						log_bytes!(entry.get().channel_id), current_max_capacity,
-						log_bytes!(channel.channel_id), channel.inbound_capacity_msat);
-					continue;
+						log_bytes!(channel.channel_id), channel.short_channel_id,
+						channel.inbound_capacity_msat,
+						log_bytes!(entry.get().channel_id), entry.get().short_channel_id,
+						current_max_capacity);
+					entry.insert(channel);
+				} else {
+					log_trace!(logger,
+						"Preferring counterparty {} channel {} (SCID {:?}, {} msats) over {} (SCID {:?}, {} msats) for invoice route hints",
+						log_pubkey!(channel.counterparty.node_id),
+						log_bytes!(entry.get().channel_id), entry.get().short_channel_id,
+						current_max_capacity,
+						log_bytes!(channel.channel_id), channel.short_channel_id,
+						channel.inbound_capacity_msat);
 				}
-				log_trace!(logger,
-					"Preferring counterparty {} channel {} ({} msats) over {} ({} msats) for invoice route hints",
-					log_pubkey!(channel.counterparty.node_id),
-					log_bytes!(channel.channel_id), channel.inbound_capacity_msat,
-					log_bytes!(entry.get().channel_id), current_max_capacity);
-				entry.insert(channel);
 			}
 			hash_map::Entry::Vacant(entry) => {
 				entry.insert(channel);
@@ -609,7 +629,12 @@ fn filter_channels<L: Deref>(
 		.map(|(_, channel)| channel)
 		.filter(|channel| {
 			let has_enough_capacity = channel.inbound_capacity_msat >= min_inbound_capacity;
-			let include_channel = if online_min_capacity_channel_exists {
+			let include_channel = if has_pub_unconf_chan {
+				// If we have a public channel, but it doesn't have enough confirmations to (yet)
+				// be in the public network graph (and have gotten a chance to propagate), include
+				// route hints but only for public channels to protect private channel privacy.
+				channel.is_public
+			} else if online_min_capacity_channel_exists {
 				has_enough_capacity && channel.is_usable
 			} else if min_capacity_channel_exists && online_channel_exists {
 				// If there are some online channels and some min_capacity channels, but no
@@ -629,7 +654,7 @@ fn filter_channels<L: Deref>(
 				log_trace!(logger, "Ignoring channel {} without enough capacity for invoice route hints",
 					log_bytes!(channel.channel_id));
 			} else {
-				debug_assert!(!channel.is_usable);
+				debug_assert!(!channel.is_usable || (has_pub_unconf_chan && !channel.is_public));
 				log_trace!(logger, "Ignoring channel {} with disconnected peer",
 					log_bytes!(channel.channel_id));
 			}
@@ -646,13 +671,13 @@ mod test {
 	use crate::{Currency, Description, InvoiceDescription, SignOrCreationError, CreationError};
 	use bitcoin_hashes::{Hash, sha256};
 	use bitcoin_hashes::sha256::Hash as Sha256;
-	use lightning::chain::keysinterface::{EntropySource, PhantomKeysManager};
+	use lightning::chain::keysinterface::PhantomKeysManager;
+	use lightning::events::{MessageSendEvent, MessageSendEventsProvider, Event};
 	use lightning::ln::{PaymentPreimage, PaymentHash};
-	use lightning::ln::channelmanager::{PhantomRouteHints, MIN_FINAL_CLTV_EXPIRY_DELTA, PaymentId};
+	use lightning::ln::channelmanager::{PhantomRouteHints, MIN_FINAL_CLTV_EXPIRY_DELTA, PaymentId, RecipientOnionFields, Retry};
 	use lightning::ln::functional_test_utils::*;
 	use lightning::ln::msgs::ChannelMessageHandler;
-	use lightning::routing::router::{PaymentParameters, RouteParameters, find_route};
-	use lightning::util::events::{MessageSendEvent, MessageSendEventsProvider, Event};
+	use lightning::routing::router::{PaymentParameters, RouteParameters};
 	use lightning::util::test_utils;
 	use lightning::util::config::UserConfig;
 	use crate::utils::create_invoice_from_channelmanager_and_duration_since_epoch;
@@ -667,7 +692,7 @@ mod test {
 		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 100000, 10001);
 		let non_default_invoice_expiry_secs = 4200;
 		let invoice = create_invoice_from_channelmanager_and_duration_since_epoch(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), "test".to_string(), Duration::from_secs(1234567),
 			non_default_invoice_expiry_secs, None).unwrap();
 		assert_eq!(invoice.amount_pico_btc(), Some(100_000));
@@ -694,20 +719,12 @@ mod test {
 			payment_params,
 			final_value_msat: invoice.amount_milli_satoshis().unwrap(),
 		};
-		let first_hops = nodes[0].node.list_usable_channels();
-		let network_graph = &node_cfgs[0].network_graph;
-		let logger = test_utils::TestLogger::new();
-		let scorer = test_utils::TestScorer::new();
-		let random_seed_bytes = chanmon_cfgs[1].keys_manager.get_secure_random_bytes();
-		let route = find_route(
-			&nodes[0].node.get_our_node_id(), &route_params, &network_graph,
-			Some(&first_hops.iter().collect::<Vec<_>>()), &logger, &scorer, &random_seed_bytes
-		).unwrap();
-
 		let payment_event = {
 			let mut payment_hash = PaymentHash([0; 32]);
 			payment_hash.0.copy_from_slice(&invoice.payment_hash().as_ref()[0..32]);
-			nodes[0].node.send_payment(&route, payment_hash, &Some(invoice.payment_secret().clone()), PaymentId(payment_hash.0)).unwrap();
+			nodes[0].node.send_payment(payment_hash,
+				RecipientOnionFields::secret_only(*invoice.payment_secret()),
+				PaymentId(payment_hash.0), route_params, Retry::Attempts(0)).unwrap();
 			let mut added_monitors = nodes[0].chain_monitor.added_monitors.lock().unwrap();
 			assert_eq!(added_monitors.len(), 1);
 			added_monitors.clear();
@@ -734,7 +751,7 @@ mod test {
 		let custom_min_final_cltv_expiry_delta = Some(50);
 
 		let invoice = crate::utils::create_invoice_from_channelmanager_and_duration_since_epoch(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), "".into(), Duration::from_secs(1234567), 3600,
 			if with_custom_delta { custom_min_final_cltv_expiry_delta } else { None },
 		).unwrap();
@@ -757,7 +774,7 @@ mod test {
 		let custom_min_final_cltv_expiry_delta = Some(21);
 
 		let invoice = crate::utils::create_invoice_from_channelmanager_and_duration_since_epoch(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), "".into(), Duration::from_secs(1234567), 3600,
 			custom_min_final_cltv_expiry_delta,
 		).unwrap();
@@ -772,7 +789,7 @@ mod test {
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let description_hash = crate::Sha256(Hash::hash("Testing description_hash".as_bytes()));
 		let invoice = crate::utils::create_invoice_from_channelmanager_with_description_hash_and_duration_since_epoch(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), description_hash, Duration::from_secs(1234567), 3600, None,
 		).unwrap();
 		assert_eq!(invoice.amount_pico_btc(), Some(100_000));
@@ -788,7 +805,7 @@ mod test {
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let payment_hash = PaymentHash([0; 32]);
 		let invoice = crate::utils::create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_hash(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), "test".to_string(), Duration::from_secs(1234567), 3600,
 			payment_hash, None,
 		).unwrap();
@@ -796,6 +813,63 @@ mod test {
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), MIN_FINAL_CLTV_EXPIRY_DELTA as u64);
 		assert_eq!(invoice.description(), InvoiceDescription::Direct(&Description("test".to_string())));
 		assert_eq!(invoice.payment_hash(), &sha256::Hash::from_slice(&payment_hash.0[..]).unwrap());
+	}
+
+	#[test]
+	fn test_hints_has_only_public_confd_channels() {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let mut config = test_default_channel_config();
+		config.channel_handshake_config.minimum_depth = 1;
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config), Some(config)]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+		// Create a private channel with lots of capacity and a lower value public channel (without
+		// confirming the funding tx yet).
+		let unannounced_scid = create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 0);
+		let conf_tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 10_000, 0);
+
+		// Before the channel is available, we should include the unannounced_scid.
+		let mut scid_aliases = HashSet::new();
+		scid_aliases.insert(unannounced_scid.0.short_channel_id_alias.unwrap());
+		match_invoice_routes(Some(5000), &nodes[1], scid_aliases.clone());
+
+		// However after we mine the funding tx and exchange channel_ready messages for the public
+		// channel we'll immediately switch to including it as a route hint, even though it isn't
+		// yet announced.
+		let pub_channel_scid = mine_transaction(&nodes[0], &conf_tx);
+		let node_a_pub_channel_ready = get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, nodes[1].node.get_our_node_id());
+		nodes[1].node.handle_channel_ready(&nodes[0].node.get_our_node_id(), &node_a_pub_channel_ready);
+
+		assert_eq!(mine_transaction(&nodes[1], &conf_tx), pub_channel_scid);
+		let events = nodes[1].node.get_and_clear_pending_msg_events();
+		assert_eq!(events.len(), 2);
+		if let MessageSendEvent::SendChannelReady { msg, .. } = &events[0] {
+			nodes[0].node.handle_channel_ready(&nodes[1].node.get_our_node_id(), msg);
+		} else { panic!(); }
+		if let MessageSendEvent::SendChannelUpdate { msg, .. } = &events[1] {
+			nodes[0].node.handle_channel_update(&nodes[1].node.get_our_node_id(), msg);
+		} else { panic!(); }
+
+		nodes[1].node.handle_channel_update(&nodes[0].node.get_our_node_id(), &get_event_msg!(nodes[0], MessageSendEvent::SendChannelUpdate, nodes[1].node.get_our_node_id()));
+
+		expect_channel_ready_event(&nodes[0], &nodes[1].node.get_our_node_id());
+		expect_channel_ready_event(&nodes[1], &nodes[0].node.get_our_node_id());
+
+		scid_aliases.clear();
+		scid_aliases.insert(node_a_pub_channel_ready.short_channel_id_alias.unwrap());
+		match_invoice_routes(Some(5000), &nodes[1], scid_aliases.clone());
+		// This also applies even if the amount is more than the payment amount, to ensure users
+		// dont screw up their privacy.
+		match_invoice_routes(Some(50_000_000), &nodes[1], scid_aliases.clone());
+
+		// The same remains true until the channel has 7 confirmations, at which point we include
+		// no hints.
+		connect_blocks(&nodes[1], 5);
+		match_invoice_routes(Some(5000), &nodes[1], scid_aliases.clone());
+		connect_blocks(&nodes[1], 1);
+		get_event_msg!(nodes[1], MessageSendEvent::SendAnnouncementSignatures, nodes[0].node.get_our_node_id());
+		match_invoice_routes(Some(5000), &nodes[1], HashSet::new());
 	}
 
 	#[test]
@@ -979,7 +1053,7 @@ mod test {
 		mut chan_ids_to_match: HashSet<u64>
 	) {
 		let invoice = create_invoice_from_channelmanager_and_duration_since_epoch(
-			&invoice_node.node, invoice_node.keys_manager, invoice_node.logger,
+			invoice_node.node, invoice_node.keys_manager, invoice_node.logger,
 			Currency::BitcoinTestnet, invoice_amt, "test".to_string(), Duration::from_secs(1234567),
 			3600, None).unwrap();
 		let hints = invoice.private_routes();
@@ -1001,9 +1075,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn do_test_multi_node_receive(user_generated_pmt_hash: bool) {
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1033,7 +1107,7 @@ mod test {
 		let invoice =
 			crate::utils::create_phantom_invoice::<&test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestLogger>(
 				Some(payment_amt), payment_hash, "test".to_string(), non_default_invoice_expiry_secs,
-				route_hints, &nodes[1].keys_manager, &nodes[1].keys_manager, &nodes[1].logger,
+				route_hints, nodes[1].keys_manager, nodes[1].keys_manager, nodes[1].logger,
 				Currency::BitcoinTestnet, None, Duration::from_secs(1234567)
 			).unwrap();
 		let (payment_hash, payment_secret) = (PaymentHash(invoice.payment_hash().into_inner()), *invoice.payment_secret());
@@ -1057,19 +1131,12 @@ mod test {
 			payment_params,
 			final_value_msat: invoice.amount_milli_satoshis().unwrap(),
 		};
-		let first_hops = nodes[0].node.list_usable_channels();
-		let network_graph = &node_cfgs[0].network_graph;
-		let logger = test_utils::TestLogger::new();
-		let scorer = test_utils::TestScorer::new();
-		let random_seed_bytes = chanmon_cfgs[1].keys_manager.get_secure_random_bytes();
-		let route = find_route(
-			&nodes[0].node.get_our_node_id(), &params, &network_graph,
-			Some(&first_hops.iter().collect::<Vec<_>>()), &logger, &scorer, &random_seed_bytes
-		).unwrap();
 		let (payment_event, fwd_idx) = {
 			let mut payment_hash = PaymentHash([0; 32]);
 			payment_hash.0.copy_from_slice(&invoice.payment_hash().as_ref()[0..32]);
-			nodes[0].node.send_payment(&route, payment_hash, &Some(invoice.payment_secret().clone()), PaymentId(payment_hash.0)).unwrap();
+			nodes[0].node.send_payment(payment_hash,
+				RecipientOnionFields::secret_only(*invoice.payment_secret()),
+				PaymentId(payment_hash.0), params, Retry::Attempts(0)).unwrap();
 			let mut added_monitors = nodes[0].chain_monitor.added_monitors.lock().unwrap();
 			assert_eq!(added_monitors.len(), 1);
 			added_monitors.clear();
@@ -1098,8 +1165,8 @@ mod test {
 		nodes[fwd_idx].node.process_pending_htlc_forwards();
 
 		let payment_preimage_opt = if user_generated_pmt_hash { None } else { Some(payment_preimage) };
-		expect_payment_claimable!(&nodes[fwd_idx], payment_hash, payment_secret, payment_amt, payment_preimage_opt, route.paths[0].last().unwrap().pubkey);
-		do_claim_payment_along_route(&nodes[0], &vec!(&vec!(&nodes[fwd_idx])[..]), false, payment_preimage);
+		expect_payment_claimable!(&nodes[fwd_idx], payment_hash, payment_secret, payment_amt, payment_preimage_opt, invoice.recover_payee_pub_key());
+		do_claim_payment_along_route(&nodes[0], &[&vec!(&nodes[fwd_idx])[..]], false, payment_preimage);
 		let events = nodes[0].node.get_and_clear_pending_events();
 		assert_eq!(events.len(), 2);
 		match events[0] {
@@ -1122,9 +1189,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_hints_has_htlc_min_max_values() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1143,8 +1210,8 @@ mod test {
 
 		let invoice = crate::utils::create_phantom_invoice::<&test_utils::TestKeysInterface,
 			&test_utils::TestKeysInterface, &test_utils::TestLogger>(Some(payment_amt), Some(payment_hash),
-				"test".to_string(), 3600, route_hints, &nodes[1].keys_manager, &nodes[1].keys_manager,
-				&nodes[1].logger, Currency::BitcoinTestnet, None, Duration::from_secs(1234567)).unwrap();
+				"test".to_string(), 3600, route_hints, nodes[1].keys_manager, nodes[1].keys_manager,
+				nodes[1].logger, Currency::BitcoinTestnet, None, Duration::from_secs(1234567)).unwrap();
 
 		let chan_0_1 = &nodes[1].node.list_usable_channels()[0];
 		assert_eq!(invoice.route_hints()[0].0[0].htlc_minimum_msat, chan_0_1.inbound_htlc_minimum_msat);
@@ -1175,7 +1242,7 @@ mod test {
 			&test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestLogger,
 		>(
 			Some(payment_amt), None, non_default_invoice_expiry_secs, description_hash,
-			route_hints, &nodes[1].keys_manager, &nodes[1].keys_manager, &nodes[1].logger,
+			route_hints, nodes[1].keys_manager, nodes[1].keys_manager, nodes[1].logger,
 			Currency::BitcoinTestnet, None, Duration::from_secs(1234567),
 		)
 		.unwrap();
@@ -1205,8 +1272,8 @@ mod test {
 		let duration_since_epoch = Duration::from_secs(1234567);
 		let invoice = crate::utils::create_phantom_invoice::<&test_utils::TestKeysInterface,
 			&test_utils::TestKeysInterface, &test_utils::TestLogger>(Some(payment_amt), payment_hash,
-				"".to_string(), non_default_invoice_expiry_secs, route_hints, &nodes[1].keys_manager, &nodes[1].keys_manager,
-				&nodes[1].logger, Currency::BitcoinTestnet, min_final_cltv_expiry_delta, duration_since_epoch).unwrap();
+				"".to_string(), non_default_invoice_expiry_secs, route_hints, nodes[1].keys_manager, nodes[1].keys_manager,
+				nodes[1].logger, Currency::BitcoinTestnet, min_final_cltv_expiry_delta, duration_since_epoch).unwrap();
 		assert_eq!(invoice.amount_pico_btc(), Some(200_000));
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), (min_final_cltv_expiry_delta.unwrap() + 3) as u64);
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(non_default_invoice_expiry_secs.into()));
@@ -1216,9 +1283,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_hints_includes_single_channels_to_participating_nodes() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1245,9 +1312,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_hints_includes_one_channel_of_each_counterparty_nodes_per_participating_node() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(4);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[3].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
@@ -1276,9 +1343,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_forwarding_info_not_assigned_channel_excluded_from_hints() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(4);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[3].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
@@ -1334,9 +1401,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_with_only_public_channels_hints_includes_only_phantom_route() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1367,9 +1434,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_with_mixed_public_and_private_channel_hints_includes_only_phantom_route() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(4);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
@@ -1401,9 +1468,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_hints_has_only_highest_inbound_capacity_channel() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
@@ -1432,9 +1499,9 @@ mod test {
 	#[cfg(feature = "std")]
 	fn test_multi_node_channels_inbound_capacity_lower_than_invoice_amt_filtering() {
 		let mut chanmon_cfgs = create_chanmon_cfgs(4);
-		let seed_1 = [42 as u8; 32];
-		let seed_2 = [43 as u8; 32];
-		let cross_node_seed = [44 as u8; 32];
+		let seed_1 = [42u8; 32];
+		let seed_2 = [43u8; 32];
+		let cross_node_seed = [44u8; 32];
 		chanmon_cfgs[1].keys_manager.backing = PhantomKeysManager::new(&seed_1, 43, 44, &cross_node_seed);
 		chanmon_cfgs[2].keys_manager.backing = PhantomKeysManager::new(&seed_2, 43, 44, &cross_node_seed);
 		let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
@@ -1519,8 +1586,8 @@ mod test {
 
 		let invoice = crate::utils::create_phantom_invoice::<&test_utils::TestKeysInterface,
 			&test_utils::TestKeysInterface, &test_utils::TestLogger>(invoice_amt, None, "test".to_string(),
-				3600, phantom_route_hints, &invoice_node.keys_manager, &invoice_node.keys_manager,
-				&invoice_node.logger, Currency::BitcoinTestnet, None, Duration::from_secs(1234567)).unwrap();
+				3600, phantom_route_hints, invoice_node.keys_manager, invoice_node.keys_manager,
+				invoice_node.logger, Currency::BitcoinTestnet, None, Duration::from_secs(1234567)).unwrap();
 
 		let invoice_hints = invoice.private_routes();
 
@@ -1551,7 +1618,7 @@ mod test {
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let result = crate::utils::create_invoice_from_channelmanager_and_duration_since_epoch(
-			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
+			nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::BitcoinTestnet,
 			Some(10_000), "Some description".into(), Duration::from_secs(1234567), 3600, Some(MIN_FINAL_CLTV_EXPIRY_DELTA - 4),
 		);
 		match result {

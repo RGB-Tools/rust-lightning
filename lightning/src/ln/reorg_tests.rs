@@ -9,14 +9,15 @@
 
 //! Further functional tests which test blockchain reorganizations.
 
-use crate::chain::channelmonitor::ANTI_REORG_DELAY;
+use crate::chain::channelmonitor::{ANTI_REORG_DELAY, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::OutPoint;
 use crate::chain::Confirm;
+use crate::events::{Event, MessageSendEventsProvider, ClosureReason, HTLCDestination};
 use crate::ln::channelmanager::ChannelManager;
 use crate::ln::msgs::{ChannelMessageHandler, Init};
-use crate::util::events::{Event, MessageSendEventsProvider, ClosureReason, HTLCDestination};
 use crate::util::test_utils;
 use crate::util::ser::Writeable;
+use crate::util::string::UntrustedString;
 
 use bitcoin::blockdata::block::{Block, BlockHeader};
 use bitcoin::blockdata::script::Builder;
@@ -102,7 +103,7 @@ fn do_test_onchain_htlc_reorg(local_commitment: bool, claim: bool) {
 
 		// Give node 1 node 2's commitment transaction and get its response (timing the HTLC out)
 		mine_transaction(&nodes[1], &node_2_commitment_txn[0]);
-		connect_blocks(&nodes[1], TEST_FINAL_CLTV - 1); // Confirm blocks until the HTLC expires
+		connect_blocks(&nodes[1], TEST_FINAL_CLTV); // Confirm blocks until the HTLC expires
 		let node_1_commitment_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
 		assert_eq!(node_1_commitment_txn.len(), 1); // ChannelMonitor: 1 offered HTLC-Timeout
 		check_spends!(node_1_commitment_txn[0], node_2_commitment_txn[0]);
@@ -320,12 +321,7 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 		let chan_0_monitor_serialized = get_monitor!(nodes[0], chan.2).encode();
 
 		reload_node!(nodes[0], *nodes[0].node.get_current_default_configuration(), &nodes_0_serialized, &[&chan_0_monitor_serialized], persister, new_chain_monitor, nodes_0_deserialized);
-		if !reorg_after_reload {
-			// If the channel is already closed when we reload the node, we'll broadcast a closing
-			// transaction via the ChannelMonitor which is missing a corresponding channel.
-			assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
-			nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
-		}
+		assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
 	}
 
 	if reorg_after_reload {
@@ -368,7 +364,7 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 	nodes[0].node.test_process_background_events(); // Required to free the pending background monitor update
 	check_added_monitors!(nodes[0], 1);
 	let expected_err = "Funding transaction was un-confirmed. Locked at 6 confs, now have 0 confs.";
-	check_closed_event!(nodes[1], 1, ClosureReason::CounterpartyForceClosed { peer_msg: "Channel closed because of an exception: ".to_owned() + expected_err });
+	check_closed_event!(nodes[1], 1, ClosureReason::CounterpartyForceClosed { peer_msg: UntrustedString(format!("Channel closed because of an exception: {}", expected_err)) });
 	check_closed_event!(nodes[0], 1, ClosureReason::ProcessingError { err: expected_err.to_owned() });
 	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
 	nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
@@ -471,19 +467,21 @@ fn test_set_outpoints_partial_claiming() {
 	}
 
 	// Connect blocks on node B
-	connect_blocks(&nodes[1], 135);
+	connect_blocks(&nodes[1], TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + 1);
 	check_closed_broadcast!(nodes[1], true);
 	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed);
 	check_added_monitors!(nodes[1], 1);
 	// Verify node B broadcast 2 HTLC-timeout txn
 	let partial_claim_tx = {
-		let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		let mut node_txn = nodes[1].tx_broadcaster.unique_txn_broadcast();
 		assert_eq!(node_txn.len(), 3);
+		check_spends!(node_txn[0], chan.3);
 		check_spends!(node_txn[1], node_txn[0]);
 		check_spends!(node_txn[2], node_txn[0]);
 		assert_eq!(node_txn[1].input.len(), 1);
 		assert_eq!(node_txn[2].input.len(), 1);
-		node_txn[1].clone()
+		assert_ne!(node_txn[1].input[0].previous_output, node_txn[2].input[0].previous_output);
+		node_txn.remove(1)
 	};
 
 	// Broadcast partial claim on node A, should regenerate a claiming tx with HTLC dropped

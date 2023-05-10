@@ -16,8 +16,8 @@ use bitcoin_hashes::Hash;
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::keysinterface::{NodeSigner, SignerProvider, EntropySource};
-use lightning::ln::{PaymentHash, PaymentSecret};
-use lightning::ln::channelmanager::{ChannelManager, PaymentId, Retry, RetryableSendFailure};
+use lightning::ln::PaymentHash;
+use lightning::ln::channelmanager::{ChannelManager, PaymentId, Retry, RetryableSendFailure, RecipientOnionFields};
 use lightning::routing::router::{PaymentParameters, RouteParameters, Router};
 use lightning::util::logger::Logger;
 
@@ -144,11 +144,14 @@ fn pay_invoice_using_amount<P: Deref>(
 	invoice: &Invoice, amount_msats: u64, payment_id: PaymentId, retry_strategy: Retry,
 	payer: P
 ) -> Result<(), PaymentError> where P::Target: Payer {
-	let payment_hash = PaymentHash(invoice.payment_hash().clone().into_inner());
-	let payment_secret = Some(invoice.payment_secret().clone());
+	let payment_hash = PaymentHash((*invoice.payment_hash()).into_inner());
+	let recipient_onion = RecipientOnionFields {
+		payment_secret: Some(*invoice.payment_secret()),
+		payment_metadata: invoice.payment_metadata().map(|v| v.clone()),
+	};
 	let mut payment_params = PaymentParameters::from_node_id(invoice.recover_payee_pub_key(),
 		invoice.min_final_cltv_expiry_delta() as u32)
-		.with_expiry_time(expiry_time_from_unix_epoch(&invoice).as_secs())
+		.with_expiry_time(expiry_time_from_unix_epoch(invoice).as_secs())
 		.with_route_hints(invoice.route_hints());
 	if let Some(features) = invoice.features() {
 		payment_params = payment_params.with_features(features.clone());
@@ -158,7 +161,7 @@ fn pay_invoice_using_amount<P: Deref>(
 		final_value_msat: amount_msats,
 	};
 
-	payer.send_payment(payment_hash, &payment_secret, payment_id, route_params, retry_strategy)
+	payer.send_payment(payment_hash, recipient_onion, payment_id, route_params, retry_strategy)
 }
 
 fn expiry_time_from_unix_epoch(invoice: &Invoice) -> Duration {
@@ -182,7 +185,7 @@ trait Payer {
 	///
 	/// [`Route`]: lightning::routing::router::Route
 	fn send_payment(
-		&self, payment_hash: PaymentHash, payment_secret: &Option<PaymentSecret>,
+		&self, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields,
 		payment_id: PaymentId, route_params: RouteParameters, retry_strategy: Retry
 	) -> Result<(), PaymentError>;
 }
@@ -199,11 +202,11 @@ where
 		L::Target: Logger,
 {
 	fn send_payment(
-		&self, payment_hash: PaymentHash, payment_secret: &Option<PaymentSecret>,
+		&self, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields,
 		payment_id: PaymentId, route_params: RouteParameters, retry_strategy: Retry
 	) -> Result<(), PaymentError> {
-		self.send_payment_with_retry(payment_hash, payment_secret, payment_id, route_params, retry_strategy)
-			.map_err(|e| PaymentError::Sending(e))
+		self.send_payment(payment_hash, recipient_onion, payment_id, route_params, retry_strategy)
+			.map_err(PaymentError::Sending)
 	}
 }
 
@@ -212,7 +215,9 @@ mod tests {
 	use super::*;
 	use crate::{InvoiceBuilder, Currency};
 	use bitcoin_hashes::sha256::Hash as Sha256;
-	use lightning::ln::PaymentPreimage;
+	use lightning::events::Event;
+	use lightning::ln::msgs::ChannelMessageHandler;
+	use lightning::ln::{PaymentPreimage, PaymentSecret};
 	use lightning::ln::functional_test_utils::*;
 	use secp256k1::{SecretKey, Secp256k1};
 	use std::collections::VecDeque;
@@ -249,7 +254,7 @@ mod tests {
 
 	impl Payer for TestPayer {
 		fn send_payment(
-			&self, _payment_hash: PaymentHash, _payment_secret: &Option<PaymentSecret>,
+			&self, _payment_hash: PaymentHash, _recipient_onion: RecipientOnionFields,
 			_payment_id: PaymentId, route_params: RouteParameters, _retry_strategy: Retry
 		) -> Result<(), PaymentError> {
 			self.check_value_msats(Amount(route_params.final_value_msat));
@@ -344,9 +349,57 @@ mod tests {
 		let invoice = invoice(payment_preimage);
 		let amt_msat = 10_000;
 
-		match pay_zero_value_invoice(&invoice, amt_msat, Retry::Attempts(0), &nodes[0].node) {
+		match pay_zero_value_invoice(&invoice, amt_msat, Retry::Attempts(0), nodes[0].node) {
 			Err(PaymentError::Invoice("amount unexpected")) => {},
 			_ => panic!()
+		}
+	}
+
+	#[test]
+	#[cfg(feature = "std")]
+	fn payment_metadata_end_to_end() {
+		// Test that a payment metadata read from an invoice passed to `pay_invoice` makes it all
+		// the way out through the `PaymentClaimable` event.
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_announced_chan_between_nodes(&nodes, 0, 1);
+
+		let payment_metadata = vec![42, 43, 44, 45, 46, 47, 48, 49, 42];
+
+		let (payment_hash, payment_secret) =
+			nodes[1].node.create_inbound_payment(None, 7200, None).unwrap();
+
+		let invoice = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("test".into())
+			.payment_hash(Sha256::from_slice(&payment_hash.0).unwrap())
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(144)
+			.amount_milli_satoshis(50_000)
+			.payment_metadata(payment_metadata.clone())
+			.build_signed(|hash| {
+				Secp256k1::new().sign_ecdsa_recoverable(hash,
+					&nodes[1].keys_manager.backing.get_node_secret_key())
+			})
+			.unwrap();
+
+		pay_invoice(&invoice, Retry::Attempts(0), nodes[0].node).unwrap();
+		check_added_monitors(&nodes[0], 1);
+		let send_event = SendEvent::from_node(&nodes[0]);
+		nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &send_event.msgs[0]);
+		commitment_signed_dance!(nodes[1], nodes[0], &send_event.commitment_msg, false);
+
+		expect_pending_htlcs_forwardable!(nodes[1]);
+
+		let mut events = nodes[1].node.get_and_clear_pending_events();
+		assert_eq!(events.len(), 1);
+		match events.pop().unwrap() {
+			Event::PaymentClaimable { onion_fields, .. } => {
+				assert_eq!(Some(payment_metadata), onion_fields.unwrap().payment_metadata);
+			},
+			_ => panic!("Unexpected event")
 		}
 	}
 }

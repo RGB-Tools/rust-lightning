@@ -7,12 +7,12 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use crate::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use crate::ln::channelmanager::HTLCSource;
+use crate::ln::{PaymentHash, PaymentPreimage};
+use crate::ln::channelmanager::{HTLCSource, RecipientOnionFields};
 use crate::ln::msgs;
 use crate::ln::wire::Encode;
 use crate::routing::gossip::NetworkUpdate;
-use crate::routing::router::RouteHop;
+use crate::routing::router::{Path, RouteHop};
 use crate::util::chacha20::{ChaCha20, ChaChaReader};
 use crate::util::errors::{self, APIError};
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, LengthCalculatingWriter};
@@ -128,10 +128,10 @@ pub(super) fn construct_onion_keys_callback<T: secp256k1::Signing, FType: FnMut(
 }
 
 // can only fail if an intermediary hop has an invalid public key or session_priv is invalid
-pub(super) fn construct_onion_keys<T: secp256k1::Signing>(secp_ctx: &Secp256k1<T>, path: &Vec<RouteHop>, session_priv: &SecretKey) -> Result<Vec<OnionKeys>, secp256k1::Error> {
-	let mut res = Vec::with_capacity(path.len());
+pub(super) fn construct_onion_keys<T: secp256k1::Signing>(secp_ctx: &Secp256k1<T>, path: &Path, session_priv: &SecretKey) -> Result<Vec<OnionKeys>, secp256k1::Error> {
+	let mut res = Vec::with_capacity(path.hops.len());
 
-	construct_onion_keys_callback(secp_ctx, path, session_priv, |shared_secret, _blinding_factor, ephemeral_pubkey, _, _| {
+	construct_onion_keys_callback(secp_ctx, &path.hops, session_priv, |shared_secret, _blinding_factor, ephemeral_pubkey, _, _| {
 		let (rho, mu) = gen_rho_mu_from_shared_secret(shared_secret.as_ref());
 
 		res.push(OnionKeys {
@@ -149,13 +149,13 @@ pub(super) fn construct_onion_keys<T: secp256k1::Signing>(secp_ctx: &Secp256k1<T
 }
 
 /// returns the hop data, as well as the first-hop value_msat and CLTV value we should send.
-pub(super) fn build_onion_payloads(path: &Vec<RouteHop>, total_msat: u64, payment_secret_option: &Option<PaymentSecret>, starting_htlc_offset: u32, keysend_preimage: &Option<PaymentPreimage>) -> Result<(Vec<msgs::OnionHopData>, u64, u32), APIError> {
+pub(super) fn build_onion_payloads(path: &Path, total_msat: u64, mut recipient_onion: RecipientOnionFields, starting_htlc_offset: u32, keysend_preimage: &Option<PaymentPreimage>) -> Result<(Vec<msgs::OnionHopData>, u64, u32), APIError> {
 	let mut cur_value_msat = 0u64;
 	let mut cur_cltv = starting_htlc_offset;
 	let mut last_short_channel_id = 0;
-	let mut res: Vec<msgs::OnionHopData> = Vec::with_capacity(path.len());
+	let mut res: Vec<msgs::OnionHopData> = Vec::with_capacity(path.hops.len());
 
-	for (idx, hop) in path.iter().rev().enumerate() {
+	for (idx, hop) in path.hops.iter().rev().enumerate() {
 		// First hop gets special values so that it can check, on receipt, that everything is
 		// exactly as it should be (and the next hop isn't trying to probe to find out if we're
 		// the intended recipient).
@@ -164,12 +164,13 @@ pub(super) fn build_onion_payloads(path: &Vec<RouteHop>, total_msat: u64, paymen
 		res.insert(0, msgs::OnionHopData {
 			format: if idx == 0 {
 				msgs::OnionHopDataFormat::FinalNode {
-					payment_data: if let &Some(ref payment_secret) = payment_secret_option {
+					payment_data: if let Some(secret) = recipient_onion.payment_secret.take() {
 						Some(msgs::FinalOnionHopData {
-							payment_secret: payment_secret.clone(),
+							payment_secret: secret,
 							total_msat,
 						})
 					} else { None },
+					payment_metadata: recipient_onion.payment_metadata.take(),
 					keysend_preimage: *keysend_preimage,
 				}
 			} else {
@@ -402,7 +403,7 @@ pub(super) fn process_onion_failure<T: secp256k1::Signing, L: Deref>(secp_ctx: &
 		let mut is_from_final_node = false;
 
 		// Handle packed channel/node updates for passing back for the route handler
-		construct_onion_keys_callback(secp_ctx, path, session_priv, |shared_secret, _, _, route_hop, route_hop_idx| {
+		construct_onion_keys_callback(secp_ctx, &path.hops, session_priv, |shared_secret, _, _, route_hop, route_hop_idx| {
 			if res.is_some() { return; }
 
 			let amt_to_forward = htlc_msat - route_hop.fee_msat;
@@ -418,8 +419,8 @@ pub(super) fn process_onion_failure<T: secp256k1::Signing, L: Deref>(secp_ctx: &
 
 			// The failing hop includes either the inbound channel to the recipient or the outbound
 			// channel from the current hop (i.e., the next hop's inbound channel).
-			is_from_final_node = route_hop_idx + 1 == path.len();
-			let failing_route_hop = if is_from_final_node { route_hop } else { &path[route_hop_idx + 1] };
+			is_from_final_node = route_hop_idx + 1 == path.hops.len();
+			let failing_route_hop = if is_from_final_node { route_hop } else { &path.hops[route_hop_idx + 1] };
 
 			if let Ok(err_packet) = msgs::DecodedOnionErrorPacket::read(&mut Cursor::new(&packet_decrypted)) {
 				let um = gen_um_from_shared_secret(shared_secret.as_ref());
@@ -492,21 +493,28 @@ pub(super) fn process_onion_failure<T: secp256k1::Signing, L: Deref>(secp_ctx: &
 									} else {
 										log_trace!(logger, "Failure provided features a channel update without type prefix. Deprecated, but allowing for now.");
 									}
-									if let Ok(chan_update) = msgs::ChannelUpdate::read(&mut Cursor::new(&update_slice)) {
+									let update_opt = msgs::ChannelUpdate::read(&mut Cursor::new(&update_slice));
+									if update_opt.is_ok() || update_slice.is_empty() {
 										// if channel_update should NOT have caused the failure:
 										// MAY treat the channel_update as invalid.
 										let is_chan_update_invalid = match error_code & 0xff {
 											7 => false,
-											11 => amt_to_forward > chan_update.contents.htlc_minimum_msat,
-											12 => amt_to_forward
-												.checked_mul(chan_update.contents.fee_proportional_millionths as u64)
+											11 => update_opt.is_ok() &&
+												amt_to_forward >
+													update_opt.as_ref().unwrap().contents.htlc_minimum_msat,
+											12 => update_opt.is_ok() && amt_to_forward
+												.checked_mul(update_opt.as_ref().unwrap()
+													.contents.fee_proportional_millionths as u64)
 												.map(|prop_fee| prop_fee / 1_000_000)
-												.and_then(|prop_fee| prop_fee.checked_add(chan_update.contents.fee_base_msat as u64))
+												.and_then(|prop_fee| prop_fee.checked_add(
+													update_opt.as_ref().unwrap().contents.fee_base_msat as u64))
 												.map(|fee_msats| route_hop.fee_msat >= fee_msats)
 												.unwrap_or(false),
-											13 => route_hop.cltv_expiry_delta as u16 >= chan_update.contents.cltv_expiry_delta,
+											13 => update_opt.is_ok() &&
+												route_hop.cltv_expiry_delta as u16 >=
+													update_opt.as_ref().unwrap().contents.cltv_expiry_delta,
 											14 => false, // expiry_too_soon; always valid?
-											20 => chan_update.contents.flags & 2 == 0,
+											20 => update_opt.as_ref().unwrap().contents.flags & 2 == 0,
 											_ => false, // unknown error code; take channel_update as valid
 										};
 										if is_chan_update_invalid {
@@ -517,17 +525,31 @@ pub(super) fn process_onion_failure<T: secp256k1::Signing, L: Deref>(secp_ctx: &
 												is_permanent: true,
 											});
 										} else {
-											// Make sure the ChannelUpdate contains the expected
-											// short channel id.
-											if failing_route_hop.short_channel_id == chan_update.contents.short_channel_id {
-												short_channel_id = Some(failing_route_hop.short_channel_id);
+											if let Ok(chan_update) = update_opt {
+												// Make sure the ChannelUpdate contains the expected
+												// short channel id.
+												if failing_route_hop.short_channel_id == chan_update.contents.short_channel_id {
+													short_channel_id = Some(failing_route_hop.short_channel_id);
+												} else {
+													log_info!(logger, "Node provided a channel_update for which it was not authoritative, ignoring.");
+												}
+												network_update = Some(NetworkUpdate::ChannelUpdateMessage {
+													msg: chan_update,
+												})
 											} else {
-												log_info!(logger, "Node provided a channel_update for which it was not authoritative, ignoring.");
+												network_update = Some(NetworkUpdate::ChannelFailure {
+													short_channel_id: route_hop.short_channel_id,
+													is_permanent: false,
+												});
 											}
-											network_update = Some(NetworkUpdate::ChannelUpdateMessage {
-												msg: chan_update,
-											})
 										};
+									} else {
+										// If the channel_update had a non-zero length (i.e. was
+										// present) but we couldn't read it, treat it as a total
+										// node failure.
+										log_info!(logger,
+											"Failed to read a channel_update of len {} in an onion",
+											update_slice.len());
 									}
 								}
 							}
@@ -725,7 +747,7 @@ impl HTLCFailReason {
 				// generally ignores its view of our own channels as we provide them via
 				// ChannelDetails.
 				if let &HTLCSource::OutboundRoute { ref path, .. } = htlc_source {
-					(None, Some(path.first().unwrap().short_channel_id), true, Some(*failure_code), Some(data.clone()))
+					(None, Some(path.hops[0].short_channel_id), true, Some(*failure_code), Some(data.clone()))
 				} else { unreachable!(); }
 			}
 		}
@@ -882,7 +904,7 @@ mod tests {
 	use crate::prelude::*;
 	use crate::ln::PaymentHash;
 	use crate::ln::features::{ChannelFeatures, NodeFeatures};
-	use crate::routing::router::{Route, RouteHop};
+	use crate::routing::router::{Path, Route, RouteHop};
 	use crate::ln::msgs;
 	use crate::util::ser::{Writeable, Writer, VecWriter};
 
@@ -902,7 +924,7 @@ mod tests {
 		let secp_ctx = Secp256k1::new();
 
 		let route = Route {
-			paths: vec![vec![
+			paths: vec![Path { hops: vec![
 					RouteHop {
 						pubkey: PublicKey::from_slice(&hex::decode("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619").unwrap()[..]).unwrap(),
 						channel_features: ChannelFeatures::empty(), node_features: NodeFeatures::empty(),
@@ -928,12 +950,12 @@ mod tests {
 						channel_features: ChannelFeatures::empty(), node_features: NodeFeatures::empty(),
 						short_channel_id: 0, fee_msat: 0, cltv_expiry_delta: 0 // We fill in the payloads manually instead of generating them from RouteHops.
 					},
-			]],
+			], blinded_tail: None }],
 			payment_params: None,
 		};
 
 		let onion_keys = super::construct_onion_keys(&secp_ctx, &route.paths[0], &get_test_session_key()).unwrap();
-		assert_eq!(onion_keys.len(), route.paths[0].len());
+		assert_eq!(onion_keys.len(), route.paths[0].hops.len());
 		onion_keys
 	}
 

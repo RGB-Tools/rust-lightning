@@ -35,12 +35,12 @@ use crate::ln::chan_utils;
 use crate::ln::onion_utils::HTLCFailReason;
 use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
-use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS};
+use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::keysinterface::{WriteableEcdsaChannelSigner, EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount};
+use crate::events::ClosureReason;
 use crate::routing::gossip::NodeId;
-use crate::util::events::ClosureReason;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, VecWriter};
 use crate::util::logger::Logger;
 use crate::util::errors::APIError;
@@ -319,9 +319,9 @@ pub(super) enum ChannelUpdateStatus {
 	/// We've announced the channel as enabled and are connected to our peer.
 	Enabled,
 	/// Our channel is no longer live, but we haven't announced the channel as disabled yet.
-	DisabledStaged,
+	DisabledStaged(u8),
 	/// Our channel is live again, but we haven't announced the channel as enabled yet.
-	EnabledStaged,
+	EnabledStaged(u8),
 	/// We've announced the channel as disabled.
 	Disabled,
 }
@@ -506,6 +506,7 @@ pub(super) struct Channel<Signer: ChannelSigner> {
 	user_id: u128,
 
 	channel_id: [u8; 32],
+	temporary_channel_id: Option<[u8; 32]>, // Will be `None` for channels created prior to 0.0.115.
 	channel_state: u32,
 
 	// When we reach max(6 blocks, minimum_depth), we need to send an AnnouncementSigs message to
@@ -659,7 +660,7 @@ pub(super) struct Channel<Signer: ChannelSigner> {
 	pub counterparty_max_accepted_htlcs: u16,
 	#[cfg(not(test))]
 	counterparty_max_accepted_htlcs: u16,
-	//implied by OUR_MAX_HTLCS: max_accepted_htlcs: u16,
+	holder_max_accepted_htlcs: u16,
 	minimum_depth: Option<u32>,
 
 	counterparty_forwarding_info: Option<CounterpartyForwardingInfo>,
@@ -736,6 +737,9 @@ pub(super) struct Channel<Signer: ChannelSigner> {
 	// blinded paths instead of simple scid+node_id aliases.
 	outbound_scid_alias: u64,
 
+	// We track whether we already emitted a `ChannelPending` event.
+	channel_pending_event_emitted: bool,
+
 	// We track whether we already emitted a `ChannelReady` event.
 	channel_ready_event_emitted: bool,
 
@@ -764,7 +768,7 @@ struct CommitmentTxInfoCached {
 	feerate: u32,
 }
 
-pub const OUR_MAX_HTLCS: u16 = 50; //TODO
+pub const DEFAULT_MAX_HTLCS: u16 = 50;
 
 pub(crate) fn commitment_tx_base_weight(opt_anchors: bool) -> u64 {
 	const COMMITMENT_TX_BASE_WEIGHT: u64 = 724;
@@ -1003,6 +1007,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 		}
 
+		let temporary_channel_id = entropy_source.get_secure_random_bytes();
+
 		Ok(Channel {
 			user_id,
 
@@ -1016,7 +1022,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 			inbound_handshake_limits_override: Some(config.channel_handshake_limits.clone()),
 
-			channel_id: entropy_source.get_secure_random_bytes(),
+			channel_id: temporary_channel_id,
+			temporary_channel_id: Some(temporary_channel_id),
 			channel_state: ChannelState::OurInitSent as u32,
 			announcement_sigs_state: AnnouncementSigsState::NotSent,
 			secp_ctx,
@@ -1077,6 +1084,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			counterparty_htlc_minimum_msat: 0,
 			holder_htlc_minimum_msat: if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
 			counterparty_max_accepted_htlcs: 0,
+			holder_max_accepted_htlcs: cmp::min(config.channel_handshake_config.our_max_accepted_htlcs, MAX_HTLCS),
 			minimum_depth: None, // Filled in in accept_channel
 
 			counterparty_forwarding_info: None,
@@ -1115,6 +1123,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			latest_inbound_scid_alias: None,
 			outbound_scid_alias,
 
+			channel_pending_event_emitted: false,
 			channel_ready_event_emitted: false,
 
 			#[cfg(any(test, fuzzing))]
@@ -1366,6 +1375,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			inbound_handshake_limits_override: None,
 
 			channel_id: msg.temporary_channel_id,
+			temporary_channel_id: Some(msg.temporary_channel_id),
 			channel_state: (ChannelState::OurInitSent as u32) | (ChannelState::TheirInitSent as u32),
 			announcement_sigs_state: AnnouncementSigsState::NotSent,
 			secp_ctx,
@@ -1426,6 +1436,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			counterparty_htlc_minimum_msat: msg.htlc_minimum_msat,
 			holder_htlc_minimum_msat: if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
 			counterparty_max_accepted_htlcs: msg.max_accepted_htlcs,
+			holder_max_accepted_htlcs: cmp::min(config.channel_handshake_config.our_max_accepted_htlcs, MAX_HTLCS),
 			minimum_depth: Some(cmp::max(config.channel_handshake_config.minimum_depth, 1)),
 
 			counterparty_forwarding_info: None,
@@ -1467,6 +1478,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			latest_inbound_scid_alias: None,
 			outbound_scid_alias,
 
+			channel_pending_event_emitted: false,
 			channel_ready_event_emitted: false,
 
 			#[cfg(any(test, fuzzing))]
@@ -2378,7 +2390,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		Ok((msgs::FundingSigned {
 			channel_id: self.channel_id,
-			signature
+			signature,
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
 		}, channel_monitor))
 	}
 
@@ -2890,8 +2904,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let inbound_stats = self.get_inbound_pending_htlc_stats(None);
 		let outbound_stats = self.get_outbound_pending_htlc_stats(None);
-		if inbound_stats.pending_htlcs + 1 > OUR_MAX_HTLCS as u32 {
-			return Err(ChannelError::Close(format!("Remote tried to push more than our max accepted HTLCs ({})", OUR_MAX_HTLCS)));
+		if inbound_stats.pending_htlcs + 1 > self.holder_max_accepted_htlcs as u32 {
+			return Err(ChannelError::Close(format!("Remote tried to push more than our max accepted HTLCs ({})", self.holder_max_accepted_htlcs)));
 		}
 		if inbound_stats.pending_htlcs_value_msat + msg.amount_msat > self.holder_max_htlc_value_in_flight_msat {
 			return Err(ChannelError::Close(format!("Remote HTLC add would put them over our max HTLC value ({})", self.holder_max_htlc_value_in_flight_msat)));
@@ -3152,9 +3166,24 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			return Err(ChannelError::Close(format!("Got wrong number of HTLC signatures ({}) from remote. It must be {}", msg.htlc_signatures.len(), commitment_stats.num_nondust_htlcs)));
 		}
 
-		// TODO: Sadly, we pass HTLCs twice to ChannelMonitor: once via the HolderCommitmentTransaction and once via the update
+		// Up to LDK 0.0.115, HTLC information was required to be duplicated in the
+		// `htlcs_and_sigs` vec and in the `holder_commitment_tx` itself, both of which were passed
+		// in the `ChannelMonitorUpdate`. In 0.0.115, support for having a separate set of
+		// outbound-non-dust-HTLCSources in the `ChannelMonitorUpdate` was added, however for
+		// backwards compatibility, we never use it in production. To provide test coverage, here,
+		// we randomly decide (in test/fuzzing builds) to use the new vec sometimes.
+		#[allow(unused_assignments, unused_mut)]
+		let mut separate_nondust_htlc_sources = false;
+		#[cfg(all(feature = "std", any(test, fuzzing)))] {
+			use core::hash::{BuildHasher, Hasher};
+			// Get a random value using the only std API to do so - the DefaultHasher
+			let rand_val = std::collections::hash_map::RandomState::new().build_hasher().finish();
+			separate_nondust_htlc_sources = rand_val % 2 == 0;
+		}
+
+		let mut nondust_htlc_sources = Vec::with_capacity(htlcs_cloned.len());
 		let mut htlcs_and_sigs = Vec::with_capacity(htlcs_cloned.len());
-		for (idx, (htlc, source)) in htlcs_cloned.drain(..).enumerate() {
+		for (idx, (htlc, mut source_opt)) in htlcs_cloned.drain(..).enumerate() {
 			if let Some(_) = htlc.transaction_output_index {
 				let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
 					self.get_counterparty_selected_contest_delay().unwrap(), &htlc, self.opt_anchors(),
@@ -3170,10 +3199,18 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				if let Err(_) = self.secp_ctx.verify_ecdsa(&htlc_sighash, &msg.htlc_signatures[idx], &keys.countersignatory_htlc_key) {
 					return Err(ChannelError::Close("Invalid HTLC tx signature from peer".to_owned()));
 				}
-				htlcs_and_sigs.push((htlc, Some(msg.htlc_signatures[idx]), source));
+				if !separate_nondust_htlc_sources {
+					htlcs_and_sigs.push((htlc, Some(msg.htlc_signatures[idx]), source_opt.take()));
+				}
 			} else {
-				htlcs_and_sigs.push((htlc, None, source));
+				htlcs_and_sigs.push((htlc, None, source_opt.take()));
 			}
+			if separate_nondust_htlc_sources {
+				if let Some(source) = source_opt.take() {
+					nondust_htlc_sources.push(source);
+				}
+			}
+			debug_assert!(source_opt.is_none(), "HTLCSource should have been put somewhere");
 		}
 
 		let holder_commitment_tx = HolderCommitmentTransaction::new(
@@ -3236,6 +3273,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				commitment_tx: holder_commitment_tx,
 				htlc_outputs: htlcs_and_sigs,
 				claimed_htlcs,
+				nondust_htlc_sources,
 			}]
 		};
 
@@ -3951,6 +3989,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			channel_id: self.channel_id,
 			per_commitment_secret,
 			next_per_commitment_point,
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		}
 	}
 
@@ -4595,6 +4635,13 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.channel_id
 	}
 
+	// Return the `temporary_channel_id` used during channel establishment.
+	//
+	// Will return `None` for channels created prior to LDK version 0.0.115.
+	pub fn temporary_channel_id(&self) -> Option<[u8; 32]> {
+		self.temporary_channel_id
+	}
+
 	pub fn minimum_depth(&self) -> Option<u32> {
 		self.minimum_depth
 	}
@@ -4739,6 +4786,21 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.prev_config.map(|prev_config| prev_config.0)
 	}
 
+	// Checks whether we should emit a `ChannelPending` event.
+	pub(crate) fn should_emit_channel_pending_event(&mut self) -> bool {
+		self.is_funding_initiated() && !self.channel_pending_event_emitted
+	}
+
+	// Returns whether we already emitted a `ChannelPending` event.
+	pub(crate) fn channel_pending_event_emitted(&self) -> bool {
+		self.channel_pending_event_emitted
+	}
+
+	// Remembers that we already emitted a `ChannelPending` event.
+	pub(crate) fn set_channel_pending_event_emitted(&mut self) {
+		self.channel_pending_event_emitted = true;
+	}
+
 	// Checks whether we should emit a `ChannelReady` event.
 	pub(crate) fn should_emit_channel_ready_event(&mut self) -> bool {
 		self.is_usable() && !self.channel_ready_event_emitted
@@ -4822,7 +4884,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			})
 	}
 
-	pub fn get_feerate(&self) -> u32 {
+	pub fn get_feerate_sat_per_1000_weight(&self) -> u32 {
 		self.feerate_per_kw
 	}
 
@@ -5298,7 +5360,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			htlc_minimum_msat: self.holder_htlc_minimum_msat,
 			feerate_per_kw: self.feerate_per_kw as u32,
 			to_self_delay: self.get_holder_selected_contest_delay(),
-			max_accepted_htlcs: OUR_MAX_HTLCS,
+			max_accepted_htlcs: self.holder_max_accepted_htlcs,
 			funding_pubkey: keys.funding_pubkey,
 			revocation_basepoint: keys.revocation_basepoint,
 			payment_point: keys.payment_point,
@@ -5366,7 +5428,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			htlc_minimum_msat: self.holder_htlc_minimum_msat,
 			minimum_depth: self.minimum_depth.unwrap(),
 			to_self_delay: self.get_holder_selected_contest_delay(),
-			max_accepted_htlcs: OUR_MAX_HTLCS,
+			max_accepted_htlcs: self.holder_max_accepted_htlcs,
 			funding_pubkey: keys.funding_pubkey,
 			revocation_basepoint: keys.revocation_basepoint,
 			payment_point: keys.payment_point,
@@ -5378,6 +5440,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				None => Builder::new().into_script(),
 			}),
 			channel_type: Some(self.channel_type.clone()),
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		}
 	}
 
@@ -5444,7 +5508,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			temporary_channel_id,
 			funding_txid: funding_txo.txid,
 			funding_output_index: funding_txo.index,
-			signature
+			signature,
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		})
 	}
 
@@ -5971,6 +6039,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			channel_id: self.channel_id,
 			signature,
 			htlc_signatures,
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
 		}, (counterparty_commitment_txid, commitment_stats.htlcs_included)))
 	}
 
@@ -6137,7 +6207,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			// monitor update to the user, even if we return one).
 			// See test_duplicate_chan_id and test_pre_lockin_no_chan_closed_update for more.
 			if self.channel_state & (ChannelState::FundingSent as u32 | ChannelState::ChannelReady as u32 | ChannelState::ShutdownComplete as u32) != 0 {
-				self.latest_monitor_update_id += 1;
+				self.latest_monitor_update_id = CLOSED_CHANNEL_UPDATE_ID;
 				Some((funding_txo, ChannelMonitorUpdate {
 					update_id: self.latest_monitor_update_id,
 					updates: vec![ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast }],
@@ -6179,8 +6249,8 @@ impl Writeable for ChannelUpdateStatus {
 		// channel as enabled, so we write 0. For EnabledStaged, we similarly write a 1.
 		match self {
 			ChannelUpdateStatus::Enabled => 0u8.write(writer)?,
-			ChannelUpdateStatus::DisabledStaged => 0u8.write(writer)?,
-			ChannelUpdateStatus::EnabledStaged => 1u8.write(writer)?,
+			ChannelUpdateStatus::DisabledStaged(_) => 0u8.write(writer)?,
+			ChannelUpdateStatus::EnabledStaged(_) => 1u8.write(writer)?,
 			ChannelUpdateStatus::Disabled => 1u8.write(writer)?,
 		}
 		Ok(())
@@ -6477,12 +6547,15 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 			if self.holder_max_htlc_value_in_flight_msat != Self::get_holder_max_htlc_value_in_flight_msat(self.channel_value_satoshis, &old_max_in_flight_percent_config)
 			{ Some(self.holder_max_htlc_value_in_flight_msat) } else { None };
 
+		let channel_pending_event_emitted = Some(self.channel_pending_event_emitted);
 		let channel_ready_event_emitted = Some(self.channel_ready_event_emitted);
 
 		// `user_id` used to be a single u64 value. In order to remain backwards compatible with
 		// versions prior to 0.0.113, the u128 is serialized as two separate u64 values. Therefore,
 		// we write the high bytes as an option here.
 		let user_id_high_opt = Some((self.user_id >> 64) as u64);
+
+		let holder_max_accepted_htlcs = if self.holder_max_accepted_htlcs == DEFAULT_MAX_HTLCS { None } else { Some(self.holder_max_accepted_htlcs) };
 
 		write_tlv_fields!(writer, {
 			(0, self.announcement_sigs, option),
@@ -6509,8 +6582,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 			(23, channel_ready_event_emitted, option),
 			(25, user_id_high_opt, option),
 			(27, self.channel_keys_id, required),
-			(29, self.consignment_endpoint, required),
-			(31, self.ldk_data_dir, required),
+			(28, holder_max_accepted_htlcs, option),
+			(29, self.temporary_channel_id, option),
+			(31, channel_pending_event_emitted, option),
+			(33, self.consignment_endpoint, required),
+			(35, self.ldk_data_dir, required),
 		});
 
 		Ok(())
@@ -6577,7 +6653,8 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let value_to_self_msat = Readable::read(reader)?;
 
 		let pending_inbound_htlc_count: u64 = Readable::read(reader)?;
-		let mut pending_inbound_htlcs = Vec::with_capacity(cmp::min(pending_inbound_htlc_count as usize, OUR_MAX_HTLCS as usize));
+
+		let mut pending_inbound_htlcs = Vec::with_capacity(cmp::min(pending_inbound_htlc_count as usize, DEFAULT_MAX_HTLCS as usize));
 		for _ in 0..pending_inbound_htlc_count {
 			pending_inbound_htlcs.push(InboundHTLCOutput {
 				htlc_id: Readable::read(reader)?,
@@ -6596,7 +6673,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		}
 
 		let pending_outbound_htlc_count: u64 = Readable::read(reader)?;
-		let mut pending_outbound_htlcs = Vec::with_capacity(cmp::min(pending_outbound_htlc_count as usize, OUR_MAX_HTLCS as usize));
+		let mut pending_outbound_htlcs = Vec::with_capacity(cmp::min(pending_outbound_htlc_count as usize, DEFAULT_MAX_HTLCS as usize));
 		for _ in 0..pending_outbound_htlc_count {
 			pending_outbound_htlcs.push(OutboundHTLCOutput {
 				htlc_id: Readable::read(reader)?,
@@ -6626,7 +6703,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		}
 
 		let holding_cell_htlc_update_count: u64 = Readable::read(reader)?;
-		let mut holding_cell_htlc_updates = Vec::with_capacity(cmp::min(holding_cell_htlc_update_count as usize, OUR_MAX_HTLCS as usize*2));
+		let mut holding_cell_htlc_updates = Vec::with_capacity(cmp::min(holding_cell_htlc_update_count as usize, DEFAULT_MAX_HTLCS as usize*2));
 		for _ in 0..holding_cell_htlc_update_count {
 			holding_cell_htlc_updates.push(match <u8 as Readable>::read(reader)? {
 				0 => HTLCUpdateAwaitingACK::AddHTLC {
@@ -6660,13 +6737,13 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let monitor_pending_commitment_signed = Readable::read(reader)?;
 
 		let monitor_pending_forwards_count: u64 = Readable::read(reader)?;
-		let mut monitor_pending_forwards = Vec::with_capacity(cmp::min(monitor_pending_forwards_count as usize, OUR_MAX_HTLCS as usize));
+		let mut monitor_pending_forwards = Vec::with_capacity(cmp::min(monitor_pending_forwards_count as usize, DEFAULT_MAX_HTLCS as usize));
 		for _ in 0..monitor_pending_forwards_count {
 			monitor_pending_forwards.push((Readable::read(reader)?, Readable::read(reader)?));
 		}
 
 		let monitor_pending_failures_count: u64 = Readable::read(reader)?;
-		let mut monitor_pending_failures = Vec::with_capacity(cmp::min(monitor_pending_failures_count as usize, OUR_MAX_HTLCS as usize));
+		let mut monitor_pending_failures = Vec::with_capacity(cmp::min(monitor_pending_failures_count as usize, DEFAULT_MAX_HTLCS as usize));
 		for _ in 0..monitor_pending_failures_count {
 			monitor_pending_failures.push((Readable::read(reader)?, Readable::read(reader)?, Readable::read(reader)?));
 		}
@@ -6781,10 +6858,13 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let mut announcement_sigs_state = Some(AnnouncementSigsState::NotSent);
 		let mut latest_inbound_scid_alias = None;
 		let mut outbound_scid_alias = None;
+		let mut channel_pending_event_emitted = None;
 		let mut channel_ready_event_emitted = None;
 
 		let mut user_id_high_opt: Option<u64> = None;
 		let mut channel_keys_id: Option<[u8; 32]> = None;
+		let mut temporary_channel_id: Option<[u8; 32]> = None;
+		let mut holder_max_accepted_htlcs: Option<u16> = None;
 		let mut consignment_endpoint: Option<ConsignmentEndpoint> = None;
 		let mut ldk_data_dir: Option<PathBuf> = None;
 
@@ -6807,8 +6887,11 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			(23, channel_ready_event_emitted, option),
 			(25, user_id_high_opt, option),
 			(27, channel_keys_id, option),
-			(29, consignment_endpoint, option),
-			(31, ldk_data_dir, option),
+			(28, holder_max_accepted_htlcs, option),
+			(29, temporary_channel_id, option),
+			(31, channel_pending_event_emitted, option),
+			(33, consignment_endpoint, option),
+			(35, ldk_data_dir, option),
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
@@ -6861,6 +6944,8 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		// separate u64 values.
 		let user_id = user_id_low as u128 + ((user_id_high_opt.unwrap_or(0) as u128) << 64);
 
+		let holder_max_accepted_htlcs = holder_max_accepted_htlcs.unwrap_or(DEFAULT_MAX_HTLCS);
+
 		Ok(Channel {
 			user_id,
 
@@ -6873,6 +6958,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			inbound_handshake_limits_override: None,
 
 			channel_id,
+			temporary_channel_id,
 			channel_state,
 			announcement_sigs_state: announcement_sigs_state.unwrap(),
 			secp_ctx,
@@ -6888,6 +6974,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			cur_counterparty_commitment_transaction_number,
 			value_to_self_msat,
 
+			holder_max_accepted_htlcs,
 			pending_inbound_htlcs,
 			pending_outbound_htlcs,
 			holding_cell_htlc_updates,
@@ -6965,6 +7052,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			// Later in the ChannelManager deserialization phase we scan for channels and assign scid aliases if its missing
 			outbound_scid_alias: outbound_scid_alias.unwrap_or(0),
 
+			channel_pending_event_emitted: channel_pending_event_emitted.unwrap_or(true),
 			channel_ready_event_emitted: channel_ready_event_emitted.unwrap_or(true),
 
 			#[cfg(any(test, fuzzing))]
@@ -7007,6 +7095,7 @@ mod tests {
 	use crate::chain::chaininterface::{FeeEstimator, LowerBoundedFeeEstimator, ConfirmationTarget};
 	use crate::chain::keysinterface::{ChannelSigner, InMemorySigner, EntropySource, SignerProvider};
 	use crate::chain::transaction::OutPoint;
+	use crate::routing::router::Path;
 	use crate::util::config::UserConfig;
 	use crate::util::enforcing_trait_impls::EnforcingSigner;
 	use crate::util::errors::APIError;
@@ -7184,12 +7273,10 @@ mod tests {
 			cltv_expiry: 200000000,
 			state: OutboundHTLCState::Committed,
 			source: HTLCSource::OutboundRoute {
-				path: Vec::new(),
+				path: Path { hops: Vec::new(), blinded_tail: None },
 				session_priv: SecretKey::from_slice(&hex::decode("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap()[..]).unwrap(),
 				first_hop_htlc_msat: 548,
 				payment_id: PaymentId([42; 32]),
-				payment_secret: None,
-				payment_params: None,
 			}
 		});
 
@@ -7501,7 +7588,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(not(feature = "grind_signatures"))]
+	#[cfg(feature = "_test_vectors")]
 	#[test]
 	fn outbound_commitment_test() {
 		use bitcoin::util::sighash;
@@ -7534,6 +7621,7 @@ mod tests {
 			[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
 			10_000_000,
 			[0; 32],
+			[0; 32],
 		);
 
 		assert_eq!(signer.pubkeys().funding_pubkey.serialize()[..],
@@ -7543,7 +7631,7 @@ mod tests {
 		let counterparty_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let mut config = UserConfig::default();
 		config.channel_handshake_config.announced_channel = false;
-		let mut chan = Channel::<InMemorySigner>::new_outbound(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(&config), 10_000_000, 100000, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
+		let mut chan = Channel::<InMemorySigner>::new_outbound(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(&config), 10_000_000, 0, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
 		chan.holder_dust_limit_satoshis = 546;
 		chan.counterparty_selected_channel_reserve_satoshis = Some(0); // Filled in in accept_channel
 
@@ -7685,6 +7773,11 @@ mod tests {
 				assert!(htlc_sig_iter.next().is_none());
 			} }
 		}
+
+		// anchors: simple commitment tx with no HTLCs and single anchor
+		test_commitment_with_anchors!("30440220655bf909fb6fa81d086f1336ac72c97906dce29d1b166e305c99152d810e26e1022051f577faa46412c46707aaac46b65d50053550a66334e00a44af2706f27a8658",
+						 "3044022007cf6b405e9c9b4f527b0ecad9d8bb661fabb8b12abf7d1c0b3ad1855db3ed490220616d5c1eeadccc63bd775a131149455d62d95a42c2a1b01cc7821fc42dce7778",
+						 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80024a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f10529800000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400473044022007cf6b405e9c9b4f527b0ecad9d8bb661fabb8b12abf7d1c0b3ad1855db3ed490220616d5c1eeadccc63bd775a131149455d62d95a42c2a1b01cc7821fc42dce7778014730440220655bf909fb6fa81d086f1336ac72c97906dce29d1b166e305c99152d810e26e1022051f577faa46412c46707aaac46b65d50053550a66334e00a44af2706f27a865801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {});
 
 		// simple commitment tx with no HTLCs
 		chan.value_to_self_msat = 7000000000;
@@ -8136,7 +8229,7 @@ mod tests {
 		chan.pending_outbound_htlcs.push({
 			let mut out = OutboundHTLCOutput{
 				htlc_id: 6,
-				amount_msat: 5000000,
+				amount_msat: 5000001,
 				cltv_expiry: 506,
 				payment_hash: PaymentHash([0; 32]),
 				state: OutboundHTLCState::Committed,
@@ -8158,40 +8251,40 @@ mod tests {
 			out
 		});
 
-		test_commitment!("30440220048705bec5288d28b3f29344b8d124853b1af423a568664d2c6f02c8ea886525022060f998a461052a2476b912db426ea2a06700953a241135c7957f2e79bc222df9",
-		                 "3045022100c4f1d60b6fca9febc8b39de1a31e84c5f7c4b41c97239ef05f4350aa484c6b5e02200c5134ac8b20eb7a29d0dd4a501f6aa8fefb8489171f4cb408bd2a32324ab03f",
-		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8005d007000000000000220020748eba944fedc8827f6b06bc44678f93c0f9e6078b35c6331ed31e75f8ce0c2d8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121b8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121bc0c62d0000000000160014cc1b07838e387deacd0e5232e1e8b49f4c29e484a79f6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100c4f1d60b6fca9febc8b39de1a31e84c5f7c4b41c97239ef05f4350aa484c6b5e02200c5134ac8b20eb7a29d0dd4a501f6aa8fefb8489171f4cb408bd2a32324ab03f014730440220048705bec5288d28b3f29344b8d124853b1af423a568664d2c6f02c8ea886525022060f998a461052a2476b912db426ea2a06700953a241135c7957f2e79bc222df901475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
+		test_commitment!("304402207d0870964530f97b62497b11153c551dca0a1e226815ef0a336651158da0f82402200f5378beee0e77759147b8a0a284decd11bfd2bc55c8fafa41c134fe996d43c8",
+		                 "304402200d10bf5bc5397fc59d7188ae438d80c77575595a2d488e41bd6363a810cc8d72022012b57e714fbbfdf7a28c47d5b370cb8ac37c8545f596216e5b21e9b236ef457c",
+		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8005d007000000000000220020748eba944fedc8827f6b06bc44678f93c0f9e6078b35c6331ed31e75f8ce0c2d8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121b8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121bc0c62d0000000000160014cc1b07838e387deacd0e5232e1e8b49f4c29e484a69f6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e040047304402200d10bf5bc5397fc59d7188ae438d80c77575595a2d488e41bd6363a810cc8d72022012b57e714fbbfdf7a28c47d5b370cb8ac37c8545f596216e5b21e9b236ef457c0147304402207d0870964530f97b62497b11153c551dca0a1e226815ef0a336651158da0f82402200f5378beee0e77759147b8a0a284decd11bfd2bc55c8fafa41c134fe996d43c801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
 
 		                  { 0,
-		                  "304502210081cbb94121761d34c189cd4e6a281feea6f585060ad0ba2632e8d6b3c6bb8a6c02201007981bbd16539d63df2805b5568f1f5688cd2a885d04706f50db9b77ba13c6",
-		                  "304502210090ed76aeb21b53236a598968abc66e2024691d07b62f53ddbeca8f93144af9c602205f873af5a0c10e62690e9aba09740550f194a9dc455ba4c1c23f6cde7704674c",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc34000000000000000000011f070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050048304502210081cbb94121761d34c189cd4e6a281feea6f585060ad0ba2632e8d6b3c6bb8a6c02201007981bbd16539d63df2805b5568f1f5688cd2a885d04706f50db9b77ba13c60148304502210090ed76aeb21b53236a598968abc66e2024691d07b62f53ddbeca8f93144af9c602205f873af5a0c10e62690e9aba09740550f194a9dc455ba4c1c23f6cde7704674c012001010101010101010101010101010101010101010101010101010101010101018a76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac686800000000" },
+		                  "3045022100b470fe12e5b7fea9eccb8cbff1972cea4f96758041898982a02bcc7f9d56d50b0220338a75b2afaab4ec00cdd2d9273c68c7581ff5a28bcbb40c4d138b81f1d45ce5",
+		                  "3044022017b90c65207522a907fb6a137f9dd528b3389465a8ae72308d9e1d564f512cf402204fc917b4f0e88604a3e994f85bfae7c7c1f9d9e9f78e8cd112e0889720d9405b",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec000000000000000000011f070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100b470fe12e5b7fea9eccb8cbff1972cea4f96758041898982a02bcc7f9d56d50b0220338a75b2afaab4ec00cdd2d9273c68c7581ff5a28bcbb40c4d138b81f1d45ce501473044022017b90c65207522a907fb6a137f9dd528b3389465a8ae72308d9e1d564f512cf402204fc917b4f0e88604a3e994f85bfae7c7c1f9d9e9f78e8cd112e0889720d9405b012001010101010101010101010101010101010101010101010101010101010101018a76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac686800000000" },
 		                  { 1,
-		                  "304402201d0f09d2bf7bc245a4f17980e1e9164290df16c70c6a2ff1592f5030d6108581022061e744a7dc151b36bf0aff7a4f1812ba90b8b03633bb979a270d19858fd960c5",
-		                  "30450221009aef000d2e843a4202c1b1a2bf554abc9a7902bf49b2cb0759bc507456b7ebad02204e7c3d193ede2fd2b4cd6b39f51a920e581e35575e357e44d7b699c40ce61d39",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc3401000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050047304402201d0f09d2bf7bc245a4f17980e1e9164290df16c70c6a2ff1592f5030d6108581022061e744a7dc151b36bf0aff7a4f1812ba90b8b03633bb979a270d19858fd960c5014830450221009aef000d2e843a4202c1b1a2bf554abc9a7902bf49b2cb0759bc507456b7ebad02204e7c3d193ede2fd2b4cd6b39f51a920e581e35575e357e44d7b699c40ce61d3901008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868f9010000" },
+		                  "3045022100b575379f6d8743cb0087648f81cfd82d17a97fbf8f67e058c65ce8b9d25df9500220554a210d65b02d9f36c6adf0f639430ca8293196ba5089bf67cc3a9813b7b00a",
+		                  "3045022100ee2e16b90930a479b13f8823a7f14b600198c838161160b9436ed086d3fc57e002202a66fa2324f342a17129949c640bfe934cbc73a869ba7c06aa25c5a3d0bfb53d",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec01000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100b575379f6d8743cb0087648f81cfd82d17a97fbf8f67e058c65ce8b9d25df9500220554a210d65b02d9f36c6adf0f639430ca8293196ba5089bf67cc3a9813b7b00a01483045022100ee2e16b90930a479b13f8823a7f14b600198c838161160b9436ed086d3fc57e002202a66fa2324f342a17129949c640bfe934cbc73a869ba7c06aa25c5a3d0bfb53d01008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868f9010000" },
 		                  { 2,
-		                  "30440220010bf035d5823596e50dce2076a4d9f942d8d28031c9c428b901a02b6b8140de02203250e8e4a08bc5b4ecdca4d0eedf98223e02e3ac1c0206b3a7ffdb374aa21e5f",
-		                  "30440220073de0067b88e425b3018b30366bfeda0ccb703118ccd3d02ead08c0f53511d002203fac50ac0e4cf8a3af0b4b1b12e801650591f748f8ddf1e089c160f10b69e511",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc3402000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220010bf035d5823596e50dce2076a4d9f942d8d28031c9c428b901a02b6b8140de02203250e8e4a08bc5b4ecdca4d0eedf98223e02e3ac1c0206b3a7ffdb374aa21e5f014730440220073de0067b88e425b3018b30366bfeda0ccb703118ccd3d02ead08c0f53511d002203fac50ac0e4cf8a3af0b4b1b12e801650591f748f8ddf1e089c160f10b69e51101008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868fa010000" }
+		                  "30440220471c9f3ad92e49b13b7b8059f43ecf8f7887b0dccbb9fdb54bfe23d62a8ae332022024bd22fae0740e86a44228c35330da9526fd7306dffb2b9dc362d5e78abef7cc",
+		                  "304402207157f452f2506d73c315192311893800cfb3cc235cc1185b1cfcc136b55230db022014be242dbc6c5da141fec4034e7f387f74d6ff1899453d72ba957467540e1ecb",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec02000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220471c9f3ad92e49b13b7b8059f43ecf8f7887b0dccbb9fdb54bfe23d62a8ae332022024bd22fae0740e86a44228c35330da9526fd7306dffb2b9dc362d5e78abef7cc0147304402207157f452f2506d73c315192311893800cfb3cc235cc1185b1cfcc136b55230db022014be242dbc6c5da141fec4034e7f387f74d6ff1899453d72ba957467540e1ecb01008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868fa010000" }
 		} );
 
-		test_commitment_with_anchors!("3045022100c592f6b80d35b4f5d1e3bc9788f51141a0065be6013bad53a1977f7c444651660220278ac06ead9016bfb8dc476f186eabace2b02793b2f308442f5b0d5f24a68948",
-		                 "3045022100c37ac4fc8538677631230c4b286f36b6f54c51fb4b34ef0bd0ba219ba47452630220278e09a745454ea380f3694392ed113762c68dd209b48360f547541088be9e45",
-		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80074a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f4a01000000000000220020e9e86e4823faa62e222ebc858a226636856158f07e69898da3b0d1af0ddb3994d007000000000000220020fe0598d74fee2205cc3672e6e6647706b4f3099713b4661b62482c3addd04a5e881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7c0c62d0000000000220020f3394e1e619b0eca1f91be2fb5ab4dfc59ba5b84ebe014ad1d43a564d012994aae9c6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100c37ac4fc8538677631230c4b286f36b6f54c51fb4b34ef0bd0ba219ba47452630220278e09a745454ea380f3694392ed113762c68dd209b48360f547541088be9e4501483045022100c592f6b80d35b4f5d1e3bc9788f51141a0065be6013bad53a1977f7c444651660220278ac06ead9016bfb8dc476f186eabace2b02793b2f308442f5b0d5f24a6894801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
+		test_commitment_with_anchors!("3044022027b38dfb654c34032ffb70bb43022981652fce923cbbe3cbe7394e2ade8b34230220584195b78da6e25c2e8da6b4308d9db25b65b64975db9266163ef592abb7c725",
+		                 "3045022100b4014970d9d7962853f3f85196144671d7d5d87426250f0a5fdaf9a55292e92502205360910c9abb397467e19dbd63d081deb4a3240903114c98cec0a23591b79b76",
+		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80074a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f4a01000000000000220020e9e86e4823faa62e222ebc858a226636856158f07e69898da3b0d1af0ddb3994d007000000000000220020fe0598d74fee2205cc3672e6e6647706b4f3099713b4661b62482c3addd04a5e881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7c0c62d0000000000220020f3394e1e619b0eca1f91be2fb5ab4dfc59ba5b84ebe014ad1d43a564d012994aad9c6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100b4014970d9d7962853f3f85196144671d7d5d87426250f0a5fdaf9a55292e92502205360910c9abb397467e19dbd63d081deb4a3240903114c98cec0a23591b79b7601473044022027b38dfb654c34032ffb70bb43022981652fce923cbbe3cbe7394e2ade8b34230220584195b78da6e25c2e8da6b4308d9db25b65b64975db9266163ef592abb7c72501475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
 
 		                  { 0,
-		                  "3045022100de8a0649d54fd2e4fc04502c77df9b65da839bbd01854f818f129338b99564b2022009528dbb12c00e874cb2149b1dccc600c69ea5e4042ebf584984fcb029c2d1ec",
-		                  "304402203e7c2622fa3ca29355d37a0ea991bfd7cdb54e6122a1d98d3229d092131f55cd022055263f7f8f32f4cd2f86da63ca106bd7badf0b19ee9833d80cd3b9216eeafd74",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe2902000000000100000001d0070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100de8a0649d54fd2e4fc04502c77df9b65da839bbd01854f818f129338b99564b2022009528dbb12c00e874cb2149b1dccc600c69ea5e4042ebf584984fcb029c2d1ec8347304402203e7c2622fa3ca29355d37a0ea991bfd7cdb54e6122a1d98d3229d092131f55cd022055263f7f8f32f4cd2f86da63ca106bd7badf0b19ee9833d80cd3b9216eeafd74012001010101010101010101010101010101010101010101010101010101010101018d76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac6851b2756800000000" },
+		                  "30440220078fe5343dab88c348a3a8a9c1a9293259dbf35507ae971702cc39dd623ea9af022011ed0c0f35243cd0bb4d9ca3c772379b2b5f4af93140e9fdc5600dfec1cdb0c2",
+		                  "304402205df665e2908c7690d2d33eb70e6e119958c28febe141a94ed0dd9a55ce7c8cfc0220364d02663a5d019af35c5cd5fda9465d985d85bbd12db207738d61163449a424",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c402000000000100000001d0070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220078fe5343dab88c348a3a8a9c1a9293259dbf35507ae971702cc39dd623ea9af022011ed0c0f35243cd0bb4d9ca3c772379b2b5f4af93140e9fdc5600dfec1cdb0c28347304402205df665e2908c7690d2d33eb70e6e119958c28febe141a94ed0dd9a55ce7c8cfc0220364d02663a5d019af35c5cd5fda9465d985d85bbd12db207738d61163449a424012001010101010101010101010101010101010101010101010101010101010101018d76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac6851b2756800000000" },
 		                  { 1,
-		                  "3045022100de6eee8474376ea316d007b33103b4543a46bdf6fda5cbd5902b28a5bc14584f022002989e7b4f7813b77acbe4babcf96d7ffbbe0bf14cba24672364f8e591479edb",
-		                  "3045022100c10688346a9d84647bde7027da07f0d79c6d4129307e4c6c9aea7bdbf25ac3350220269104209793c32c47491698c4e46ebea9c3293a1e4403f9abda39f79698f6b5",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe290300000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100de6eee8474376ea316d007b33103b4543a46bdf6fda5cbd5902b28a5bc14584f022002989e7b4f7813b77acbe4babcf96d7ffbbe0bf14cba24672364f8e591479edb83483045022100c10688346a9d84647bde7027da07f0d79c6d4129307e4c6c9aea7bdbf25ac3350220269104209793c32c47491698c4e46ebea9c3293a1e4403f9abda39f79698f6b501008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568f9010000" },
+		                  "304402202df6bf0f98a42cfd0172a16bded7d1b16c14f5f42ba23f5c54648c14b647531302200fe1508626817f23925bb56951d5e4b2654c751743ab6db48a6cce7dda17c01c",
+		                  "304402203f99ec05cdd89558a23683b471c1dcce8f6a92295f1fff3b0b5d21be4d4f97ea022019d29070690fc2c126fe27cc4ab2f503f289d362721b2efa7418e7fddb939a5b",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c40300000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050047304402202df6bf0f98a42cfd0172a16bded7d1b16c14f5f42ba23f5c54648c14b647531302200fe1508626817f23925bb56951d5e4b2654c751743ab6db48a6cce7dda17c01c8347304402203f99ec05cdd89558a23683b471c1dcce8f6a92295f1fff3b0b5d21be4d4f97ea022019d29070690fc2c126fe27cc4ab2f503f289d362721b2efa7418e7fddb939a5b01008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568f9010000" },
 		                  { 2,
-		                  "3045022100fe87da8124ceecbcabb9d599c5339f40277c7c7406514fafbccbf180c7c09cf40220429c7fb6d0fd3705e931ab1219ab0432af38ae4d676008cc1964fbeb8cd35d2e",
-		                  "3044022040ac769a851da31d8e4863e5f94719204f716c82a1ce6d6c52193d9a33b84bce022035df97b078ce80f20dca2109e4c6075af0b50148811452e7290e68b2680fced4",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe290400000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100fe87da8124ceecbcabb9d599c5339f40277c7c7406514fafbccbf180c7c09cf40220429c7fb6d0fd3705e931ab1219ab0432af38ae4d676008cc1964fbeb8cd35d2e83473044022040ac769a851da31d8e4863e5f94719204f716c82a1ce6d6c52193d9a33b84bce022035df97b078ce80f20dca2109e4c6075af0b50148811452e7290e68b2680fced401008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568fa010000" }
+		                  "3045022100bd206b420c495f3aa714d3ea4766cbe95441deacb5d2f737f1913349aee7c2ae02200249d2c950dd3b15326bf378ae5d2b871d33d6737f5d70735f3de8383140f2a1",
+		                  "3045022100f2cd35e385b9b7e15b92a5d78d120b6b2c5af4e974bc01e884c5facb3bb5966c0220706e0506477ce809a40022d6de8e041e9ef13136c45abee9c36f58a01fdb188b",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c40400000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100bd206b420c495f3aa714d3ea4766cbe95441deacb5d2f737f1913349aee7c2ae02200249d2c950dd3b15326bf378ae5d2b871d33d6737f5d70735f3de8383140f2a183483045022100f2cd35e385b9b7e15b92a5d78d120b6b2c5af4e974bc01e884c5facb3bb5966c0220706e0506477ce809a40022d6de8e041e9ef13136c45abee9c36f58a01fdb188b01008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568fa010000" }
 		} );
 	}
 

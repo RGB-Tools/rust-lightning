@@ -49,14 +49,17 @@
 //! # use lightning::util::logger::{Logger, Record};
 //! # struct FakeLogger {}
 //! # impl Logger for FakeLogger {
-//! #     fn log(&self, record: &Record) { unimplemented!() }
+//! #     fn log(&self, record: &Record) { }
 //! # }
 //! # let logger = FakeLogger {};
 //!
 //! let network_graph = NetworkGraph::new(Network::Bitcoin, &logger);
 //! let rapid_sync = RapidGossipSync::new(&network_graph, &logger);
 //! let snapshot_contents: &[u8] = &[0; 0];
-//! let new_last_sync_timestamp_result = rapid_sync.update_network_graph(snapshot_contents);
+//! // In no-std you need to provide the current time in unix epoch seconds
+//! // otherwise you can use update_network_graph
+//! let current_time_unix = 0;
+//! let new_last_sync_timestamp_result = rapid_sync.update_network_graph_no_std(snapshot_contents, Some(current_time_unix));
 //! ```
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
@@ -128,6 +131,7 @@ impl<NG: Deref<Target=NetworkGraph<L>>, L: Deref> RapidGossipSync<NG, L> where L
 	/// Returns the last sync timestamp to be used the next time rapid sync data is queried.
 	///
 	/// `update_data`: `&[u8]` binary stream that comprises the update data
+	#[cfg(feature = "std")]
 	pub fn update_network_graph(&self, update_data: &[u8]) -> Result<u32, GraphSyncError> {
 		let mut read_cursor = io::Cursor::new(update_data);
 		self.update_network_graph_from_byte_stream(&mut read_cursor)
@@ -146,7 +150,7 @@ impl<NG: Deref<Target=NetworkGraph<L>>, L: Deref> RapidGossipSync<NG, L> where L
 	/// Gets a reference to the underlying [`NetworkGraph`] which was provided in
 	/// [`RapidGossipSync::new`].
 	///
-	/// (C-not exported) as bindings don't support a reference-to-a-reference yet
+	/// This is not exported to bindings users as bindings don't support a reference-to-a-reference yet
 	pub fn network_graph(&self) -> &NG {
 		&self.network_graph
 	}
@@ -183,18 +187,17 @@ mod tests {
 				fs::create_dir_all(graph_sync_test_directory).unwrap();
 
 				let graph_sync_test_file = test.get_test_file_path();
-				fs::write(&graph_sync_test_file, valid_response).unwrap();
+				fs::write(graph_sync_test_file, valid_response).unwrap();
 
 				test
 			}
+
 			fn get_test_directory(&self) -> String {
-				let graph_sync_test_directory = self.directory.clone() + "/graph-sync-tests";
-				graph_sync_test_directory
+				self.directory.clone() + "/graph-sync-tests"
 			}
+
 			fn get_test_file_path(&self) -> String {
-				let graph_sync_test_directory = self.get_test_directory();
-				let graph_sync_test_file = graph_sync_test_directory.to_owned() + "/test_data.lngossip";
-				graph_sync_test_file
+				self.get_test_directory() + "/test_data.lngossip"
 			}
 		}
 

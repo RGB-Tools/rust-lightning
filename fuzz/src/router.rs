@@ -227,7 +227,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 			},
 			4 => {
 				let short_channel_id = slice_to_be64(get_slice!(8));
-				net_graph.channel_failed(short_channel_id, false);
+				net_graph.channel_failed_permanent(short_channel_id);
 			},
 			_ if node_pks.is_empty() => {},
 			_ => {
@@ -268,6 +268,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 								inbound_htlc_minimum_msat: None,
 								inbound_htlc_maximum_msat: None,
 								config: None,
+								feerate_sat_per_1000_weight: None,
 							});
 						}
 						Some(&first_hops_vec[..])

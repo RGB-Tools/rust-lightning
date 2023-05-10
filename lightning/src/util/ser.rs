@@ -38,6 +38,8 @@ use bitcoin::hash_types::{Txid, BlockHash};
 use core::marker::Sized;
 use core::time::Duration;
 use crate::ln::msgs::DecodeError;
+#[cfg(taproot)]
+use crate::ln::msgs::PartialSignatureWithNonce;
 use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
 
 use crate::util::byte_utils::{be48_to_array, slice_to_be48};
@@ -50,7 +52,7 @@ pub const MAX_BUF_SIZE: usize = 64 * 1024;
 /// A simplified version of [`std::io::Write`] that exists largely for backwards compatibility.
 /// An impl is provided for any type that also impls [`std::io::Write`].
 ///
-/// (C-not exported) as we only export serialization to/from byte arrays instead
+/// This is not exported to bindings users as we only export serialization to/from byte arrays instead
 pub trait Writer {
 	/// Writes the given buf out. See std::io::Write::write_all for more
 	fn write_all(&mut self, buf: &[u8]) -> Result<(), io::Error>;
@@ -92,7 +94,7 @@ impl Writer for VecWriter {
 /// Writer that only tracks the amount of data written - useful if you need to calculate the length
 /// of some data when serialized but don't yet need the full data.
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct LengthCalculatingWriter(pub usize);
 impl Writer for LengthCalculatingWriter {
 	#[inline]
@@ -105,7 +107,7 @@ impl Writer for LengthCalculatingWriter {
 /// Essentially [`std::io::Take`] but a bit simpler and with a method to walk the underlying stream
 /// forward to ensure we always consume exactly the fixed length specified.
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct FixedLengthReader<R: Read> {
 	read: R,
 	bytes_read: u64,
@@ -162,7 +164,7 @@ impl<R: Read> LengthRead for FixedLengthReader<R> {
 /// A [`Read`] implementation which tracks whether any bytes have been read at all. This allows us to distinguish
 /// between "EOF reached before we started" and "EOF reached mid-read".
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct ReadTrackingReader<R: Read> {
 	read: R,
 	/// Returns whether we have read from this reader or not yet.
@@ -190,7 +192,7 @@ impl<R: Read> Read for ReadTrackingReader<R> {
 
 /// A trait that various LDK types implement allowing them to be written out to a [`Writer`].
 ///
-/// (C-not exported) as we only export serialization to/from byte arrays instead
+/// This is not exported to bindings users as we only export serialization to/from byte arrays instead
 pub trait Writeable {
 	/// Writes `self` out to the given [`Writer`].
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error>;
@@ -230,7 +232,7 @@ impl<'a, T: Writeable> Writeable for &'a T {
 
 /// A trait that various LDK types implement allowing them to be read in from a [`Read`].
 ///
-/// (C-not exported) as we only export serialization to/from byte arrays instead
+/// This is not exported to bindings users as we only export serialization to/from byte arrays instead
 pub trait Readable
 	where Self: Sized
 {
@@ -248,7 +250,7 @@ pub(crate) trait SeekReadable where Self: Sized {
 /// A trait that various higher-level LDK types implement allowing them to be read in
 /// from a [`Read`] given some additional set of arguments which is required to deserialize.
 ///
-/// (C-not exported) as we only export serialization to/from byte arrays instead
+/// This is not exported to bindings users as we only export serialization to/from byte arrays instead
 pub trait ReadableArgs<P>
 	where Self: Sized
 {
@@ -281,7 +283,7 @@ pub(crate) trait LengthReadable where Self: Sized
 
 /// A trait that various LDK types implement allowing them to (maybe) be read in from a [`Read`].
 ///
-/// (C-not exported) as we only export serialization to/from byte arrays instead
+/// This is not exported to bindings users as we only export serialization to/from byte arrays instead
 pub trait MaybeReadable
 	where Self: Sized
 {
@@ -298,7 +300,7 @@ impl<T: Readable> MaybeReadable for T {
 
 /// Wrapper to read a required (non-optional) TLV record.
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct RequiredWrapper<T>(pub Option<T>);
 impl<T: Readable> Readable for RequiredWrapper<T> {
 	#[inline]
@@ -322,7 +324,7 @@ impl<T> From<T> for RequiredWrapper<T> {
 /// Wrapper to read a required (non-optional) TLV record that may have been upgraded without
 /// backwards compat.
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct UpgradableRequired<T: MaybeReadable>(pub Option<T>);
 impl<T: MaybeReadable> MaybeReadable for UpgradableRequired<T> {
 	#[inline]
@@ -576,6 +578,7 @@ impl_array!(16); // for IPv6
 impl_array!(32); // for channel id & hmac
 impl_array!(PUBLIC_KEY_SIZE); // for PublicKey
 impl_array!(64); // for ecdsa::Signature and schnorr::Signature
+impl_array!(66); // for MuSig2 nonces
 impl_array!(1300); // for OnionPacket.hop_data
 
 impl Writeable for [u16; 8] {
@@ -595,7 +598,7 @@ impl Readable for [u16; 8] {
 		r.read_exact(&mut buf)?;
 		let mut res = [0u16; 8];
 		for (idx, v) in res.iter_mut().enumerate() {
-			*v = (buf[idx] as u16) << 8 | (buf[idx + 1] as u16)
+			*v = (buf[idx*2] as u16) << 8 | (buf[idx*2 + 1] as u16)
 		}
 		Ok(res)
 	}
@@ -604,7 +607,7 @@ impl Readable for [u16; 8] {
 /// A type for variable-length values within TLV record where the length is encoded as part of the record.
 /// Used to prevent encoding the length twice.
 ///
-/// (C-not exported) as manual TLV building is not currently supported in bindings
+/// This is not exported to bindings users as manual TLV building is not currently supported in bindings
 pub struct WithoutLength<T>(pub T);
 
 impl Writeable for WithoutLength<&String> {
@@ -748,7 +751,7 @@ where T: Readable + Eq + Hash
 }
 
 // Vectors
-macro_rules! impl_for_vec {
+macro_rules! impl_writeable_for_vec {
 	($ty: ty $(, $name: ident)*) => {
 		impl<$($name : Writeable),*> Writeable for Vec<$ty> {
 			#[inline]
@@ -760,7 +763,10 @@ macro_rules! impl_for_vec {
 				Ok(())
 			}
 		}
-
+	}
+}
+macro_rules! impl_readable_for_vec {
+	($ty: ty $(, $name: ident)*) => {
 		impl<$($name : Readable),*> Readable for Vec<$ty> {
 			#[inline]
 			fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
@@ -774,6 +780,12 @@ macro_rules! impl_for_vec {
 				Ok(ret)
 			}
 		}
+	}
+}
+macro_rules! impl_for_vec {
+	($ty: ty $(, $name: ident)*) => {
+		impl_writeable_for_vec!($ty $(, $name)*);
+		impl_readable_for_vec!($ty $(, $name)*);
 	}
 }
 
@@ -804,6 +816,8 @@ impl Readable for Vec<u8> {
 impl_for_vec!(ecdsa::Signature);
 impl_for_vec!(crate::ln::channelmanager::MonitorUpdateCompletionAction);
 impl_for_vec!((A, B), A, B);
+impl_writeable_for_vec!(&crate::routing::router::BlindedTail);
+impl_readable_for_vec!(crate::routing::router::BlindedTail);
 
 impl Writeable for Script {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
@@ -860,6 +874,39 @@ impl Readable for SecretKey {
 			Ok(key) => Ok(key),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
+	}
+}
+
+#[cfg(taproot)]
+impl Writeable for musig2::types::PublicNonce {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.serialize().write(w)
+	}
+}
+
+#[cfg(taproot)]
+impl Readable for musig2::types::PublicNonce {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let buf: [u8; PUBLIC_KEY_SIZE * 2] = Readable::read(r)?;
+		musig2::types::PublicNonce::from_slice(&buf).map_err(|_| DecodeError::InvalidValue)
+	}
+}
+
+#[cfg(taproot)]
+impl Writeable for PartialSignatureWithNonce {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.0.serialize().write(w)?;
+		self.1.write(w)
+	}
+}
+
+#[cfg(taproot)]
+impl Readable for PartialSignatureWithNonce {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let partial_signature_buf: [u8; SECRET_KEY_SIZE] = Readable::read(r)?;
+		let partial_signature = musig2::types::PartialSignature::from_slice(&partial_signature_buf).map_err(|_| DecodeError::InvalidValue)?;
+		let public_nonce: musig2::types::PublicNonce = Readable::read(r)?;
+		Ok(PartialSignatureWithNonce(partial_signature, public_nonce))
 	}
 }
 
@@ -1275,6 +1322,7 @@ impl Readable for Duration {
 #[cfg(test)]
 mod tests {
 	use core::convert::TryFrom;
+	use bitcoin::secp256k1::ecdsa;
 	use crate::util::ser::{Readable, Hostname, Writeable};
 
 	#[test]
@@ -1295,5 +1343,58 @@ mod tests {
 		let mut buf: Vec<u8> = Vec::new();
 		hostname.write(&mut buf).unwrap();
 		assert_eq!(Hostname::read(&mut buf.as_slice()).unwrap().as_str(), "test");
+	}
+
+	#[test]
+	/// Taproot will likely fill legacy signature fields with all 0s.
+	/// This test ensures that doing so won't break serialization.
+	fn null_signature_codec() {
+		let buffer = vec![0u8; 64];
+		let mut cursor = crate::io::Cursor::new(buffer.clone());
+		let signature = ecdsa::Signature::read(&mut cursor).unwrap();
+		let serialization = signature.serialize_compact();
+		assert_eq!(buffer, serialization.to_vec())
+	}
+
+	#[test]
+	fn bigsize_encoding_decoding() {
+		let values = vec![0, 252, 253, 65535, 65536, 4294967295, 4294967296, 18446744073709551615];
+		let bytes = vec![
+			"00",
+			"fc",
+			"fd00fd",
+			"fdffff",
+			"fe00010000",
+			"feffffffff",
+			"ff0000000100000000",
+			"ffffffffffffffffff"
+		];
+		for i in 0..=7 {
+			let mut stream = crate::io::Cursor::new(::hex::decode(bytes[i]).unwrap());
+			assert_eq!(super::BigSize::read(&mut stream).unwrap().0, values[i]);
+			let mut stream = super::VecWriter(Vec::new());
+			super::BigSize(values[i]).write(&mut stream).unwrap();
+			assert_eq!(stream.0, ::hex::decode(bytes[i]).unwrap());
+		}
+		let err_bytes = vec![
+			"fd00fc",
+			"fe0000ffff",
+			"ff00000000ffffffff",
+			"fd00",
+			"feffff",
+			"ffffffffff",
+			"fd",
+			"fe",
+			"ff",
+			""
+		];
+		for i in 0..=9 {
+			let mut stream = crate::io::Cursor::new(::hex::decode(err_bytes[i]).unwrap());
+			if i < 3 {
+				assert_eq!(super::BigSize::read(&mut stream).err(), Some(crate::ln::msgs::DecodeError::InvalidValue));
+			} else {
+				assert_eq!(super::BigSize::read(&mut stream).err(), Some(crate::ln::msgs::DecodeError::ShortRead));
+			}
+		}
 	}
 }

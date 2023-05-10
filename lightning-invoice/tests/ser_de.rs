@@ -5,9 +5,10 @@ extern crate lightning_invoice;
 extern crate secp256k1;
 extern crate hex;
 
+use bitcoin::util::address::WitnessVersion;
+use bitcoin::{PubkeyHash, ScriptHash};
 use bitcoin_hashes::hex::FromHex;
 use bitcoin_hashes::{sha256, Hash};
-use bech32::u5;
 use lightning::ln::PaymentSecret;
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{RouteHint, RouteHintHop};
@@ -115,7 +116,7 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 				.payment_hash(sha256::Hash::from_hex(
 					"0001020304050607080900010203040506070809000102030405060708090102"
 				).unwrap())
-				.fallback(Fallback::PubKeyHash([49, 114, 181, 101, 79, 102, 131, 200, 251, 20, 105, 89, 211, 71, 206, 48, 60, 174, 76, 167]))
+				.fallback(Fallback::PubKeyHash(PubkeyHash::from_slice(&[49, 114, 181, 101, 79, 102, 131, 200, 251, 20, 105, 89, 211, 71, 206, 48, 60, 174, 76, 167]).unwrap()))
 				.build_raw()
 				.unwrap()
 				.sign(|_| {
@@ -137,7 +138,7 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 				.payment_hash(sha256::Hash::from_hex(
 					"0001020304050607080900010203040506070809000102030405060708090102"
 				).unwrap())
-				.fallback(Fallback::PubKeyHash([4, 182, 31, 125, 193, 234, 13, 201, 148, 36, 70, 76, 196, 6, 77, 197, 100, 217, 30, 137]))
+				.fallback(Fallback::PubKeyHash(PubkeyHash::from_slice(&[4, 182, 31, 125, 193, 234, 13, 201, 148, 36, 70, 76, 196, 6, 77, 197, 100, 217, 30, 137]).unwrap()))
 				.private_route(RouteHint(vec![RouteHintHop {
 					src_node_id: PublicKey::from_slice(&hex::decode(
 							"029e03a901b85534ff1e92c43c74431f7ce72046060fcf7a95c37e148f78c77255"
@@ -176,7 +177,7 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 				.payment_hash(sha256::Hash::from_hex(
 					"0001020304050607080900010203040506070809000102030405060708090102"
 				).unwrap())
-				.fallback(Fallback::ScriptHash([143, 85, 86, 59, 154, 25, 243, 33, 194, 17, 233, 185, 243, 140, 223, 104, 110, 160, 120, 69]))
+				.fallback(Fallback::ScriptHash(ScriptHash::from_slice(&[143, 85, 86, 59, 154, 25, 243, 33, 194, 17, 233, 185, 243, 140, 223, 104, 110, 160, 120, 69]).unwrap()))
 				.build_raw()
 				.unwrap()
 				.sign(|_| {
@@ -198,7 +199,7 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 				.payment_hash(sha256::Hash::from_hex(
 					"0001020304050607080900010203040506070809000102030405060708090102"
 				).unwrap())
-				.fallback(Fallback::SegWitProgram { version: u5::try_from_u8(0).unwrap(),
+				.fallback(Fallback::SegWitProgram { version: WitnessVersion::V0,
 					program: vec![117, 30, 118, 232, 25, 145, 150, 212, 84, 148, 28, 69, 209, 179, 163, 35, 241, 67, 59, 214]
 				})
 				.build_raw()
@@ -222,7 +223,7 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 				.payment_hash(sha256::Hash::from_hex(
 					"0001020304050607080900010203040506070809000102030405060708090102"
 				).unwrap())
-				.fallback(Fallback::SegWitProgram { version: u5::try_from_u8(0).unwrap(),
+				.fallback(Fallback::SegWitProgram { version: WitnessVersion::V0,
 					program: vec![24, 99, 20, 60, 20, 197, 22, 104, 4, 189, 25, 32, 51, 86, 218, 19, 108, 152, 86, 120, 205, 77, 39, 161, 184, 198, 50, 150, 4, 144, 50, 98]
 				})
 				.build_raw()
@@ -331,6 +332,56 @@ fn get_test_tuples() -> Vec<(String, SignedRawInvoice, bool, bool)> {
 			true, // Different features than set in InvoiceBuilder
 			true, // Some unknown fields
 		),
+		( // Older version of the payment metadata test with a payment_pubkey set
+			"lnbc10m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdp9wpshjmt9de6zqmt9w3skgct5vysxjmnnd9jx2mq8q8a04uqnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66sp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q2gqqqqqqsgqy9gw6ymamd20jumvdgpfphkhp8fzhhdhycw36egcmla5vlrtrmhs9t7psfy3hkkdqzm9eq64fjg558znccds5nhsfmxveha5xe0dykgpspdha0".to_owned(),
+			InvoiceBuilder::new(Currency::Bitcoin)
+				.amount_milli_satoshis(1_000_000_000)
+				.duration_since_epoch(Duration::from_secs(1496314658))
+				.payment_hash(sha256::Hash::from_hex(
+					"0001020304050607080900010203040506070809000102030405060708090102"
+				).unwrap())
+				.description("payment metadata inside".to_owned())
+				.payment_metadata(hex::decode("01fafaf0").unwrap())
+				.require_payment_metadata()
+				.payee_pub_key(PublicKey::from_slice(&hex::decode(
+						"03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad"
+					).unwrap()).unwrap())
+				.payment_secret(PaymentSecret([0x11; 32]))
+				.build_raw()
+				.unwrap()
+				.sign(|_| {
+					RecoverableSignature::from_compact(
+						&hex::decode("2150ed137ddb54f9736c6a0290ded709d22bddb7261d1d6518dffb467c6b1eef02afc182491bdacd00b65c83554c914a1c53c61b0a4ef04eccccdfb4365ed259").unwrap(),
+						RecoveryId::from_i32(1).unwrap()
+					)
+				}).unwrap(),
+			false, // Different features than set in InvoiceBuilder
+			true, // Some unknown fields
+		),
+		(
+			"lnbc10m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdp9wpshjmt9de6zqmt9w3skgct5vysxjmnnd9jx2mq8q8a04uqsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q2gqqqqqqsgq7hf8he7ecf7n4ffphs6awl9t6676rrclv9ckg3d3ncn7fct63p6s365duk5wrk202cfy3aj5xnnp5gs3vrdvruverwwq7yzhkf5a3xqpd05wjc".to_owned(),
+			InvoiceBuilder::new(Currency::Bitcoin)
+				.amount_milli_satoshis(1_000_000_000)
+				.duration_since_epoch(Duration::from_secs(1496314658))
+				.payment_hash(sha256::Hash::from_hex(
+					"0001020304050607080900010203040506070809000102030405060708090102"
+				).unwrap())
+				.description("payment metadata inside".to_owned())
+				.payment_metadata(hex::decode("01fafaf0").unwrap())
+				.require_payment_metadata()
+				.payment_secret(PaymentSecret([0x11; 32]))
+				.build_raw()
+				.unwrap()
+				.sign(|_| {
+					RecoverableSignature::from_compact(
+						&hex::decode("f5d27be7d9c27d3aa521bc35d77cabd6bda18f1f61716445b19e27e4e17a887508ea8de5a8e1d94f561248f65434e61a221160dac1f1991b9c0f1057b269d898").unwrap(),
+						RecoveryId::from_i32(1).unwrap()
+					)
+				}).unwrap(),
+			false, // Different features than set in InvoiceBuilder
+			true, // Some unknown fields
+		),
+
 	]
 }
 

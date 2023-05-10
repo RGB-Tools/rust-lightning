@@ -18,9 +18,11 @@
 //! invoices and functions to create, encode and decode these. If you just want to use the standard
 //! en-/decoding functionality this should get you started:
 //!
-//!   * For parsing use `str::parse::<Invoice>(&self)` (see the docs of `impl FromStr for Invoice`)
-//!   * For constructing invoices use the `InvoiceBuilder`
-//!   * For serializing invoices use the `Display`/`ToString` traits
+//!   * For parsing use `str::parse::<Invoice>(&self)` (see [`Invoice::from_str`])
+//!   * For constructing invoices use the [`InvoiceBuilder`]
+//!   * For serializing invoices use the [`Display`]/[`ToString`] traits
+//!
+//! [`Invoice::from_str`]: crate::Invoice#impl-FromStr
 
 #[cfg(not(any(feature = "std", feature = "no-std")))]
 compile_error!("at least one of the `std` or `no-std` features must be enabled");
@@ -45,8 +47,9 @@ extern crate serde;
 use std::time::SystemTime;
 
 use bech32::u5;
-use bitcoin_hashes::Hash;
-use bitcoin_hashes::sha256;
+use bitcoin::{Address, Network, PubkeyHash, ScriptHash};
+use bitcoin::util::address::{Payload, WitnessVersion};
+use bitcoin_hashes::{Hash, sha256};
 use lightning::ln::PaymentSecret;
 use lightning::ln::features::InvoiceFeatures;
 #[cfg(any(doc, test))]
@@ -162,7 +165,7 @@ pub const DEFAULT_EXPIRY_TIME: u64 = 3600;
 /// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
 pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA: u64 = 18;
 
-/// Builder for `Invoice`s. It's the most convenient and advised way to use this library. It ensures
+/// Builder for [`Invoice`]s. It's the most convenient and advised way to use this library. It ensures
 /// that only a semantically and syntactically correct Invoice can be built using it.
 ///
 /// ```
@@ -214,13 +217,16 @@ pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA: u64 = 18;
 /// # Type parameters
 /// The two parameters `D` and `H` signal if the builder already contains the correct amount of the
 /// given field:
-///  * `D`: exactly one `Description` or `DescriptionHash`
-///  * `H`: exactly one `PaymentHash`
+///  * `D`: exactly one [`TaggedField::Description`] or [`TaggedField::DescriptionHash`]
+///  * `H`: exactly one [`TaggedField::PaymentHash`]
 ///  * `T`: the timestamp is set
+///  * `C`: the CLTV expiry is set
+///  * `S`: the payment secret is set
+///  * `M`: payment metadata is set
 ///
-/// (C-not exported) as we likely need to manually select one set of boolean type parameters.
+/// This is not exported to bindings users as we likely need to manually select one set of boolean type parameters.
 #[derive(Eq, PartialEq, Debug, Clone)]
-pub struct InvoiceBuilder<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> {
+pub struct InvoiceBuilder<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> {
 	currency: Currency,
 	amount: Option<u64>,
 	si_prefix: Option<SiPrefix>,
@@ -233,14 +239,17 @@ pub struct InvoiceBuilder<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S:
 	phantom_t: core::marker::PhantomData<T>,
 	phantom_c: core::marker::PhantomData<C>,
 	phantom_s: core::marker::PhantomData<S>,
+	phantom_m: core::marker::PhantomData<M>,
 }
 
 /// Represents a syntactically and semantically correct lightning BOLT11 invoice.
 ///
 /// There are three ways to construct an `Invoice`:
-///  1. using `InvoiceBuilder`
-///  2. using `Invoice::from_signed(SignedRawInvoice)`
-///  3. using `str::parse::<Invoice>(&str)`
+///  1. using [`InvoiceBuilder`]
+///  2. using [`Invoice::from_signed`]
+///  3. using `str::parse::<Invoice>(&str)` (see [`Invoice::from_str`])
+///
+/// [`Invoice::from_str`]: crate::Invoice#impl-FromStr
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct Invoice {
 	signed_invoice: SignedRawInvoice,
@@ -249,7 +258,7 @@ pub struct Invoice {
 /// Represents the description of an invoice which has to be either a directly included string or
 /// a hash of a description provided out of band.
 ///
-/// (C-not exported) As we don't have a good way to map the reference lifetimes making this
+/// This is not exported to bindings users as we don't have a good way to map the reference lifetimes making this
 /// practically impossible to use safely in languages like C.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum InvoiceDescription<'f> {
@@ -260,34 +269,34 @@ pub enum InvoiceDescription<'f> {
 	Hash(&'f Sha256),
 }
 
-/// Represents a signed `RawInvoice` with cached hash. The signature is not checked and may be
+/// Represents a signed [`RawInvoice`] with cached hash. The signature is not checked and may be
 /// invalid.
 ///
 /// # Invariants
-/// The hash has to be either from the deserialized invoice or from the serialized `raw_invoice`.
+/// The hash has to be either from the deserialized invoice or from the serialized [`RawInvoice`].
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct SignedRawInvoice {
 	/// The rawInvoice that the signature belongs to
 	raw_invoice: RawInvoice,
 
-	/// Hash of the `RawInvoice` that will be used to check the signature.
+	/// Hash of the [`RawInvoice`] that will be used to check the signature.
 	///
 	/// * if the `SignedRawInvoice` was deserialized the hash is of from the original encoded form,
 	/// since it's not guaranteed that encoding it again will lead to the same result since integers
 	/// could have been encoded with leading zeroes etc.
 	/// * if the `SignedRawInvoice` was constructed manually the hash will be the calculated hash
-	/// from the `RawInvoice`
+	/// from the [`RawInvoice`]
 	hash: [u8; 32],
 
 	/// signature of the payment request
 	signature: InvoiceSignature,
 }
 
-/// Represents an syntactically correct Invoice for a payment on the lightning network,
+/// Represents an syntactically correct [`Invoice`] for a payment on the lightning network,
 /// but without the signature information.
-/// De- and encoding should not lead to information loss but may lead to different hashes.
+/// Decoding and encoding should not lead to information loss but may lead to different hashes.
 ///
-/// For methods without docs see the corresponding methods in `Invoice`.
+/// For methods without docs see the corresponding methods in [`Invoice`].
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct RawInvoice {
 	/// human readable part
@@ -297,9 +306,9 @@ pub struct RawInvoice {
 	pub data: RawDataPart,
 }
 
-/// Data of the `RawInvoice` that is encoded in the human readable part
+/// Data of the [`RawInvoice`] that is encoded in the human readable part.
 ///
-/// (C-not exported) As we don't yet support `Option<Enum>`
+/// This is not exported to bindings users as we don't yet support `Option<Enum>`
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct RawHrp {
 	/// The currency deferred from the 3rd and 4th character of the bech32 transaction
@@ -312,7 +321,7 @@ pub struct RawHrp {
 	pub si_prefix: Option<SiPrefix>,
 }
 
-/// Data of the `RawInvoice` that is encoded in the data part
+/// Data of the [`RawInvoice`] that is encoded in the data part
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub struct RawDataPart {
 	/// generation time of the invoice
@@ -359,7 +368,7 @@ impl SiPrefix {
 	/// Returns all enum variants of `SiPrefix` sorted in descending order of their associated
 	/// multiplier.
 	///
-	/// (C-not exported) As we don't yet support a slice of enums, and also because this function
+	/// This is not exported to bindings users as we don't yet support a slice of enums, and also because this function
 	/// isn't the most critical to expose.
 	pub fn values_desc() -> &'static [SiPrefix] {
 		use crate::SiPrefix::*;
@@ -387,9 +396,32 @@ pub enum Currency {
 	Signet,
 }
 
+impl From<Network> for Currency {
+	fn from(network: Network) -> Self {
+		match network {
+			Network::Bitcoin => Currency::Bitcoin,
+			Network::Testnet => Currency::BitcoinTestnet,
+			Network::Regtest => Currency::Regtest,
+			Network::Signet => Currency::Signet,
+		}
+	}
+}
+
+impl From<Currency> for Network {
+	fn from(currency: Currency) -> Self {
+		match currency {
+			Currency::Bitcoin => Network::Bitcoin,
+			Currency::BitcoinTestnet => Network::Testnet,
+			Currency::Regtest => Network::Regtest,
+			Currency::Simnet => Network::Regtest,
+			Currency::Signet => Network::Signet,
+		}
+	}
+}
+
 /// Tagged field which may have an unknown tag
 ///
-/// (C-not exported) as we don't currently support TaggedField
+/// This is not exported to bindings users as we don't currently support TaggedField
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum RawTaggedField {
 	/// Parsed tagged field with known tag
@@ -402,7 +434,7 @@ pub enum RawTaggedField {
 ///
 /// For descriptions of the enum values please refer to the enclosed type's docs.
 ///
-/// (C-not exported) As we don't yet support enum variants with the same name the struct contained
+/// This is not exported to bindings users as we don't yet support enum variants with the same name the struct contained
 /// in the variant.
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -416,6 +448,7 @@ pub enum TaggedField {
 	Fallback(Fallback),
 	PrivateRoute(PrivateRoute),
 	PaymentSecret(PaymentSecret),
+	PaymentMetadata(Vec<u8>),
 	Features(InvoiceFeatures),
 	RgbAmount(RgbAmount),
 	RgbContractId(RgbContractId),
@@ -423,7 +456,7 @@ pub enum TaggedField {
 
 /// SHA-256 hash
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub struct Sha256(/// (C-not exported) as the native hash types are not currently mapped
+pub struct Sha256(/// This is not exported to bindings users as the native hash types are not currently mapped
 	pub sha256::Hash);
 
 /// Description string
@@ -454,17 +487,16 @@ pub struct RgbAmount(pub u64);
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct RgbContractId(pub ContractId);
 
-// TODO: better types instead onf byte arrays
 /// Fallback address in case no LN payment is possible
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum Fallback {
 	SegWitProgram {
-		version: u5,
+		version: WitnessVersion,
 		program: Vec<u8>,
 	},
-	PubKeyHash([u8; 20]),
-	ScriptHash([u8; 20]),
+	PubKeyHash(PubkeyHash),
+	ScriptHash(ScriptHash),
 }
 
 /// Recoverable signature
@@ -491,17 +523,18 @@ pub mod constants {
 	pub const TAG_FALLBACK: u8 = 9;
 	pub const TAG_PRIVATE_ROUTE: u8 = 3;
 	pub const TAG_PAYMENT_SECRET: u8 = 16;
+	pub const TAG_PAYMENT_METADATA: u8 = 27;
 	pub const TAG_FEATURES: u8 = 5;
 	pub const TAG_RGB_AMOUNT: u8 = 30;
 	pub const TAG_RGB_CONTRACT_ID: u8 = 31;
 }
 
-impl InvoiceBuilder<tb::False, tb::False, tb::False, tb::False, tb::False> {
+impl InvoiceBuilder<tb::False, tb::False, tb::False, tb::False, tb::False, tb::False> {
 	/// Construct new, empty `InvoiceBuilder`. All necessary fields have to be filled first before
 	/// `InvoiceBuilder::build(self)` becomes available.
-	pub fn new(currrency: Currency) -> Self {
+	pub fn new(currency: Currency) -> Self {
 		InvoiceBuilder {
-			currency: currrency,
+			currency,
 			amount: None,
 			si_prefix: None,
 			timestamp: None,
@@ -513,14 +546,15 @@ impl InvoiceBuilder<tb::False, tb::False, tb::False, tb::False, tb::False> {
 			phantom_t: core::marker::PhantomData,
 			phantom_c: core::marker::PhantomData,
 			phantom_s: core::marker::PhantomData,
+			phantom_m: core::marker::PhantomData,
 		}
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, T, C, S> {
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, T, C, S, M> {
 	/// Helper function to set the completeness flags.
-	fn set_flags<DN: tb::Bool, HN: tb::Bool, TN: tb::Bool, CN: tb::Bool, SN: tb::Bool>(self) -> InvoiceBuilder<DN, HN, TN, CN, SN> {
-		InvoiceBuilder::<DN, HN, TN, CN, SN> {
+	fn set_flags<DN: tb::Bool, HN: tb::Bool, TN: tb::Bool, CN: tb::Bool, SN: tb::Bool, MN: tb::Bool>(self) -> InvoiceBuilder<DN, HN, TN, CN, SN, MN> {
+		InvoiceBuilder::<DN, HN, TN, CN, SN, MN> {
 			currency: self.currency,
 			amount: self.amount,
 			si_prefix: self.si_prefix,
@@ -533,6 +567,7 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBui
 			phantom_t: core::marker::PhantomData,
 			phantom_c: core::marker::PhantomData,
 			phantom_s: core::marker::PhantomData,
+			phantom_m: core::marker::PhantomData,
 		}
 	}
 
@@ -589,8 +624,9 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBui
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb::True, C, S> {
-	/// Builds a `RawInvoice` if no `CreationError` occurred while construction any of the fields.
+impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, tb::True, C, S, M> {
+	/// Builds a [`RawInvoice`] if no [`CreationError`] occurred while construction any of the
+	/// fields.
 	pub fn build_raw(self) -> Result<RawInvoice, CreationError> {
 
 		// If an error occurred at any time before, return it now
@@ -611,20 +647,20 @@ impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb
 		}).collect::<Vec<_>>();
 
 		let data = RawDataPart {
-			timestamp: timestamp,
-			tagged_fields: tagged_fields,
+			timestamp,
+			tagged_fields,
 		};
 
 		Ok(RawInvoice {
-			hrp: hrp,
-			data: data,
+			hrp,
+			data,
 		})
 	}
 }
 
-impl<H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<tb::False, H, T, C, S> {
+impl<H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<tb::False, H, T, C, S, M> {
 	/// Set the description. This function is only available if no description (hash) was set.
-	pub fn description(mut self, description: String) -> InvoiceBuilder<tb::True, H, T, C, S> {
+	pub fn description(mut self, description: String) -> InvoiceBuilder<tb::True, H, T, C, S, M> {
 		match Description::new(description) {
 			Ok(d) => self.tagged_fields.push(TaggedField::Description(d)),
 			Err(e) => self.error = Some(e),
@@ -633,24 +669,36 @@ impl<H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<tb::Fals
 	}
 
 	/// Set the description hash. This function is only available if no description (hash) was set.
-	pub fn description_hash(mut self, description_hash: sha256::Hash) -> InvoiceBuilder<tb::True, H, T, C, S> {
+	pub fn description_hash(mut self, description_hash: sha256::Hash) -> InvoiceBuilder<tb::True, H, T, C, S, M> {
 		self.tagged_fields.push(TaggedField::DescriptionHash(Sha256(description_hash)));
 		self.set_flags()
 	}
+
+	/// Set the description or description hash. This function is only available if no description (hash) was set.
+	pub fn invoice_description(self, description: InvoiceDescription) -> InvoiceBuilder<tb::True, H, T, C, S, M> {
+		match description {
+			InvoiceDescription::Direct(desc) => {
+				self.description(desc.clone().into_inner())
+			}
+			InvoiceDescription::Hash(hash) => {
+				self.description_hash(hash.0)
+			}
+		}
+	}
 }
 
-impl<D: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, tb::False, T, C, S> {
+impl<D: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<D, tb::False, T, C, S, M> {
 	/// Set the payment hash. This function is only available if no payment hash was set.
-	pub fn payment_hash(mut self, hash: sha256::Hash) -> InvoiceBuilder<D, tb::True, T, C, S> {
+	pub fn payment_hash(mut self, hash: sha256::Hash) -> InvoiceBuilder<D, tb::True, T, C, S, M> {
 		self.tagged_fields.push(TaggedField::PaymentHash(Sha256(hash)));
 		self.set_flags()
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb::False, C, S> {
+impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, tb::False, C, S, M> {
 	/// Sets the timestamp to a specific [`SystemTime`].
 	#[cfg(feature = "std")]
-	pub fn timestamp(mut self, time: SystemTime) -> InvoiceBuilder<D, H, tb::True, C, S> {
+	pub fn timestamp(mut self, time: SystemTime) -> InvoiceBuilder<D, H, tb::True, C, S, M> {
 		match PositiveTimestamp::from_system_time(time) {
 			Ok(t) => self.timestamp = Some(t),
 			Err(e) => self.error = Some(e),
@@ -661,7 +709,7 @@ impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb
 
 	/// Sets the timestamp to a duration since the Unix epoch, dropping the subsecond part (which
 	/// is not representable in BOLT 11 invoices).
-	pub fn duration_since_epoch(mut self, time: Duration) -> InvoiceBuilder<D, H, tb::True, C, S> {
+	pub fn duration_since_epoch(mut self, time: Duration) -> InvoiceBuilder<D, H, tb::True, C, S, M> {
 		match PositiveTimestamp::from_duration_since_epoch(time) {
 			Ok(t) => self.timestamp = Some(t),
 			Err(e) => self.error = Some(e),
@@ -672,34 +720,82 @@ impl<D: tb::Bool, H: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, tb
 
 	/// Sets the timestamp to the current system time.
 	#[cfg(feature = "std")]
-	pub fn current_timestamp(mut self) -> InvoiceBuilder<D, H, tb::True, C, S> {
+	pub fn current_timestamp(mut self) -> InvoiceBuilder<D, H, tb::True, C, S, M> {
 		let now = PositiveTimestamp::from_system_time(SystemTime::now());
 		self.timestamp = Some(now.expect("for the foreseeable future this shouldn't happen"));
 		self.set_flags()
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, T, tb::False, S> {
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, S: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, T, tb::False, S, M> {
 	/// Sets `min_final_cltv_expiry_delta`.
-	pub fn min_final_cltv_expiry_delta(mut self, min_final_cltv_expiry_delta: u64) -> InvoiceBuilder<D, H, T, tb::True, S> {
+	pub fn min_final_cltv_expiry_delta(mut self, min_final_cltv_expiry_delta: u64) -> InvoiceBuilder<D, H, T, tb::True, S, M> {
 		self.tagged_fields.push(TaggedField::MinFinalCltvExpiryDelta(MinFinalCltvExpiryDelta(min_final_cltv_expiry_delta)));
 		self.set_flags()
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool> InvoiceBuilder<D, H, T, C, tb::False> {
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, T, C, tb::False, M> {
 	/// Sets the payment secret and relevant features.
-	pub fn payment_secret(mut self, payment_secret: PaymentSecret) -> InvoiceBuilder<D, H, T, C, tb::True> {
-		let mut features = InvoiceFeatures::empty();
-		features.set_variable_length_onion_required();
-		features.set_payment_secret_required();
+	pub fn payment_secret(mut self, payment_secret: PaymentSecret) -> InvoiceBuilder<D, H, T, C, tb::True, M> {
+		let mut found_features = false;
+		for field in self.tagged_fields.iter_mut() {
+			if let TaggedField::Features(f) = field {
+				found_features = true;
+				f.set_variable_length_onion_required();
+				f.set_payment_secret_required();
+			}
+		}
 		self.tagged_fields.push(TaggedField::PaymentSecret(payment_secret));
-		self.tagged_fields.push(TaggedField::Features(features));
+		if !found_features {
+			let mut features = InvoiceFeatures::empty();
+			features.set_variable_length_onion_required();
+			features.set_payment_secret_required();
+			self.tagged_fields.push(TaggedField::Features(features));
+		}
 		self.set_flags()
 	}
 }
 
-impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool> InvoiceBuilder<D, H, T, C, tb::True> {
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, T, C, S, tb::False> {
+	/// Sets the payment metadata.
+	///
+	/// By default features are set to *optionally* allow the sender to include the payment metadata.
+	/// If you wish to require that the sender include the metadata (and fail to parse the invoice if
+	/// they don't support payment metadata fields), you need to call
+	/// [`InvoiceBuilder::require_payment_metadata`] after this.
+	pub fn payment_metadata(mut self, payment_metadata: Vec<u8>) -> InvoiceBuilder<D, H, T, C, S, tb::True> {
+		self.tagged_fields.push(TaggedField::PaymentMetadata(payment_metadata));
+		let mut found_features = false;
+		for field in self.tagged_fields.iter_mut() {
+			if let TaggedField::Features(f) = field {
+				found_features = true;
+				f.set_payment_metadata_optional();
+			}
+		}
+		if !found_features {
+			let mut features = InvoiceFeatures::empty();
+			features.set_payment_metadata_optional();
+			self.tagged_fields.push(TaggedField::Features(features));
+		}
+		self.set_flags()
+	}
+}
+
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool> InvoiceBuilder<D, H, T, C, S, tb::True> {
+	/// Sets forwarding of payment metadata as required. A reader of the invoice which does not
+	/// support sending payment metadata will fail to read the invoice.
+	pub fn require_payment_metadata(mut self) -> InvoiceBuilder<D, H, T, C, S, tb::True> {
+		for field in self.tagged_fields.iter_mut() {
+			if let TaggedField::Features(f) = field {
+				f.set_payment_metadata_required();
+			}
+		}
+		self
+	}
+}
+
+impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, M: tb::Bool> InvoiceBuilder<D, H, T, C, tb::True, M> {
 	/// Sets the `basic_mpp` feature as optional.
 	pub fn basic_mpp(mut self) -> Self {
 		for field in self.tagged_fields.iter_mut() {
@@ -711,7 +807,7 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool> InvoiceBuilder<D, H, T,
 	}
 }
 
-impl InvoiceBuilder<tb::True, tb::True, tb::True, tb::True, tb::True> {
+impl<M: tb::Bool> InvoiceBuilder<tb::True, tb::True, tb::True, tb::True, tb::True, M> {
 	/// Builds and signs an invoice using the supplied `sign_function`. This function MAY NOT fail
 	/// and MUST produce a recoverable signature valid for the given hash and if applicable also for
 	/// the included payee public key.
@@ -767,17 +863,17 @@ impl SignedRawInvoice {
 		(self.raw_invoice, self.hash, self.signature)
 	}
 
-	/// The `RawInvoice` which was signed.
+	/// The [`RawInvoice`] which was signed.
 	pub fn raw_invoice(&self) -> &RawInvoice {
 		&self.raw_invoice
 	}
 
-	/// The hash of the `RawInvoice` that was signed.
+	/// The hash of the [`RawInvoice`] that was signed.
 	pub fn signable_hash(&self) -> &[u8; 32] {
 		&self.hash
 	}
 
-	/// InvoiceSignature for the invoice.
+	/// Signature for the invoice.
 	pub fn signature(&self) -> &InvoiceSignature {
 		&self.signature
 	}
@@ -807,7 +903,7 @@ impl SignedRawInvoice {
 			recovered_pub_key = Some(recovered);
 		}
 
-		let pub_key = included_pub_key.or_else(|| recovered_pub_key.as_ref())
+		let pub_key = included_pub_key.or(recovered_pub_key.as_ref())
 			.expect("One is always present");
 
 		let hash = Message::from_slice(&self.hash[..])
@@ -895,11 +991,11 @@ impl RawInvoice {
 		)
 	}
 
-	/// Signs the invoice using the supplied `sign_function`. This function MAY fail with an error
-	/// of type `E`. Since the signature of a `SignedRawInvoice` is not required to be valid there
+	/// Signs the invoice using the supplied `sign_method`. This function MAY fail with an error of
+	/// type `E`. Since the signature of a [`SignedRawInvoice`] is not required to be valid there
 	/// are no constraints regarding the validity of the produced signature.
 	///
-	/// (C-not exported) As we don't currently support passing function pointers into methods
+	/// This is not exported to bindings users as we don't currently support passing function pointers into methods
 	/// explicitly.
 	pub fn sign<F, E>(self, sign_method: F) -> Result<SignedRawInvoice, E>
 		where F: FnOnce(&Message) -> Result<RecoverableSignature, E>
@@ -918,7 +1014,7 @@ impl RawInvoice {
 
 	/// Returns an iterator over all tagged fields with known semantics.
 	///
-	/// (C-not exported) As there is not yet a manual mapping for a FilterMap
+	/// This is not exported to bindings users as there is not yet a manual mapping for a FilterMap
 	pub fn known_tagged_fields(&self)
 		-> FilterMap<Iter<RawTaggedField>, fn(&RawTaggedField) -> Option<&TaggedField>>
 	{
@@ -963,6 +1059,10 @@ impl RawInvoice {
 		find_extract!(self.known_tagged_fields(), TaggedField::PaymentSecret(ref x), x)
 	}
 
+	pub fn payment_metadata(&self) -> Option<&Vec<u8>> {
+		find_extract!(self.known_tagged_fields(), TaggedField::PaymentMetadata(ref x), x)
+	}
+
 	pub fn features(&self) -> Option<&InvoiceFeatures> {
 		find_extract!(self.known_tagged_fields(), TaggedField::Features(ref x), x)
 	}
@@ -975,7 +1075,7 @@ impl RawInvoice {
 		find_extract!(self.known_tagged_fields(), TaggedField::RgbContractId(ref x), x)
 	}
 
-	/// (C-not exported) as we don't support Vec<&NonOpaqueType>
+	/// This is not exported to bindings users as we don't support Vec<&NonOpaqueType>
 	pub fn fallbacks(&self) -> Vec<&Fallback> {
 		find_all_extract!(self.known_tagged_fields(), TaggedField::Fallback(ref x), x).collect()
 	}
@@ -1048,13 +1148,18 @@ impl PositiveTimestamp {
 }
 
 #[cfg(feature = "std")]
-impl Into<SystemTime> for PositiveTimestamp {
-	fn into(self) -> SystemTime {
-		SystemTime::UNIX_EPOCH + self.0
+impl From<PositiveTimestamp> for SystemTime {
+	fn from(val: PositiveTimestamp) -> Self {
+		SystemTime::UNIX_EPOCH + val.0
 	}
 }
 
 impl Invoice {
+	/// The hash of the [`RawInvoice`] that was signed.
+	pub fn signable_hash(&self) -> [u8; 32] {
+		self.signed_invoice.hash
+	}
+
 	/// Transform the `Invoice` into it's unchecked version
 	pub fn into_signed_raw(self) -> SignedRawInvoice {
 		self.signed_invoice
@@ -1159,7 +1264,7 @@ impl Invoice {
 		Ok(())
 	}
 
-	/// Constructs an `Invoice` from a `SignedRawInvoice` by checking all its invariants.
+	/// Constructs an `Invoice` from a [`SignedRawInvoice`] by checking all its invariants.
 	/// ```
 	/// use lightning_invoice::*;
 	///
@@ -1181,7 +1286,7 @@ impl Invoice {
 	/// ```
 	pub fn from_signed(signed_invoice: SignedRawInvoice) -> Result<Self, SemanticError> {
 		let invoice = Invoice {
-			signed_invoice: signed_invoice,
+			signed_invoice,
 		};
 		invoice.check_field_counts()?;
 		invoice.check_feature_bits()?;
@@ -1204,7 +1309,7 @@ impl Invoice {
 
 	/// Returns an iterator over all tagged fields of this Invoice.
 	///
-	/// (C-not exported) As there is not yet a manual mapping for a FilterMap
+	/// This is not exported to bindings users as there is not yet a manual mapping for a FilterMap
 	pub fn tagged_fields(&self)
 		-> FilterMap<Iter<RawTaggedField>, fn(&RawTaggedField) -> Option<&TaggedField>> {
 		self.signed_invoice.raw_invoice().known_tagged_fields()
@@ -1217,11 +1322,11 @@ impl Invoice {
 
 	/// Return the description or a hash of it for longer ones
 	///
-	/// (C-not exported) because we don't yet export InvoiceDescription
+	/// This is not exported to bindings users because we don't yet export InvoiceDescription
 	pub fn description(&self) -> InvoiceDescription {
-		if let Some(ref direct) = self.signed_invoice.description() {
+		if let Some(direct) = self.signed_invoice.description() {
 			return InvoiceDescription::Direct(direct);
-		} else if let Some(ref hash) = self.signed_invoice.description_hash() {
+		} else if let Some(hash) = self.signed_invoice.description_hash() {
 			return InvoiceDescription::Hash(hash);
 		}
 		unreachable!("ensured by constructor");
@@ -1237,6 +1342,11 @@ impl Invoice {
 		self.signed_invoice.payment_secret().expect("was checked by constructor")
 	}
 
+	/// Get the payment metadata blob if one was included in the invoice
+	pub fn payment_metadata(&self) -> Option<&Vec<u8>> {
+		self.signed_invoice.payment_metadata()
+	}
+
 	/// Get the invoice features if they were included in the invoice
 	pub fn features(&self) -> Option<&InvoiceFeatures> {
 		self.signed_invoice.features()
@@ -1245,6 +1355,12 @@ impl Invoice {
 	/// Recover the payee's public key (only to be used if none was included in the invoice)
 	pub fn recover_payee_pub_key(&self) -> PublicKey {
 		self.signed_invoice.recover_payee_pub_key().expect("was checked by constructor").0
+	}
+
+	/// Returns the Duration since the Unix epoch at which the invoice expires.
+	/// Returning None if overflow occurred.
+	pub fn expires_at(&self) -> Option<Duration> {
+		self.duration_since_epoch().checked_add(self.expiry_time())
 	}
 
 	/// Returns the invoice's expiry time, if present, otherwise [`DEFAULT_EXPIRY_TIME`].
@@ -1269,6 +1385,20 @@ impl Invoice {
 		}
 	}
 
+	/// Returns the Duration remaining until the invoice expires.
+	#[cfg(feature = "std")]
+	pub fn duration_until_expiry(&self) -> Duration {
+		SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+			.map(|now| self.expiration_remaining_from_epoch(now))
+			.unwrap_or(Duration::from_nanos(0))
+	}
+
+	/// Returns the Duration remaining until the invoice expires given the current time.
+	/// `time` is the timestamp as a duration since the Unix epoch.
+	pub fn expiration_remaining_from_epoch(&self, time: Duration) -> Duration {
+		self.expires_at().map(|x| x.checked_sub(time)).flatten().unwrap_or(Duration::from_nanos(0))
+	}
+
 	/// Returns whether the expiry time would pass at the given point in time.
 	/// `at_time` is the timestamp as a duration since the Unix epoch.
 	pub fn would_expire(&self, at_time: Duration) -> bool {
@@ -1287,9 +1417,28 @@ impl Invoice {
 
 	/// Returns a list of all fallback addresses
 	///
-	/// (C-not exported) as we don't support Vec<&NonOpaqueType>
+	/// This is not exported to bindings users as we don't support Vec<&NonOpaqueType>
 	pub fn fallbacks(&self) -> Vec<&Fallback> {
 		self.signed_invoice.fallbacks()
+	}
+
+	/// Returns a list of all fallback addresses as [`Address`]es
+	pub fn fallback_addresses(&self) -> Vec<Address> {
+		self.fallbacks().iter().map(|fallback| {
+			let payload = match fallback {
+				Fallback::SegWitProgram { version, program } => {
+					Payload::WitnessProgram { version: *version, program: program.to_vec() }
+				}
+				Fallback::PubKeyHash(pkh) => {
+					Payload::PubkeyHash(*pkh)
+				}
+				Fallback::ScriptHash(sh) => {
+					Payload::ScriptHash(*sh)
+				}
+			};
+
+			Address { payload, network: self.network() }
+		}).collect()
 	}
 
 	/// Returns a list of all routes included in the invoice
@@ -1307,6 +1456,13 @@ impl Invoice {
 	/// Returns the currency for which the invoice was issued
 	pub fn currency(&self) -> Currency {
 		self.signed_invoice.currency()
+	}
+
+	/// Returns the network for which the invoice was issued
+	///
+	/// This is not exported to bindings users, see [`Self::currency`] instead.
+	pub fn network(&self) -> Network {
+		self.signed_invoice.currency().into()
 	}
 
 	/// Returns the amount if specified in the invoice as millisatoshis.
@@ -1351,6 +1507,7 @@ impl TaggedField {
 			TaggedField::Fallback(_) => constants::TAG_FALLBACK,
 			TaggedField::PrivateRoute(_) => constants::TAG_PRIVATE_ROUTE,
 			TaggedField::PaymentSecret(_) => constants::TAG_PAYMENT_SECRET,
+			TaggedField::PaymentMetadata(_) => constants::TAG_PAYMENT_METADATA,
 			TaggedField::Features(_) => constants::TAG_FEATURES,
 			TaggedField::RgbAmount(_) => constants::TAG_RGB_AMOUNT,
 			TaggedField::RgbContractId(_) => constants::TAG_RGB_CONTRACT_ID,
@@ -1363,7 +1520,7 @@ impl TaggedField {
 impl Description {
 
 	/// Creates a new `Description` if `description` is at most 1023 __bytes__ long,
-	/// returns `CreationError::DescriptionTooLong` otherwise
+	/// returns [`CreationError::DescriptionTooLong`] otherwise
 	///
 	/// Please note that single characters may use more than one byte due to UTF8 encoding.
 	pub fn new(description: String) -> Result<Description, CreationError> {
@@ -1374,15 +1531,15 @@ impl Description {
 		}
 	}
 
-	/// Returns the underlying description `String`
+	/// Returns the underlying description [`String`]
 	pub fn into_inner(self) -> String {
 		self.0
 	}
 }
 
-impl Into<String> for Description {
-	fn into(self) -> String {
-		self.into_inner()
+impl From<Description> for String {
+	fn from(val: Description) -> Self {
+		val.into_inner()
 	}
 }
 
@@ -1414,7 +1571,7 @@ impl ExpiryTime {
 		ExpiryTime(Duration::from_secs(seconds))
 	}
 
-	/// Construct an `ExpiryTime` from a `Duration`, dropping the sub-second part.
+	/// Construct an `ExpiryTime` from a [`Duration`], dropping the sub-second part.
 	pub fn from_duration(duration: Duration) -> ExpiryTime {
 		Self::from_seconds(duration.as_secs())
 	}
@@ -1424,7 +1581,7 @@ impl ExpiryTime {
 		self.0.as_secs()
 	}
 
-	/// Returns a reference to the underlying `Duration` (=expiry time)
+	/// Returns a reference to the underlying [`Duration`] (=expiry time)
 	pub fn as_duration(&self) -> &Duration {
 		&self.0
 	}
@@ -1446,9 +1603,9 @@ impl PrivateRoute {
 	}
 }
 
-impl Into<RouteHint> for PrivateRoute {
-	fn into(self) -> RouteHint {
-		self.into_inner()
+impl From<PrivateRoute> for RouteHint {
+	fn from(val: PrivateRoute) -> Self {
+		val.into_inner()
 	}
 }
 
@@ -1476,10 +1633,10 @@ impl Deref for SignedRawInvoice {
 	}
 }
 
-/// Errors that may occur when constructing a new `RawInvoice` or `Invoice`
+/// Errors that may occur when constructing a new [`RawInvoice`] or [`Invoice`]
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum CreationError {
-	/// The supplied description string was longer than 639 __bytes__ (see [`Description::new(…)`](./struct.Description.html#method.new))
+	/// The supplied description string was longer than 639 __bytes__ (see [`Description::new`])
 	DescriptionTooLong,
 
 	/// The specified route has too many hops and can't be encoded
@@ -1520,7 +1677,7 @@ impl Display for CreationError {
 #[cfg(feature = "std")]
 impl std::error::Error for CreationError { }
 
-/// Errors that may occur when converting a `RawInvoice` to an `Invoice`. They relate to the
+/// Errors that may occur when converting a [`RawInvoice`] to an [`Invoice`]. They relate to the
 /// requirements sections in BOLT #11
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum SemanticError {
@@ -1576,7 +1733,7 @@ impl Display for SemanticError {
 #[cfg(feature = "std")]
 impl std::error::Error for SemanticError { }
 
-/// When signing using a fallible method either an user-supplied `SignError` or a `CreationError`
+/// When signing using a fallible method either an user-supplied `SignError` or a [`CreationError`]
 /// may occur.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum SignOrCreationError<S = ()> {
@@ -1607,7 +1764,7 @@ impl<'de> Deserialize<'de> for Invoice {
 	fn deserialize<D>(deserializer: D) -> Result<Invoice, D::Error> where D: Deserializer<'de> {
 		let bolt11 = String::deserialize(deserializer)?
 			.parse::<Invoice>()
-			.map_err(|e| D::Error::custom(format!("{:?}", e)))?;
+			.map_err(|e| D::Error::custom(alloc::format!("{:?}", e)))?;
 
 		Ok(bolt11)
 	}
@@ -1615,6 +1772,7 @@ impl<'de> Deserialize<'de> for Invoice {
 
 #[cfg(test)]
 mod test {
+	use bitcoin::Script;
 	use bitcoin_hashes::hex::FromHex;
 	use bitcoin_hashes::sha256;
 
@@ -1814,7 +1972,7 @@ mod test {
 
 		// Multiple payment secrets
 		let invoice = {
-			let mut invoice = invoice_template.clone();
+			let mut invoice = invoice_template;
 			invoice.data.tagged_fields.push(PaymentSecret(payment_secret).into());
 			invoice.data.tagged_fields.push(PaymentSecret(payment_secret).into());
 			invoice.sign::<_, ()>(|hash| Ok(Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key)))
@@ -1840,7 +1998,7 @@ mod test {
 		assert_eq!(invoice.hrp.raw_amount, Some(15));
 
 
-		let invoice = builder.clone()
+		let invoice = builder
 			.amount_milli_satoshis(150)
 			.build_raw()
 			.unwrap();
@@ -1894,7 +2052,7 @@ mod test {
 			.build_raw();
 		assert_eq!(long_route_res, Err(CreationError::RouteTooLong));
 
-		let sign_error_res = builder.clone()
+		let sign_error_res = builder
 			.description("Test".into())
 			.payment_secret(PaymentSecret([0; 32]))
 			.try_build_signed(|_| {
@@ -1924,7 +2082,7 @@ mod test {
 
 		let route_1 = RouteHint(vec![
 			RouteHintHop {
-				src_node_id: public_key.clone(),
+				src_node_id: public_key,
 				short_channel_id: de::parse_int_be(&[123; 8], 256).expect("short chan ID slice too big?"),
 				fees: RoutingFees {
 					base_msat: 2,
@@ -1935,7 +2093,7 @@ mod test {
 				htlc_maximum_msat: None,
 			},
 			RouteHintHop {
-				src_node_id: public_key.clone(),
+				src_node_id: public_key,
 				short_channel_id: de::parse_int_be(&[42; 8], 256).expect("short chan ID slice too big?"),
 				fees: RoutingFees {
 					base_msat: 3,
@@ -1949,7 +2107,7 @@ mod test {
 
 		let route_2 = RouteHint(vec![
 			RouteHintHop {
-				src_node_id: public_key.clone(),
+				src_node_id: public_key,
 				short_channel_id: 0,
 				fees: RoutingFees {
 					base_msat: 4,
@@ -1960,7 +2118,7 @@ mod test {
 				htlc_maximum_msat: None,
 			},
 			RouteHintHop {
-				src_node_id: public_key.clone(),
+				src_node_id: public_key,
 				short_channel_id: de::parse_int_be(&[1; 8], 256).expect("short chan ID slice too big?"),
 				fees: RoutingFees {
 					base_msat: 5,
@@ -1975,10 +2133,10 @@ mod test {
 		let builder = InvoiceBuilder::new(Currency::BitcoinTestnet)
 			.amount_milli_satoshis(123)
 			.duration_since_epoch(Duration::from_secs(1234567))
-			.payee_pub_key(public_key.clone())
+			.payee_pub_key(public_key)
 			.expiry_time(Duration::from_secs(54321))
 			.min_final_cltv_expiry_delta(144)
-			.fallback(Fallback::PubKeyHash([0;20]))
+			.fallback(Fallback::PubKeyHash(PubkeyHash::from_slice(&[0;20]).unwrap()))
 			.private_route(route_1.clone())
 			.private_route(route_2.clone())
 			.description_hash(sha256::Hash::from_slice(&[3;32][..]).unwrap())
@@ -2004,7 +2162,9 @@ mod test {
 		assert_eq!(invoice.payee_pub_key(), Some(&public_key));
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(54321));
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), 144);
-		assert_eq!(invoice.fallbacks(), vec![&Fallback::PubKeyHash([0;20])]);
+		assert_eq!(invoice.fallbacks(), vec![&Fallback::PubKeyHash(PubkeyHash::from_slice(&[0;20]).unwrap())]);
+		let address = Address::from_script(&Script::new_p2pkh(&PubkeyHash::from_slice(&[0;20]).unwrap()), Network::Testnet).unwrap();
+		assert_eq!(invoice.fallback_addresses(), vec![address]);
 		assert_eq!(invoice.private_routes(), vec![&PrivateRoute(route_1), &PrivateRoute(route_2)]);
 		assert_eq!(
 			invoice.description(),

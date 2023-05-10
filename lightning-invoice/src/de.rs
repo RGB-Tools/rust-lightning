@@ -1,14 +1,16 @@
 #[cfg(feature = "std")]
 use std::error;
+use core::convert::TryFrom;
 use core::fmt;
 use core::fmt::{Display, Formatter};
 use core::num::ParseIntError;
 use core::str;
 use core::str::FromStr;
 
-use bech32;
 use bech32::{u5, FromBase32};
 
+use bitcoin::{PubkeyHash, ScriptHash};
+use bitcoin::util::address::WitnessVersion;
 use bitcoin_hashes::Hash;
 use bitcoin_hashes::sha256;
 use rgb::ContractId;
@@ -19,7 +21,6 @@ use lightning::routing::router::{RouteHint, RouteHintHop};
 
 use num_traits::{CheckedAdd, CheckedMul};
 
-use secp256k1;
 use secp256k1::ecdsa::{RecoveryId, RecoverableSignature};
 use secp256k1::PublicKey;
 
@@ -324,9 +325,9 @@ impl FromStr for RawHrp {
 		};
 
 		Ok(RawHrp {
-			currency: currency,
+			currency,
 			raw_amount: amount,
-			si_prefix: si_prefix,
+			si_prefix,
 		})
 	}
 }
@@ -343,7 +344,7 @@ impl FromBase32 for RawDataPart {
 		let tagged = parse_tagged_parts(&data[7..])?;
 
 		Ok(RawDataPart {
-			timestamp: timestamp,
+			timestamp,
 			tagged_fields: tagged,
 		})
 	}
@@ -460,6 +461,8 @@ impl FromBase32 for TaggedField {
 				Ok(TaggedField::PrivateRoute(PrivateRoute::from_base32(field_data)?)),
 			constants::TAG_PAYMENT_SECRET =>
 				Ok(TaggedField::PaymentSecret(PaymentSecret::from_base32(field_data)?)),
+			constants::TAG_PAYMENT_METADATA =>
+				Ok(TaggedField::PaymentMetadata(Vec::<u8>::from_base32(field_data)?)),
 			constants::TAG_FEATURES =>
 				Ok(TaggedField::Features(InvoiceFeatures::from_base32(field_data)?)),
 			constants::TAG_RGB_AMOUNT =>
@@ -520,7 +523,7 @@ impl FromBase32 for ExpiryTime {
 
 	fn from_base32(field_data: &[u5]) -> Result<ExpiryTime, ParseError> {
 		match parse_int_be::<u64, u5>(field_data, 32)
-			.map(|t| ExpiryTime::from_seconds(t))
+			.map(ExpiryTime::from_seconds)
 		{
 			Some(t) => Ok(t),
 			None => Err(ParseError::IntegerOverflowError),
@@ -545,7 +548,7 @@ impl FromBase32 for Fallback {
 	type Err = ParseError;
 
 	fn from_base32(field_data: &[u5]) -> Result<Fallback, ParseError> {
-		if field_data.len() < 1 {
+		if field_data.is_empty() {
 			return Err(ParseError::UnexpectedEndOfTaggedFields);
 		}
 
@@ -557,27 +560,24 @@ impl FromBase32 for Fallback {
 				if bytes.len() < 2 || bytes.len() > 40 {
 					return Err(ParseError::InvalidSegWitProgramLength);
 				}
-
+				let version = WitnessVersion::try_from(version).expect("0 through 16 are valid SegWit versions");
 				Ok(Fallback::SegWitProgram {
-					version: version,
+					version,
 					program: bytes
 				})
 			},
 			17 => {
-				if bytes.len() != 20 {
-					return Err(ParseError::InvalidPubKeyHashLength);
-				}
-				//TODO: refactor once const generics are available
-				let mut pkh = [0u8; 20];
-				pkh.copy_from_slice(&bytes);
+				let pkh = match PubkeyHash::from_slice(&bytes) {
+					Ok(pkh) => pkh,
+					Err(bitcoin_hashes::Error::InvalidLength(_, _)) => return Err(ParseError::InvalidPubKeyHashLength),
+				};
 				Ok(Fallback::PubKeyHash(pkh))
 			}
 			18 => {
-				if bytes.len() != 20 {
-					return Err(ParseError::InvalidScriptHashLength);
-				}
-				let mut sh = [0u8; 20];
-				sh.copy_from_slice(&bytes);
+				let sh = match ScriptHash::from_slice(&bytes) {
+					Ok(sh) => sh,
+					Err(bitcoin_hashes::Error::InvalidLength(_, _)) => return Err(ParseError::InvalidScriptHashLength),
+				};
 				Ok(Fallback::ScriptHash(sh))
 			}
 			_ => Err(ParseError::Skip)
@@ -888,26 +888,29 @@ mod test {
 	fn test_parse_fallback() {
 		use crate::Fallback;
 		use bech32::FromBase32;
+		use bitcoin::{PubkeyHash, ScriptHash};
+		use bitcoin::util::address::WitnessVersion;
+		use bitcoin_hashes::Hash;
 
 		let cases = vec![
 			(
 				from_bech32("3x9et2e20v6pu37c5d9vax37wxq72un98".as_bytes()),
-				Ok(Fallback::PubKeyHash([
+				Ok(Fallback::PubKeyHash(PubkeyHash::from_slice(&[
 					0x31, 0x72, 0xb5, 0x65, 0x4f, 0x66, 0x83, 0xc8, 0xfb, 0x14, 0x69, 0x59, 0xd3,
 					0x47, 0xce, 0x30, 0x3c, 0xae, 0x4c, 0xa7
-				]))
+				]).unwrap()))
 			),
 			(
 				from_bech32("j3a24vwu6r8ejrss3axul8rxldph2q7z9".as_bytes()),
-				Ok(Fallback::ScriptHash([
+				Ok(Fallback::ScriptHash(ScriptHash::from_slice(&[
 					0x8f, 0x55, 0x56, 0x3b, 0x9a, 0x19, 0xf3, 0x21, 0xc2, 0x11, 0xe9, 0xb9, 0xf3,
 					0x8c, 0xdf, 0x68, 0x6e, 0xa0, 0x78, 0x45
-				]))
+				]).unwrap()))
 			),
 			(
 				from_bech32("qw508d6qejxtdg4y5r3zarvary0c5xw7k".as_bytes()),
 				Ok(Fallback::SegWitProgram {
-					version: u5::try_from_u8(0).unwrap(),
+					version: WitnessVersion::V0,
 					program: Vec::from(&[
 						0x75u8, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45,
 						0xd1, 0xb3, 0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6

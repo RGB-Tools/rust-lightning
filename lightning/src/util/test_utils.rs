@@ -17,6 +17,7 @@ use crate::chain::channelmonitor;
 use crate::chain::channelmonitor::MonitorEvent;
 use crate::chain::transaction::OutPoint;
 use crate::chain::keysinterface;
+use crate::events;
 use crate::ln::channelmanager;
 use crate::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use crate::ln::{msgs, wire};
@@ -24,11 +25,10 @@ use crate::ln::msgs::LightningError;
 use crate::ln::script::ShutdownScript;
 use crate::routing::gossip::{EffectiveCapacity, NetworkGraph, NodeId};
 use crate::routing::utxo::{UtxoLookup, UtxoLookupError, UtxoResult};
-use crate::routing::router::{find_route, InFlightHtlcs, Route, RouteHop, RouteParameters, Router, ScorerAccountingForInFlightHtlcs};
+use crate::routing::router::{find_route, InFlightHtlcs, Path, Route, RouteParameters, Router, ScorerAccountingForInFlightHtlcs};
 use crate::routing::scoring::{ChannelUsage, Score};
 use crate::util::config::UserConfig;
 use crate::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
-use crate::util::events;
 use crate::util::logger::{Logger, Level, Record};
 use crate::util::ser::{Readable, ReadableArgs, Writer, Writeable};
 
@@ -59,6 +59,15 @@ use crate::chain::keysinterface::{InMemorySigner, Recipient, EntropySource, Node
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::Sequence;
+
+pub fn pubkey(byte: u8) -> PublicKey {
+	let secp_ctx = Secp256k1::new();
+	PublicKey::from_secret_key(&secp_ctx, &privkey(byte))
+}
+
+pub fn privkey(byte: u8) -> SecretKey {
+	SecretKey::from_slice(&[byte; 32]).unwrap()
+}
 
 pub struct TestVecWriter(pub Vec<u8>);
 impl Writer for TestVecWriter {
@@ -106,7 +115,7 @@ impl<'a> Router for TestRouter<'a> {
 				let scorer = ScorerAccountingForInFlightHtlcs::new(locked_scorer, inflight_htlcs);
 				for path in &route.paths {
 					let mut aggregate_msat = 0u64;
-					for (idx, hop) in path.iter().rev().enumerate() {
+					for (idx, hop) in path.hops.iter().rev().enumerate() {
 						aggregate_msat += hop.fee_msat;
 						let usage = ChannelUsage {
 							amount_msat: aggregate_msat,
@@ -116,11 +125,11 @@ impl<'a> Router for TestRouter<'a> {
 
 						// Since the path is reversed, the last element in our iteration is the first
 						// hop.
-						if idx == path.len() - 1 {
+						if idx == path.hops.len() - 1 {
 							scorer.channel_penalty_msat(hop.short_channel_id, &NodeId::from_pubkey(payer), &NodeId::from_pubkey(&hop.pubkey), usage);
 						} else {
-							let curr_hop_path_idx = path.len() - 1 - idx;
-							scorer.channel_penalty_msat(hop.short_channel_id, &NodeId::from_pubkey(&path[curr_hop_path_idx - 1].pubkey), &NodeId::from_pubkey(&hop.pubkey), usage);
+							let curr_hop_path_idx = path.hops.len() - 1 - idx;
+							scorer.channel_penalty_msat(hop.short_channel_id, &NodeId::from_pubkey(&path.hops[curr_hop_path_idx - 1].pubkey), &NodeId::from_pubkey(&hop.pubkey), usage);
 						}
 					}
 				}
@@ -161,7 +170,7 @@ impl SignerProvider for OnlyReadsKeysInterface {
 	fn derive_channel_signer(&self, _channel_value_satoshis: u64, _channel_keys_id: [u8; 32]) -> Self::Signer { unreachable!(); }
 
 	fn read_chan_signer(&self, mut reader: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
-		let inner: InMemorySigner = Readable::read(&mut reader)?;
+		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self)?;
 		let state = Arc::new(Mutex::new(EnforcementState::new()));
 
 		Ok(EnforcingSigner::new_with_revoked(
@@ -308,8 +317,26 @@ pub struct TestBroadcaster {
 }
 
 impl TestBroadcaster {
-	pub fn new(blocks: Arc<Mutex<Vec<(Block, u32)>>>) -> TestBroadcaster {
-		TestBroadcaster { txn_broadcasted: Mutex::new(Vec::new()), blocks }
+	pub fn new(network: Network) -> Self {
+		Self {
+			txn_broadcasted: Mutex::new(Vec::new()),
+			blocks: Arc::new(Mutex::new(vec![(genesis_block(network), 0)])),
+		}
+	}
+
+	pub fn with_blocks(blocks: Arc<Mutex<Vec<(Block, u32)>>>) -> Self {
+		Self { txn_broadcasted: Mutex::new(Vec::new()), blocks }
+	}
+
+	pub fn txn_broadcast(&self) -> Vec<Transaction> {
+		self.txn_broadcasted.lock().unwrap().split_off(0)
+	}
+
+	pub fn unique_txn_broadcast(&self) -> Vec<Transaction> {
+		let mut txn = self.txn_broadcasted.lock().unwrap().split_off(0);
+		let mut seen = HashSet::new();
+		txn.retain(|tx| seen.insert(tx.txid()));
+		txn
 	}
 }
 
@@ -317,7 +344,7 @@ impl chaininterface::BroadcasterInterface for TestBroadcaster {
 	fn broadcast_transaction(&self, tx: &Transaction) {
 		let lock_time = tx.lock_time.0;
 		assert!(lock_time < 1_500_000_000);
-		if lock_time > self.blocks.lock().unwrap().len() as u32 + 1 && lock_time < 500_000_000 {
+		if bitcoin::LockTime::from(tx.lock_time).is_block_height() && lock_time > self.blocks.lock().unwrap().last().unwrap().1 {
 			for inp in tx.input.iter() {
 				if inp.sequence != Sequence::MAX {
 					panic!("We should never broadcast a transaction before its locktime ({})!", tx.lock_time);
@@ -642,10 +669,10 @@ impl TestLogger {
 	/// 1. belongs to the specified module and
 	/// 2. contains `line` in it.
 	/// And asserts if the number of occurrences is the same with the given `count`
-	pub fn assert_log_contains(&self, module: String, line: String, count: usize) {
+	pub fn assert_log_contains(&self, module: &str, line: &str, count: usize) {
 		let log_entries = self.lines.lock().unwrap();
 		let l: usize = log_entries.iter().filter(|&(&(ref m, ref l), _c)| {
-			m == &module && l.contains(line.as_str())
+			m == module && l.contains(line)
 		}).map(|(_, c) | { c }).sum();
 		assert_eq!(l, count)
 	}
@@ -654,10 +681,10 @@ impl TestLogger {
 	/// 1. belong to the specified module and
 	/// 2. match the given regex pattern.
 	/// Assert that the number of occurrences equals the given `count`
-	pub fn assert_log_regex(&self, module: String, pattern: regex::Regex, count: usize) {
+	pub fn assert_log_regex(&self, module: &str, pattern: regex::Regex, count: usize) {
 		let log_entries = self.lines.lock().unwrap();
 		let l: usize = log_entries.iter().filter(|&(&(ref m, ref l), _c)| {
-			m == &module && pattern.is_match(&l)
+			m == module && pattern.is_match(&l)
 		}).map(|(_, c) | { c }).sum();
 		assert_eq!(l, count)
 	}
@@ -772,7 +799,7 @@ impl SignerProvider for TestKeysInterface {
 	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, msgs::DecodeError> {
 		let mut reader = io::Cursor::new(buffer);
 
-		let inner: InMemorySigner = Readable::read(&mut reader)?;
+		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self)?;
 		let state = self.make_enforcement_state_cell(inner.commitment_seed);
 
 		Ok(EnforcingSigner::new_with_revoked(
@@ -956,13 +983,13 @@ impl Score for TestScorer {
 		0
 	}
 
-	fn payment_path_failed(&mut self, _actual_path: &[&RouteHop], _actual_short_channel_id: u64) {}
+	fn payment_path_failed(&mut self, _actual_path: &Path, _actual_short_channel_id: u64) {}
 
-	fn payment_path_successful(&mut self, _actual_path: &[&RouteHop]) {}
+	fn payment_path_successful(&mut self, _actual_path: &Path) {}
 
-	fn probe_failed(&mut self, _actual_path: &[&RouteHop], _: u64) {}
+	fn probe_failed(&mut self, _actual_path: &Path, _: u64) {}
 
-	fn probe_successful(&mut self, _actual_path: &[&RouteHop]) {}
+	fn probe_successful(&mut self, _actual_path: &Path) {}
 }
 
 impl Drop for TestScorer {

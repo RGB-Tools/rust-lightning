@@ -13,9 +13,10 @@
 
 use crate::chain::channelmonitor::{CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::keysinterface::{EntropySource, NodeSigner, Recipient};
+use crate::events::{Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider, PathFailure, PaymentFailureReason};
 use crate::ln::{PaymentHash, PaymentSecret};
 use crate::ln::channel::EXPIRE_PREV_CONFIG_TICKS;
-use crate::ln::channelmanager::{HTLCForwardInfo, FailureCode, CLTV_FAR_FAR_AWAY, MIN_CLTV_EXPIRY_DELTA, PendingAddHTLCInfo, PendingHTLCInfo, PendingHTLCRouting, PaymentId};
+use crate::ln::channelmanager::{HTLCForwardInfo, FailureCode, CLTV_FAR_FAR_AWAY, DISABLE_GOSSIP_TICKS, MIN_CLTV_EXPIRY_DELTA, PendingAddHTLCInfo, PendingHTLCInfo, PendingHTLCRouting, PaymentId, RecipientOnionFields};
 use crate::ln::onion_utils;
 use crate::routing::gossip::{NetworkUpdate, RoutingFees};
 use crate::routing::router::{get_route, PaymentParameters, Route, RouteHint, RouteHintHop};
@@ -23,7 +24,6 @@ use crate::ln::features::{InitFeatures, InvoiceFeatures};
 use crate::ln::msgs;
 use crate::ln::msgs::{ChannelMessageHandler, ChannelUpdate};
 use crate::ln::wire::Encode;
-use crate::util::events::{Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider, PathFailure};
 use crate::util::ser::{Writeable, Writer};
 use crate::util::test_utils;
 use crate::util::config::{UserConfig, ChannelConfig};
@@ -82,7 +82,8 @@ fn run_onion_failure_test_with_fail_intercept<F1,F2,F3>(_name: &str, test_case: 
 
 	// 0 ~~> 2 send payment
 	let payment_id = PaymentId(nodes[0].keys_manager.backing.get_secure_random_bytes());
-	nodes[0].node.send_payment(&route, *payment_hash, &Some(*payment_secret), payment_id).unwrap();
+	nodes[0].node.send_payment_with_route(&route, *payment_hash,
+		RecipientOnionFields::secret_only(*payment_secret), payment_id).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	// temper update_add (0 => 1)
@@ -212,9 +213,14 @@ fn run_onion_failure_test_with_fail_intercept<F1,F2,F3>(_name: &str, test_case: 
 		panic!("Unexpected event");
 	}
 	match events[1] {
-		Event::PaymentFailed { payment_hash: ev_payment_hash, payment_id: ev_payment_id } => {
+		Event::PaymentFailed { payment_hash: ev_payment_hash, payment_id: ev_payment_id, reason: ref ev_reason } => {
 			assert_eq!(*payment_hash, ev_payment_hash);
 			assert_eq!(payment_id, ev_payment_id);
+			assert_eq!(if expected_retryable {
+				PaymentFailureReason::RetriesExhausted
+			} else {
+				PaymentFailureReason::RecipientRejected
+			}, ev_reason.unwrap());
 		}
 		_ => panic!("Unexpected second event"),
 	}
@@ -280,7 +286,8 @@ fn test_fee_failures() {
 
 	// positive case
 	let (route, payment_hash_success, payment_preimage_success, payment_secret_success) = get_route_and_payment_hash!(nodes[0], nodes[2], 40_000);
-	nodes[0].node.send_payment(&route, payment_hash_success, &Some(payment_secret_success), PaymentId(payment_hash_success.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash_success,
+		RecipientOnionFields::secret_only(payment_secret_success), PaymentId(payment_hash_success.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 40_000, payment_hash_success, payment_secret_success);
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage_success);
@@ -301,7 +308,8 @@ fn test_fee_failures() {
 	}
 
 	let (payment_preimage_success, payment_hash_success, payment_secret_success) = get_payment_preimage_hash!(nodes[2]);
-	nodes[0].node.send_payment(&route, payment_hash_success, &Some(payment_secret_success), PaymentId(payment_hash_success.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash_success,
+		RecipientOnionFields::secret_only(payment_secret_success), PaymentId(payment_hash_success.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	pass_along_route(&nodes[0], &[&[&nodes[1], &nodes[2]]], 40_000, payment_hash_success, payment_secret_success);
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage_success);
@@ -342,7 +350,8 @@ fn test_onion_failure() {
 		let session_priv = SecretKey::from_slice(&[3; 32]).unwrap();
 		let cur_height = nodes[0].best_block_info().1 + 1;
 		let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
-		let (mut onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(&route.paths[0], 40000, &None, cur_height, &None).unwrap();
+		let (mut onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(
+			&route.paths[0], 40000, RecipientOnionFields::spontaneous_empty(), cur_height, &None).unwrap();
 		let mut new_payloads = Vec::new();
 		for payload in onion_payloads.drain(..) {
 			new_payloads.push(BogusOnionHopData::new(payload));
@@ -359,7 +368,8 @@ fn test_onion_failure() {
 		let session_priv = SecretKey::from_slice(&[3; 32]).unwrap();
 		let cur_height = nodes[0].best_block_info().1 + 1;
 		let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
-		let (mut onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(&route.paths[0], 40000, &None, cur_height, &None).unwrap();
+		let (mut onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(
+			&route.paths[0], 40000, RecipientOnionFields::spontaneous_empty(), cur_height, &None).unwrap();
 		let mut new_payloads = Vec::new();
 		for payload in onion_payloads.drain(..) {
 			new_payloads.push(BogusOnionHopData::new(payload));
@@ -381,7 +391,7 @@ fn test_onion_failure() {
 		let session_priv = SecretKey::from_slice(&[3; 32]).unwrap();
 		let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[0].shared_secret.as_ref(), NODE|2, &[0;0]);
-	}, ||{}, true, Some(NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][0].pubkey, is_permanent: false}), Some(route.paths[0][0].short_channel_id));
+	}, ||{}, true, Some(NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[0].pubkey, is_permanent: false}), Some(route.paths[0].hops[0].short_channel_id));
 
 	// final node failure
 	run_onion_failure_test_with_fail_intercept("temporary_node_failure", 200, &nodes, &route, &payment_hash, &payment_secret, |_msg| {}, |msg| {
@@ -391,7 +401,7 @@ fn test_onion_failure() {
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[1].shared_secret.as_ref(), NODE|2, &[0;0]);
 	}, ||{
 		nodes[2].node.fail_htlc_backwards(&payment_hash);
-	}, true, Some(NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][1].pubkey, is_permanent: false}), Some(route.paths[0][1].short_channel_id));
+	}, true, Some(NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[1].pubkey, is_permanent: false}), Some(route.paths[0].hops[1].short_channel_id));
 	let (_, payment_hash, payment_secret) = get_payment_preimage_hash!(nodes[2]);
 
 	// intermediate node failure
@@ -401,7 +411,7 @@ fn test_onion_failure() {
 		let session_priv = SecretKey::from_slice(&[3; 32]).unwrap();
 		let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[0].shared_secret.as_ref(), PERM|NODE|2, &[0;0]);
-	}, ||{}, true, Some(PERM|NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][0].pubkey, is_permanent: true}), Some(route.paths[0][0].short_channel_id));
+	}, ||{}, true, Some(PERM|NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[0].pubkey, is_permanent: true}), Some(route.paths[0].hops[0].short_channel_id));
 
 	// final node failure
 	run_onion_failure_test_with_fail_intercept("permanent_node_failure", 200, &nodes, &route, &payment_hash, &payment_secret, |_msg| {}, |msg| {
@@ -410,7 +420,7 @@ fn test_onion_failure() {
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[1].shared_secret.as_ref(), PERM|NODE|2, &[0;0]);
 	}, ||{
 		nodes[2].node.fail_htlc_backwards(&payment_hash);
-	}, false, Some(PERM|NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][1].pubkey, is_permanent: true}), Some(route.paths[0][1].short_channel_id));
+	}, false, Some(PERM|NODE|2), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[1].pubkey, is_permanent: true}), Some(route.paths[0].hops[1].short_channel_id));
 	let (_, payment_hash, payment_secret) = get_payment_preimage_hash!(nodes[2]);
 
 	// intermediate node failure
@@ -422,7 +432,7 @@ fn test_onion_failure() {
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[0].shared_secret.as_ref(), PERM|NODE|3, &[0;0]);
 	}, ||{
 		nodes[2].node.fail_htlc_backwards(&payment_hash);
-	}, true, Some(PERM|NODE|3), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][0].pubkey, is_permanent: true}), Some(route.paths[0][0].short_channel_id));
+	}, true, Some(PERM|NODE|3), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[0].pubkey, is_permanent: true}), Some(route.paths[0].hops[0].short_channel_id));
 
 	// final node failure
 	run_onion_failure_test_with_fail_intercept("required_node_feature_missing", 200, &nodes, &route, &payment_hash, &payment_secret, |_msg| {}, |msg| {
@@ -431,7 +441,7 @@ fn test_onion_failure() {
 		msg.reason = onion_utils::build_first_hop_failure_packet(onion_keys[1].shared_secret.as_ref(), PERM|NODE|3, &[0;0]);
 	}, ||{
 		nodes[2].node.fail_htlc_backwards(&payment_hash);
-	}, false, Some(PERM|NODE|3), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][1].pubkey, is_permanent: true}), Some(route.paths[0][1].short_channel_id));
+	}, false, Some(PERM|NODE|3), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[1].pubkey, is_permanent: true}), Some(route.paths[0].hops[1].short_channel_id));
 	let (_, payment_hash, payment_secret) = get_payment_preimage_hash!(nodes[2]);
 
 	// Our immediate peer sent UpdateFailMalformedHTLC because it couldn't understand the onion in
@@ -492,8 +502,8 @@ fn test_onion_failure() {
 	}, ||{}, true, Some(PERM|9), Some(NetworkUpdate::ChannelFailure{short_channel_id, is_permanent: true}), Some(short_channel_id));
 
 	let mut bogus_route = route.clone();
-	bogus_route.paths[0][1].short_channel_id -= 1;
-	let short_channel_id = bogus_route.paths[0][1].short_channel_id;
+	bogus_route.paths[0].hops[1].short_channel_id -= 1;
+	let short_channel_id = bogus_route.paths[0].hops[1].short_channel_id;
 	run_onion_failure_test("unknown_next_peer", 0, &nodes, &bogus_route, &payment_hash, &payment_secret, |_| {}, ||{}, true, Some(PERM|10),
 	  Some(NetworkUpdate::ChannelFailure{short_channel_id, is_permanent:true}), Some(short_channel_id));
 
@@ -502,8 +512,8 @@ fn test_onion_failure() {
 		.unwrap().lock().unwrap().channel_by_id.get(&channels[1].2).unwrap()
 		.get_counterparty_htlc_minimum_msat() - 1;
 	let mut bogus_route = route.clone();
-	let route_len = bogus_route.paths[0].len();
-	bogus_route.paths[0][route_len-1].fee_msat = amt_to_forward;
+	let route_len = bogus_route.paths[0].hops.len();
+	bogus_route.paths[0].hops[route_len-1].fee_msat = amt_to_forward;
 	run_onion_failure_test("amount_below_minimum", 0, &nodes, &bogus_route, &payment_hash, &payment_secret, |_| {}, ||{}, true, Some(UPDATE|11), Some(NetworkUpdate::ChannelUpdateMessage{msg: ChannelUpdate::dummy(short_channel_id)}), Some(short_channel_id));
 
 	// Clear pending payments so that the following positive test has the correct payment hash.
@@ -512,7 +522,7 @@ fn test_onion_failure() {
 	}
 
 	// Test a positive test-case with one extra msat, meeting the minimum.
-	bogus_route.paths[0][route_len-1].fee_msat = amt_to_forward + 1;
+	bogus_route.paths[0].hops[route_len-1].fee_msat = amt_to_forward + 1;
 	let preimage = send_along_route(&nodes[0], bogus_route, &[&nodes[1], &nodes[2]], amt_to_forward+1).0;
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], preimage);
 
@@ -552,7 +562,7 @@ fn test_onion_failure() {
 			for f in pending_forwards.iter_mut() {
 				match f {
 					&mut HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo { ref mut forward_info, .. }) =>
-						forward_info.outgoing_cltv_value += 1,
+						forward_info.outgoing_cltv_value -= 1,
 					_ => {},
 				}
 			}
@@ -577,6 +587,15 @@ fn test_onion_failure() {
 		// disconnect event to the channel between nodes[1] ~ nodes[2]
 		nodes[1].node.peer_disconnected(&nodes[2].node.get_our_node_id());
 		nodes[2].node.peer_disconnected(&nodes[1].node.get_our_node_id());
+	}, true, Some(UPDATE|7), Some(NetworkUpdate::ChannelUpdateMessage{msg: ChannelUpdate::dummy(short_channel_id)}), Some(short_channel_id));
+	run_onion_failure_test("channel_disabled", 0, &nodes, &route, &payment_hash, &payment_secret, |_| {}, || {
+		// disconnect event to the channel between nodes[1] ~ nodes[2]
+		for _ in 0..DISABLE_GOSSIP_TICKS + 1 {
+			nodes[1].node.timer_tick_occurred();
+			nodes[2].node.timer_tick_occurred();
+		}
+		nodes[1].node.get_and_clear_pending_msg_events();
+		nodes[2].node.get_and_clear_pending_msg_events();
 	}, true, Some(UPDATE|20), Some(NetworkUpdate::ChannelUpdateMessage{msg: ChannelUpdate::dummy(short_channel_id)}), Some(short_channel_id));
 	reconnect_nodes(&nodes[1], &nodes[2], (false, false), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (false, false));
 
@@ -584,13 +603,14 @@ fn test_onion_failure() {
 		let session_priv = SecretKey::from_slice(&[3; 32]).unwrap();
 		let mut route = route.clone();
 		let height = nodes[2].best_block_info().1;
-		route.paths[0][1].cltv_expiry_delta += CLTV_FAR_FAR_AWAY + route.paths[0][0].cltv_expiry_delta + 1;
+		route.paths[0].hops[1].cltv_expiry_delta += CLTV_FAR_FAR_AWAY + route.paths[0].hops[0].cltv_expiry_delta + 1;
 		let onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
-		let (onion_payloads, _, htlc_cltv) = onion_utils::build_onion_payloads(&route.paths[0], 40000, &None, height, &None).unwrap();
+		let (onion_payloads, _, htlc_cltv) = onion_utils::build_onion_payloads(
+			&route.paths[0], 40000, RecipientOnionFields::spontaneous_empty(), height, &None).unwrap();
 		let onion_packet = onion_utils::construct_onion_packet(onion_payloads, onion_keys, [0; 32], &payment_hash);
 		msg.cltv_expiry = htlc_cltv;
 		msg.onion_routing_packet = onion_packet;
-	}, ||{}, true, Some(21), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0][0].pubkey, is_permanent: true}), Some(route.paths[0][0].short_channel_id));
+	}, ||{}, true, Some(21), Some(NetworkUpdate::NodeFailure{node_id: route.paths[0].hops[0].pubkey, is_permanent: true}), Some(route.paths[0].hops[0].short_channel_id));
 
 	run_onion_failure_test_with_fail_intercept("mpp_timeout", 200, &nodes, &route, &payment_hash, &payment_secret, |_msg| {}, |msg| {
 		// Tamper returning error message
@@ -600,6 +620,48 @@ fn test_onion_failure() {
 	}, ||{
 		nodes[2].node.fail_htlc_backwards(&payment_hash);
 	}, true, Some(23), None, None);
+}
+
+#[test]
+fn test_overshoot_final_cltv() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None; 3]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], 40000);
+
+	let payment_id = PaymentId(nodes[0].keys_manager.backing.get_secure_random_bytes());
+	nodes[0].node.send_payment_with_route(&route, payment_hash, RecipientOnionFields::secret_only(payment_secret), payment_id).unwrap();
+
+	check_added_monitors!(nodes[0], 1);
+	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
+	let mut update_add_0 = update_0.update_add_htlcs[0].clone();
+	nodes[1].node.handle_update_add_htlc(&nodes[0].node.get_our_node_id(), &update_add_0);
+	commitment_signed_dance!(nodes[1], nodes[0], &update_0.commitment_signed, false, true);
+
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	for (_, pending_forwards) in nodes[1].node.forward_htlcs.lock().unwrap().iter_mut() {
+		for f in pending_forwards.iter_mut() {
+			match f {
+				&mut HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo { ref mut forward_info, .. }) =>
+					forward_info.outgoing_cltv_value += 1,
+				_ => {},
+			}
+		}
+	}
+	expect_pending_htlcs_forwardable!(nodes[1]);
+
+	check_added_monitors!(&nodes[1], 1);
+	let update_1 = get_htlc_update_msgs!(nodes[1], nodes[2].node.get_our_node_id());
+	let mut update_add_1 = update_1.update_add_htlcs[0].clone();
+	nodes[2].node.handle_update_add_htlc(&nodes[1].node.get_our_node_id(), &update_add_1);
+	commitment_signed_dance!(nodes[2], nodes[1], update_1.commitment_signed, false, true);
+
+	expect_pending_htlcs_forwardable!(nodes[2]);
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, 40_000);
+	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
 }
 
 fn do_test_onion_failure_stale_channel_update(announced_channel: bool) {
@@ -802,14 +864,15 @@ fn test_always_create_tlv_format_onion_payloads() {
 		.with_features(InvoiceFeatures::empty());
 	let (route, _payment_hash, _payment_preimage, _payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], payment_params, 40000, TEST_FINAL_CLTV);
 
-	let hops = &route.paths[0];
+	let hops = &route.paths[0].hops;
 	// Asserts that the first hop to `node[1]` signals no support for variable length onions.
 	assert!(!hops[0].node_features.supports_variable_length_onion());
 	// Asserts that the first hop to `node[1]` signals no support for variable length onions.
 	assert!(!hops[1].node_features.supports_variable_length_onion());
 
 	let cur_height = nodes[0].best_block_info().1 + 1;
-	let (onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(&route.paths[0], 40000, &None, cur_height, &None).unwrap();
+	let (onion_payloads, _htlc_msat, _htlc_cltv) = onion_utils::build_onion_payloads(
+		&route.paths[0], 40000, RecipientOnionFields::spontaneous_empty(), cur_height, &None).unwrap();
 
 	match onion_payloads[0].format {
 		msgs::OnionHopDataFormat::NonFinalNode {..} => {},
@@ -838,7 +901,8 @@ fn do_test_fail_htlc_backwards_with_reason(failure_code: FailureCode) {
 
 	let payment_amount = 100_000;
 	let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], payment_amount);
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -949,7 +1013,8 @@ fn test_phantom_onion_hmac_failure() {
 	let (route, phantom_scid) = get_phantom_route!(nodes, recv_value_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1010,7 +1075,8 @@ fn test_phantom_invalid_onion_payload() {
 	// We'll use the session priv later when constructing an invalid onion packet.
 	let session_priv = [3; 32];
 	*nodes[0].keys_manager.override_random_bytes.lock().unwrap() = Some(session_priv);
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1032,7 +1098,9 @@ fn test_phantom_invalid_onion_payload() {
 					let height = nodes[0].best_block_info().1;
 					let session_priv = SecretKey::from_slice(&session_priv).unwrap();
 					let mut onion_keys = onion_utils::construct_onion_keys(&Secp256k1::new(), &route.paths[0], &session_priv).unwrap();
-					let (mut onion_payloads, _, _) = onion_utils::build_onion_payloads(&route.paths[0], msgs::MAX_VALUE_MSAT + 1, &Some(payment_secret), height + 1, &None).unwrap();
+					let (mut onion_payloads, _, _) = onion_utils::build_onion_payloads(
+						&route.paths[0], msgs::MAX_VALUE_MSAT + 1,
+						RecipientOnionFields::secret_only(payment_secret), height + 1, &None).unwrap();
 					// We only want to construct the onion packet for the last hop, not the entire route, so
 					// remove the first hop's payload and its keys.
 					onion_keys.remove(0);
@@ -1081,7 +1149,8 @@ fn test_phantom_final_incorrect_cltv_expiry() {
 	let (route, phantom_scid) = get_phantom_route!(nodes, recv_value_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1096,7 +1165,7 @@ fn test_phantom_final_incorrect_cltv_expiry() {
 				&mut HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
 					forward_info: PendingHTLCInfo { ref mut outgoing_cltv_value, .. }, ..
 				}) => {
-					*outgoing_cltv_value += 1;
+					*outgoing_cltv_value -= 1;
 				},
 				_ => panic!("Unexpected forward"),
 			}
@@ -1114,7 +1183,7 @@ fn test_phantom_final_incorrect_cltv_expiry() {
 	commitment_signed_dance!(nodes[0], nodes[1], update_1.commitment_signed, false);
 
 	// Ensure the payment fails with the expected error.
-	let expected_cltv: u32 = 82;
+	let expected_cltv: u32 = 80;
 	let error_data = expected_cltv.to_be_bytes().to_vec();
 	let mut fail_conditions = PaymentFailedConditions::new()
 		.blamed_scid(phantom_scid)
@@ -1137,10 +1206,11 @@ fn test_phantom_failure_too_low_cltv() {
 	let (mut route, phantom_scid) = get_phantom_route!(nodes, recv_value_msat, channel);
 
 	// Modify the route to have a too-low cltv.
-	route.paths[0][1].cltv_expiry_delta = 5;
+	route.paths[0].hops[1].cltv_expiry_delta = 5;
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1187,7 +1257,8 @@ fn test_phantom_failure_modified_cltv() {
 	let (mut route, phantom_scid) = get_phantom_route!(nodes, recv_value_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1228,7 +1299,8 @@ fn test_phantom_failure_expires_too_soon() {
 	let (mut route, phantom_scid) = get_phantom_route!(nodes, recv_value_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1266,7 +1338,8 @@ fn test_phantom_failure_too_low_recv_amt() {
 	let (mut route, phantom_scid) = get_phantom_route!(nodes, bad_recv_amt_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1316,7 +1389,8 @@ fn test_phantom_dust_exposure_failure() {
 	let (mut route, _) = get_phantom_route!(nodes, max_dust_exposure + 1, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1359,7 +1433,8 @@ fn test_phantom_failure_reject_payment() {
 	let (mut route, phantom_scid) = get_phantom_route!(nodes, recv_amt_msat, channel);
 
 	// Route the HTLC through to the destination.
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 	let update_0 = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
 	let mut update_add = update_0.update_add_htlcs[0].clone();
@@ -1371,7 +1446,7 @@ fn test_phantom_failure_reject_payment() {
 	nodes[1].node.process_pending_htlc_forwards();
 	expect_pending_htlcs_forwardable_ignore!(nodes[1]);
 	nodes[1].node.process_pending_htlc_forwards();
-	expect_payment_claimable!(nodes[1], payment_hash, payment_secret, recv_amt_msat, None, route.paths[0].last().unwrap().pubkey);
+	expect_payment_claimable!(nodes[1], payment_hash, payment_secret, recv_amt_msat, None, route.paths[0].hops.last().unwrap().pubkey);
 	nodes[1].node.fail_htlc_backwards(&payment_hash);
 	expect_pending_htlcs_forwardable_and_htlc_handling_failed_ignore!(nodes[1], vec![HTLCDestination::FailedPayment { payment_hash }]);
 	nodes[1].node.process_pending_htlc_forwards();

@@ -51,9 +51,9 @@ use crate::chain::Filter;
 use crate::util::logger::Logger;
 use crate::util::ser::{Readable, ReadableArgs, RequiredWrapper, MaybeReadable, UpgradableRequired, Writer, Writeable, U48};
 use crate::util::byte_utils;
-use crate::util::events::Event;
+use crate::events::Event;
 #[cfg(anchors)]
-use crate::util::events::{AnchorDescriptor, HTLCDescriptor, BumpTransactionEvent};
+use crate::events::bump_transaction::{AnchorDescriptor, HTLCDescriptor, BumpTransactionEvent};
 
 use crate::prelude::*;
 use core::{cmp, mem};
@@ -70,34 +70,36 @@ use crate::sync::{Mutex, LockTestExt};
 /// much smaller than a full [`ChannelMonitor`]. However, for large single commitment transaction
 /// updates (e.g. ones during which there are hundreds of HTLCs pending on the commitment
 /// transaction), a single update may reach upwards of 1 MiB in serialized size.
-#[cfg_attr(any(test, fuzzing, feature = "_test_utils"), derive(PartialEq, Eq))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[must_use]
 pub struct ChannelMonitorUpdate {
 	pub(crate) updates: Vec<ChannelMonitorUpdateStep>,
 	/// The sequence number of this update. Updates *must* be replayed in-order according to this
 	/// sequence number (and updates may panic if they are not). The update_id values are strictly
-	/// increasing and increase by one for each new update, with one exception specified below.
+	/// increasing and increase by one for each new update, with two exceptions specified below.
 	///
 	/// This sequence number is also used to track up to which points updates which returned
 	/// [`ChannelMonitorUpdateStatus::InProgress`] have been applied to all copies of a given
 	/// ChannelMonitor when ChannelManager::channel_monitor_updated is called.
 	///
-	/// The only instance where update_id values are not strictly increasing is the case where we
-	/// allow post-force-close updates with a special update ID of [`CLOSED_CHANNEL_UPDATE_ID`]. See
-	/// its docs for more details.
+	/// The only instances we allow where update_id values are not strictly increasing have a
+	/// special update ID of [`CLOSED_CHANNEL_UPDATE_ID`]. This update ID is used for updates that
+	/// will force close the channel by broadcasting the latest commitment transaction or
+	/// special post-force-close updates, like providing preimages necessary to claim outputs on the
+	/// broadcast commitment transaction. See its docs for more details.
 	///
 	/// [`ChannelMonitorUpdateStatus::InProgress`]: super::ChannelMonitorUpdateStatus::InProgress
 	pub update_id: u64,
 }
 
-/// If:
-///    (1) a channel has been force closed and
-///    (2) we receive a preimage from a forward link that allows us to spend an HTLC output on
-///        this channel's (the backward link's) broadcasted commitment transaction
-/// then we allow the `ChannelManager` to send a `ChannelMonitorUpdate` with this update ID,
-/// with the update providing said payment preimage. No other update types are allowed after
-/// force-close.
+/// The update ID used for a [`ChannelMonitorUpdate`] that is either:
+///
+///	(1) attempting to force close the channel by broadcasting our latest commitment transaction or
+///	(2) providing a preimage (after the channel has been force closed) from a forward link that
+///		allows us to spend an HTLC output on this channel's (the backward link's) broadcasted
+///		commitment transaction.
+///
+/// No other [`ChannelMonitorUpdate`]s are allowed after force-close.
 pub const CLOSED_CHANNEL_UPDATE_ID: u64 = core::u64::MAX;
 
 impl Writeable for ChannelMonitorUpdate {
@@ -489,13 +491,16 @@ impl_writeable_tlv_based_enum_upgradable!(OnchainEvent,
 
 );
 
-#[cfg_attr(any(test, fuzzing, feature = "_test_utils"), derive(PartialEq, Eq))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum ChannelMonitorUpdateStep {
 	LatestHolderCommitmentTXInfo {
 		commitment_tx: HolderCommitmentTransaction,
+		/// Note that LDK after 0.0.115 supports this only containing dust HTLCs (implying the
+		/// `Signature` field is never filled in). At that point, non-dust HTLCs are implied by the
+		/// HTLC fields in `commitment_tx` and the sources passed via `nondust_htlc_sources`.
 		htlc_outputs: Vec<(HTLCOutputInCommitment, Option<Signature>, Option<HTLCSource>)>,
 		claimed_htlcs: Vec<(SentHTLCId, PaymentPreimage)>,
+		nondust_htlc_sources: Vec<HTLCSource>,
 	},
 	LatestCounterpartyCommitmentTXInfo {
 		commitment_txid: Txid,
@@ -540,6 +545,7 @@ impl_writeable_tlv_based_enum_upgradable!(ChannelMonitorUpdateStep,
 		(0, commitment_tx, required),
 		(1, claimed_htlcs, vec_type),
 		(2, htlc_outputs, vec_type),
+		(4, nondust_htlc_sources, optional_vec),
 	},
 	(1, LatestCounterpartyCommitmentTXInfo) => {
 		(0, commitment_txid, required),
@@ -1182,7 +1188,7 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitor<Signer> {
 		&self, holder_commitment_tx: HolderCommitmentTransaction,
 		htlc_outputs: Vec<(HTLCOutputInCommitment, Option<Signature>, Option<HTLCSource>)>,
 	) -> Result<(), ()> {
-		self.inner.lock().unwrap().provide_latest_holder_commitment_tx(holder_commitment_tx, htlc_outputs, &Vec::new()).map_err(|_| ())
+		self.inner.lock().unwrap().provide_latest_holder_commitment_tx(holder_commitment_tx, htlc_outputs, &Vec::new(), Vec::new()).map_err(|_| ())
 	}
 
 	/// This is used to provide payment preimage(s) out-of-band during startup without updating the
@@ -1201,17 +1207,6 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitor<Signer> {
 	{
 		self.inner.lock().unwrap().provide_payment_preimage(
 			payment_hash, payment_preimage, broadcaster, fee_estimator, logger)
-	}
-
-	pub(crate) fn broadcast_latest_holder_commitment_txn<B: Deref, L: Deref>(
-		&self,
-		broadcaster: &B,
-		logger: &L,
-	) where
-		B::Target: BroadcasterInterface,
-		L::Target: Logger,
-	{
-		self.inner.lock().unwrap().broadcast_latest_holder_commitment_txn(broadcaster, logger);
 	}
 
 	/// Updates a ChannelMonitor on the basis of some new information provided by the Channel
@@ -1281,7 +1276,7 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// This is called by the [`EventsProvider::process_pending_events`] implementation for
 	/// [`ChainMonitor`].
 	///
-	/// [`EventsProvider::process_pending_events`]: crate::util::events::EventsProvider::process_pending_events
+	/// [`EventsProvider::process_pending_events`]: crate::events::EventsProvider::process_pending_events
 	/// [`ChainMonitor`]: crate::chain::chainmonitor::ChainMonitor
 	pub fn get_and_clear_pending_events(&self) -> Vec<Event> {
 		self.inner.lock().unwrap().get_and_clear_pending_events()
@@ -1473,6 +1468,27 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// [`chain::Confirm`] interfaces.
 	pub fn current_best_block(&self) -> BestBlock {
 		self.inner.lock().unwrap().best_block.clone()
+	}
+
+	/// Triggers rebroadcasts/fee-bumps of pending claims from a force-closed channel. This is
+	/// crucial in preventing certain classes of pinning attacks, detecting substantial mempool
+	/// feerate changes between blocks, and ensuring reliability if broadcasting fails. We recommend
+	/// invoking this every 30 seconds, or lower if running in an environment with spotty
+	/// connections, like on mobile.
+	pub fn rebroadcast_pending_claims<B: Deref, F: Deref, L: Deref>(
+		&self, broadcaster: B, fee_estimator: F, logger: L,
+	)
+	where
+		B::Target: BroadcasterInterface,
+		F::Target: FeeEstimator,
+		L::Target: Logger,
+	{
+		let fee_estimator = LowerBoundedFeeEstimator::new(fee_estimator);
+		let mut inner = self.inner.lock().unwrap();
+		let current_height = inner.best_block.height;
+		inner.onchain_tx_handler.rebroadcast_pending_claims(
+			current_height, &broadcaster, &fee_estimator, &logger,
+		);
 	}
 }
 
@@ -2162,7 +2178,53 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	/// is important that any clones of this channel monitor (including remote clones) by kept
 	/// up-to-date as our holder commitment transaction is updated.
 	/// Panics if set_on_holder_tx_csv has never been called.
-	fn provide_latest_holder_commitment_tx(&mut self, holder_commitment_tx: HolderCommitmentTransaction, htlc_outputs: Vec<(HTLCOutputInCommitment, Option<Signature>, Option<HTLCSource>)>, claimed_htlcs: &[(SentHTLCId, PaymentPreimage)]) -> Result<(), &'static str> {
+	fn provide_latest_holder_commitment_tx(&mut self, holder_commitment_tx: HolderCommitmentTransaction, mut htlc_outputs: Vec<(HTLCOutputInCommitment, Option<Signature>, Option<HTLCSource>)>, claimed_htlcs: &[(SentHTLCId, PaymentPreimage)], nondust_htlc_sources: Vec<HTLCSource>) -> Result<(), &'static str> {
+		if htlc_outputs.iter().any(|(_, s, _)| s.is_some()) {
+			// If we have non-dust HTLCs in htlc_outputs, ensure they match the HTLCs in the
+			// `holder_commitment_tx`. In the future, we'll no longer provide the redundant data
+			// and just pass in source data via `nondust_htlc_sources`.
+			debug_assert_eq!(htlc_outputs.iter().filter(|(_, s, _)| s.is_some()).count(), holder_commitment_tx.trust().htlcs().len());
+			for (a, b) in htlc_outputs.iter().filter(|(_, s, _)| s.is_some()).map(|(h, _, _)| h).zip(holder_commitment_tx.trust().htlcs().iter()) {
+				debug_assert_eq!(a, b);
+			}
+			debug_assert_eq!(htlc_outputs.iter().filter(|(_, s, _)| s.is_some()).count(), holder_commitment_tx.counterparty_htlc_sigs.len());
+			for (a, b) in htlc_outputs.iter().filter_map(|(_, s, _)| s.as_ref()).zip(holder_commitment_tx.counterparty_htlc_sigs.iter()) {
+				debug_assert_eq!(a, b);
+			}
+			debug_assert!(nondust_htlc_sources.is_empty());
+		} else {
+			// If we don't have any non-dust HTLCs in htlc_outputs, assume they were all passed via
+			// `nondust_htlc_sources`, building up the final htlc_outputs by combining
+			// `nondust_htlc_sources` and the `holder_commitment_tx`
+			#[cfg(debug_assertions)] {
+				let mut prev = -1;
+				for htlc in holder_commitment_tx.trust().htlcs().iter() {
+					assert!(htlc.transaction_output_index.unwrap() as i32 > prev);
+					prev = htlc.transaction_output_index.unwrap() as i32;
+				}
+			}
+			debug_assert!(htlc_outputs.iter().all(|(htlc, _, _)| htlc.transaction_output_index.is_none()));
+			debug_assert!(htlc_outputs.iter().all(|(_, sig_opt, _)| sig_opt.is_none()));
+			debug_assert_eq!(holder_commitment_tx.trust().htlcs().len(), holder_commitment_tx.counterparty_htlc_sigs.len());
+
+			let mut sources_iter = nondust_htlc_sources.into_iter();
+
+			for (htlc, counterparty_sig) in holder_commitment_tx.trust().htlcs().iter()
+				.zip(holder_commitment_tx.counterparty_htlc_sigs.iter())
+			{
+				if htlc.offered {
+					let source = sources_iter.next().expect("Non-dust HTLC sources didn't match commitment tx");
+					#[cfg(debug_assertions)] {
+						assert!(source.possibly_matches_output(htlc));
+					}
+					htlc_outputs.push((htlc.clone(), Some(counterparty_sig.clone()), Some(source)));
+				} else {
+					htlc_outputs.push((htlc.clone(), Some(counterparty_sig.clone()), None));
+				}
+			}
+			debug_assert!(sources_iter.next().is_none());
+		}
+
 		let trusted_tx = holder_commitment_tx.trust();
 		let txid = trusted_tx.txid();
 		let tx_keys = trusted_tx.keys();
@@ -2267,14 +2329,22 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	{
 		log_info!(logger, "Applying update to monitor {}, bringing update_id from {} to {} with {} changes.",
 			log_funding_info!(self), self.latest_update_id, updates.update_id, updates.updates.len());
-		// ChannelMonitor updates may be applied after force close if we receive a
-		// preimage for a broadcasted commitment transaction HTLC output that we'd
-		// like to claim on-chain. If this is the case, we no longer have guaranteed
-		// access to the monitor's update ID, so we use a sentinel value instead.
+		// ChannelMonitor updates may be applied after force close if we receive a preimage for a
+		// broadcasted commitment transaction HTLC output that we'd like to claim on-chain. If this
+		// is the case, we no longer have guaranteed access to the monitor's update ID, so we use a
+		// sentinel value instead.
+		//
+		// The `ChannelManager` may also queue redundant `ChannelForceClosed` updates if it still
+		// thinks the channel needs to have its commitment transaction broadcast, so we'll allow
+		// them as well.
 		if updates.update_id == CLOSED_CHANNEL_UPDATE_ID {
 			assert_eq!(updates.updates.len(), 1);
 			match updates.updates[0] {
-				ChannelMonitorUpdateStep::PaymentPreimage { .. } => {},
+				ChannelMonitorUpdateStep::ChannelForceClosed { .. } => {},
+				// We should have already seen a `ChannelForceClosed` update if we're trying to
+				// provide a preimage at this point.
+				ChannelMonitorUpdateStep::PaymentPreimage { .. } =>
+					debug_assert_eq!(self.latest_update_id, CLOSED_CHANNEL_UPDATE_ID),
 				_ => {
 					log_error!(logger, "Attempted to apply post-force-close ChannelMonitorUpdate of type {}", updates.updates[0].variant_name());
 					panic!("Attempted to apply post-force-close ChannelMonitorUpdate that wasn't providing a payment preimage");
@@ -2287,10 +2357,10 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		let bounded_fee_estimator = LowerBoundedFeeEstimator::new(&*fee_estimator);
 		for update in updates.updates.iter() {
 			match update {
-				ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, htlc_outputs, claimed_htlcs } => {
+				ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, htlc_outputs, claimed_htlcs, nondust_htlc_sources } => {
 					log_trace!(logger, "Updating ChannelMonitor with latest holder commitment transaction info");
 					if self.lockdown_from_offchain { panic!(); }
-					if let Err(e) = self.provide_latest_holder_commitment_tx(commitment_tx.clone(), htlc_outputs.clone(), &claimed_htlcs) {
+					if let Err(e) = self.provide_latest_holder_commitment_tx(commitment_tx.clone(), htlc_outputs.clone(), &claimed_htlcs, nondust_htlc_sources.clone()) {
 						log_error!(logger, "Providing latest holder commitment transaction failed/was refused:");
 						log_error!(logger, "    {}", e);
 						ret = Err(());
@@ -2366,6 +2436,13 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				},
 			}
 		}
+
+		// If the updates succeeded and we were in an already closed channel state, then there's no
+		// need to refuse any updates we expect to receive afer seeing a confirmed commitment.
+		if ret.is_ok() && updates.update_id == CLOSED_CHANNEL_UPDATE_ID && self.latest_update_id == updates.update_id {
+			return Ok(());
+		}
+
 		self.latest_update_id = updates.update_id;
 
 		if ret.is_ok() && self.funding_spend_seen {
@@ -2428,7 +2505,7 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					}));
 				},
 				ClaimEvent::BumpHTLC {
-					target_feerate_sat_per_1000_weight, htlcs,
+					target_feerate_sat_per_1000_weight, htlcs, tx_lock_time,
 				} => {
 					let mut htlc_descriptors = Vec::with_capacity(htlcs.len());
 					for htlc in htlcs {
@@ -2446,6 +2523,7 @@ impl<Signer: WriteableEcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					ret.push(Event::BumpTransaction(BumpTransactionEvent::HTLCResolution {
 						target_feerate_sat_per_1000_weight,
 						htlc_descriptors,
+						tx_lock_time,
 					}));
 				}
 			}
@@ -3670,8 +3748,9 @@ where
 	}
 }
 
-impl<Signer: WriteableEcdsaChannelSigner, T: Deref, F: Deref, L: Deref> chain::Confirm for (ChannelMonitor<Signer>, T, F, L)
+impl<Signer: WriteableEcdsaChannelSigner, M, T: Deref, F: Deref, L: Deref> chain::Confirm for (M, T, F, L)
 where
+	M: Deref<Target = ChannelMonitor<Signer>>,
 	T::Target: BroadcasterInterface,
 	F::Target: FeeEstimator,
 	L::Target: Logger,
@@ -4008,14 +4087,14 @@ mod tests {
 	use crate::chain::package::{weight_offered_htlc, weight_received_htlc, weight_revoked_offered_htlc, weight_revoked_received_htlc, WEIGHT_REVOKED_OUTPUT};
 	use crate::chain::transaction::OutPoint;
 	use crate::chain::keysinterface::InMemorySigner;
+	use crate::events::ClosureReason;
 	use crate::ln::{PaymentPreimage, PaymentHash};
 	use crate::ln::chan_utils;
 	use crate::ln::chan_utils::{HTLCOutputInCommitment, ChannelPublicKeys, ChannelTransactionParameters, HolderCommitmentTransaction, CounterpartyChannelTransactionParameters};
-	use crate::ln::channelmanager::{PaymentSendFailure, PaymentId};
+	use crate::ln::channelmanager::{PaymentSendFailure, PaymentId, RecipientOnionFields};
 	use crate::ln::functional_test_utils::*;
 	use crate::ln::script::ShutdownScript;
 	use crate::util::errors::APIError;
-	use crate::util::events::{ClosureReason, MessageSendEventsProvider};
 	use crate::util::test_utils::{TestLogger, TestBroadcaster, TestFeeEstimator};
 	use crate::util::ser::{ReadableArgs, Writeable};
 	use crate::sync::{Arc, Mutex};
@@ -4074,8 +4153,9 @@ mod tests {
 		// If the ChannelManager tries to update the channel, however, the ChainMonitor will pass
 		// the update through to the ChannelMonitor which will refuse it (as the channel is closed).
 		let (route, payment_hash, _, payment_secret) = get_route_and_payment_hash!(nodes[1], nodes[0], 100_000);
-		unwrap_send_err!(nodes[1].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)),
-			true, APIError::ChannelUnavailable { ref err },
+		unwrap_send_err!(nodes[1].node.send_payment_with_route(&route, payment_hash,
+				RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)
+			), true, APIError::ChannelUnavailable { ref err },
 			assert!(err.contains("ChannelMonitor storage failure")));
 		check_added_monitors!(nodes[1], 2); // After the failure we generate a close-channel monitor update
 		check_closed_broadcast!(nodes[1], true);
@@ -4092,7 +4172,7 @@ mod tests {
 		replay_update.updates.push(ChannelMonitorUpdateStep::PaymentPreimage { payment_preimage: payment_preimage_1 });
 		replay_update.updates.push(ChannelMonitorUpdateStep::PaymentPreimage { payment_preimage: payment_preimage_2 });
 
-		let broadcaster = TestBroadcaster::new(Arc::clone(&nodes[1].blocks));
+		let broadcaster = TestBroadcaster::with_blocks(Arc::clone(&nodes[1].blocks));
 		assert!(
 			pre_update_monitor.update_monitor(&replay_update, &&broadcaster, &chanmon_cfgs[1].fee_estimator, &nodes[1].logger)
 			.is_err());
@@ -4118,10 +4198,7 @@ mod tests {
 	fn test_prune_preimages() {
 		let secp_ctx = Secp256k1::new();
 		let logger = Arc::new(TestLogger::new());
-		let broadcaster = Arc::new(TestBroadcaster {
-			txn_broadcasted: Mutex::new(Vec::new()),
-			blocks: Arc::new(Mutex::new(Vec::new()))
-		});
+		let broadcaster = Arc::new(TestBroadcaster::new(Network::Testnet));
 		let fee_estimator = TestFeeEstimator { sat_per_kw: Mutex::new(253) };
 
 		let dummy_key = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
@@ -4135,7 +4212,7 @@ mod tests {
 			}
 		}
 
-		macro_rules! preimages_slice_to_htlc_outputs {
+		macro_rules! preimages_slice_to_htlcs {
 			($preimages_slice: expr) => {
 				{
 					let mut res = Vec::new();
@@ -4146,21 +4223,20 @@ mod tests {
 							cltv_expiry: 0,
 							payment_hash: preimage.1.clone(),
 							transaction_output_index: Some(idx as u32),
-						}, None));
+						}, ()));
 					}
 					res
 				}
 			}
 		}
-		macro_rules! preimages_to_holder_htlcs {
+		macro_rules! preimages_slice_to_htlc_outputs {
 			($preimages_slice: expr) => {
-				{
-					let mut inp = preimages_slice_to_htlc_outputs!($preimages_slice);
-					let res: Vec<_> = inp.drain(..).map(|e| { (e.0, None, e.1) }).collect();
-					res
-				}
+				preimages_slice_to_htlcs!($preimages_slice).into_iter().map(|(htlc, _)| (htlc, None)).collect()
 			}
 		}
+		let dummy_sig = crate::util::crypto::sign(&secp_ctx,
+			&bitcoin::secp256k1::Message::from_slice(&[42; 32]).unwrap(),
+			&SecretKey::from_slice(&[42; 32]).unwrap());
 
 		macro_rules! test_preimages_exist {
 			($preimages_slice: expr, $monitor: expr) => {
@@ -4179,6 +4255,7 @@ mod tests {
 			SecretKey::from_slice(&[41; 32]).unwrap(),
 			[41; 32],
 			0,
+			[0; 32],
 			[0; 32],
 		);
 
@@ -4207,13 +4284,15 @@ mod tests {
 		let shutdown_pubkey = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let best_block = BestBlock::from_network(Network::Testnet);
 		let monitor = ChannelMonitor::new(Secp256k1::new(), keys,
-		                                  Some(ShutdownScript::new_p2wpkh_from_pubkey(shutdown_pubkey).into_inner()), 0, &Script::new(),
-		                                  (OutPoint { txid: Txid::from_slice(&[43; 32]).unwrap(), index: 0 }, Script::new()),
-		                                  &channel_parameters,
-		                                  Script::new(), 46, 0,
-		                                  HolderCommitmentTransaction::dummy(), best_block, dummy_key);
+			Some(ShutdownScript::new_p2wpkh_from_pubkey(shutdown_pubkey).into_inner()), 0, &Script::new(),
+			(OutPoint { txid: Txid::from_slice(&[43; 32]).unwrap(), index: 0 }, Script::new()),
+			&channel_parameters, Script::new(), 46, 0, HolderCommitmentTransaction::dummy(&mut Vec::new()),
+			best_block, dummy_key);
 
-		monitor.provide_latest_holder_commitment_tx(HolderCommitmentTransaction::dummy(), preimages_to_holder_htlcs!(preimages[0..10])).unwrap();
+		let mut htlcs = preimages_slice_to_htlcs!(preimages[0..10]);
+		let dummy_commitment_tx = HolderCommitmentTransaction::dummy(&mut htlcs);
+		monitor.provide_latest_holder_commitment_tx(dummy_commitment_tx.clone(),
+			htlcs.into_iter().map(|(htlc, _)| (htlc, Some(dummy_sig), None)).collect()).unwrap();
 		monitor.provide_latest_counterparty_commitment_tx(Txid::from_inner(Sha256::hash(b"1").into_inner()),
 			preimages_slice_to_htlc_outputs!(preimages[5..15]), 281474976710655, dummy_key, &logger);
 		monitor.provide_latest_counterparty_commitment_tx(Txid::from_inner(Sha256::hash(b"2").into_inner()),
@@ -4246,7 +4325,10 @@ mod tests {
 
 		// Now update holder commitment tx info, pruning only element 18 as we still care about the
 		// previous commitment tx's preimages too
-		monitor.provide_latest_holder_commitment_tx(HolderCommitmentTransaction::dummy(), preimages_to_holder_htlcs!(preimages[0..5])).unwrap();
+		let mut htlcs = preimages_slice_to_htlcs!(preimages[0..5]);
+		let dummy_commitment_tx = HolderCommitmentTransaction::dummy(&mut htlcs);
+		monitor.provide_latest_holder_commitment_tx(dummy_commitment_tx.clone(),
+			htlcs.into_iter().map(|(htlc, _)| (htlc, Some(dummy_sig), None)).collect()).unwrap();
 		secret[0..32].clone_from_slice(&hex::decode("2273e227a5b7449b6e70f1fb4652864038b1cbf9cd7c043a7d6456b7fc275ad8").unwrap());
 		monitor.provide_secret(281474976710653, secret.clone()).unwrap();
 		assert_eq!(monitor.inner.lock().unwrap().payment_preimages.len(), 12);
@@ -4254,7 +4336,10 @@ mod tests {
 		test_preimages_exist!(&preimages[18..20], monitor);
 
 		// But if we do it again, we'll prune 5-10
-		monitor.provide_latest_holder_commitment_tx(HolderCommitmentTransaction::dummy(), preimages_to_holder_htlcs!(preimages[0..3])).unwrap();
+		let mut htlcs = preimages_slice_to_htlcs!(preimages[0..3]);
+		let dummy_commitment_tx = HolderCommitmentTransaction::dummy(&mut htlcs);
+		monitor.provide_latest_holder_commitment_tx(dummy_commitment_tx,
+			htlcs.into_iter().map(|(htlc, _)| (htlc, Some(dummy_sig), None)).collect()).unwrap();
 		secret[0..32].clone_from_slice(&hex::decode("27cddaa5624534cb6cb9d7da077cf2b22ab21e9b506fd4998a51d54502e99116").unwrap());
 		monitor.provide_secret(281474976710652, secret.clone()).unwrap();
 		assert_eq!(monitor.inner.lock().unwrap().payment_preimages.len(), 5);

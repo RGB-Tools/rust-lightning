@@ -38,19 +38,19 @@ use lightning::chain::channelmonitor::{ChannelMonitor, MonitorEvent};
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
 use lightning::chain::keysinterface::{KeyMaterial, InMemorySigner, Recipient, EntropySource, NodeSigner, SignerProvider};
+use lightning::events;
+use lightning::events::MessageSendEventsProvider;
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentSendFailure, ChannelManagerReadArgs, PaymentId};
+use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentSendFailure, ChannelManagerReadArgs, PaymentId, RecipientOnionFields};
 use lightning::ln::channel::FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE;
 use lightning::ln::msgs::{self, CommitmentUpdate, ChannelMessageHandler, DecodeError, UpdateAddHTLC, Init};
 use lightning::ln::script::ShutdownScript;
 use lightning::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
 use lightning::util::errors::APIError;
-use lightning::util::events;
 use lightning::util::logger::Logger;
 use lightning::util::config::UserConfig;
-use lightning::util::events::MessageSendEventsProvider;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
-use lightning::routing::router::{InFlightHtlcs, Route, RouteHop, RouteParameters, Router};
+use lightning::routing::router::{InFlightHtlcs, Path, Route, RouteHop, RouteParameters, Router};
 
 use crate::utils::test_logger::{self, Output};
 use crate::utils::test_persister::TestPersister;
@@ -240,6 +240,7 @@ impl SignerProvider for KeyProvider {
 			[id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_secret[31]],
 			channel_value_satoshis,
 			channel_keys_id,
+			channel_keys_id,
 		);
 		let revoked_commitment = self.make_enforcement_state_cell(keys.commitment_seed);
 		EnforcingSigner::new_with_revoked(keys, revoked_commitment, false)
@@ -248,7 +249,7 @@ impl SignerProvider for KeyProvider {
 	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, DecodeError> {
 		let mut reader = std::io::Cursor::new(buffer);
 
-		let inner: InMemorySigner = Readable::read(&mut reader)?;
+		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self)?;
 		let state = self.make_enforcement_state_cell(inner.commitment_seed);
 
 		Ok(EnforcingSigner {
@@ -351,17 +352,17 @@ fn send_payment(source: &ChanMan, dest: &ChanMan, dest_chan_id: u64, amt: u64, p
 	let mut payment_id = [0; 32];
 	payment_id[0..8].copy_from_slice(&payment_idx.to_ne_bytes());
 	*payment_idx += 1;
-	if let Err(err) = source.send_payment(&Route {
-		paths: vec![vec![RouteHop {
+	if let Err(err) = source.send_payment_with_route(&Route {
+		paths: vec![Path { hops: vec![RouteHop {
 			pubkey: dest.get_our_node_id(),
 			node_features: dest.node_features(),
 			short_channel_id: dest_chan_id,
 			channel_features: dest.channel_features(),
 			fee_msat: amt,
 			cltv_expiry_delta: 200,
-		}]],
+		}], blinded_tail: None }],
 		payment_params: None,
-	}, payment_hash, &Some(payment_secret), PaymentId(payment_id)) {
+	}, payment_hash, RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_id)) {
 		check_payment_err(err);
 		false
 	} else { true }
@@ -373,8 +374,8 @@ fn send_hop_payment(source: &ChanMan, middle: &ChanMan, middle_chan_id: u64, des
 	let mut payment_id = [0; 32];
 	payment_id[0..8].copy_from_slice(&payment_idx.to_ne_bytes());
 	*payment_idx += 1;
-	if let Err(err) = source.send_payment(&Route {
-		paths: vec![vec![RouteHop {
+	if let Err(err) = source.send_payment_with_route(&Route {
+		paths: vec![Path { hops: vec![RouteHop {
 			pubkey: middle.get_our_node_id(),
 			node_features: middle.node_features(),
 			short_channel_id: middle_chan_id,
@@ -388,9 +389,9 @@ fn send_hop_payment(source: &ChanMan, middle: &ChanMan, middle_chan_id: u64, des
 			channel_features: dest.channel_features(),
 			fee_msat: amt,
 			cltv_expiry_delta: 200,
-		}]],
+		}], blinded_tail: None }],
 		payment_params: None,
-	}, payment_hash, &Some(payment_secret), PaymentId(payment_id)) {
+	}, payment_hash, RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_id)) {
 		check_payment_err(err);
 		false
 	} else { true }
@@ -526,7 +527,18 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out) {
 					msg.clone()
 				} else { panic!("Wrong event type"); }
 			};
+			let events = $dest.get_and_clear_pending_events();
+			assert_eq!(events.len(), 1);
+			if let events::Event::ChannelPending{ ref counterparty_node_id, .. } = events[0] {
+				assert_eq!(counterparty_node_id, &$source.get_our_node_id());
+			} else { panic!("Wrong event type"); }
+
 			$source.handle_funding_signed(&$dest.get_our_node_id(), &funding_signed);
+			let events = $source.get_and_clear_pending_events();
+			assert_eq!(events.len(), 1);
+			if let events::Event::ChannelPending{ ref counterparty_node_id, .. } = events[0] {
+				assert_eq!(counterparty_node_id, &$dest.get_our_node_id());
+			} else { panic!("Wrong event type"); }
 
 			funding_output
 		} }

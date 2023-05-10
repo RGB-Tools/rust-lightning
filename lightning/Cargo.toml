@@ -1,6 +1,6 @@
 [package]
 name = "lightning"
-version = "0.0.114"
+version = "0.0.115"
 authors = ["Matt Corallo"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lightningdevkit/rust-lightning/"
@@ -29,6 +29,8 @@ max_level_trace = []
 # This is unsafe to use in production because it may result in the counterparty publishing taking our funds.
 unsafe_revoked_tx_signing = []
 _bench_unstable = []
+# Override signing to not include randomness when generating signatures for test vectors.
+_test_vectors = []
 
 no-std = ["hashbrown", "bitcoin/no-std", "core2/alloc"]
 std = ["bitcoin/std"]
@@ -76,3 +78,6 @@ regex = "1.5.6"
 version = "0.29.0"
 default-features = false
 features = ["bitcoinconsensus", "secp-recovery"]
+
+[target.'cfg(taproot)'.dependencies]
+musig2 = { git = "https://github.com/arik-so/rust-musig2", rev = "27797d7" }

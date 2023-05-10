@@ -12,6 +12,8 @@ use std::sync::RwLockReadGuard as StdRwLockReadGuard;
 use std::sync::RwLockWriteGuard as StdRwLockWriteGuard;
 use std::sync::Condvar as StdCondvar;
 
+pub use std::sync::WaitTimeoutResult;
+
 use crate::prelude::HashMap;
 
 use super::{LockTestExt, LockHeldState};
@@ -35,15 +37,19 @@ impl Condvar {
 		Condvar { inner: StdCondvar::new() }
 	}
 
-	pub fn wait<'a, T>(&'a self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+	pub fn wait_while<'a, T, F: FnMut(&mut T) -> bool>(&'a self, guard: MutexGuard<'a, T>, condition: F)
+	-> LockResult<MutexGuard<'a, T>> {
 		let mutex: &'a Mutex<T> = guard.mutex;
-		self.inner.wait(guard.into_inner()).map(|lock| MutexGuard { mutex, lock }).map_err(|_| ())
+		self.inner.wait_while(guard.into_inner(), condition).map(|lock| MutexGuard { mutex, lock })
+			.map_err(|_| ())
 	}
 
 	#[allow(unused)]
-	pub fn wait_timeout<'a, T>(&'a self, guard: MutexGuard<'a, T>, dur: Duration) -> LockResult<(MutexGuard<'a, T>, ())> {
+	pub fn wait_timeout_while<'a, T, F: FnMut(&mut T) -> bool>(&'a self, guard: MutexGuard<'a, T>, dur: Duration, condition: F)
+	-> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
 		let mutex = guard.mutex;
-		self.inner.wait_timeout(guard.into_inner(), dur).map(|(lock, _)| (MutexGuard { mutex, lock }, ())).map_err(|_| ())
+		self.inner.wait_timeout_while(guard.into_inner(), dur, condition).map_err(|_| ())
+			.map(|(lock, e)| (MutexGuard { mutex, lock }, e))
 	}
 
 	pub fn notify_all(&self) { self.inner.notify_all(); }
@@ -74,24 +80,31 @@ struct LockDep {
 	_lockdep_trace: Backtrace,
 }
 
+// Locates the frame preceding the earliest `debug_sync` frame in the call stack. This ensures we
+// can properly detect a lock's construction and acquiral callsites, since the latter may contain
+// multiple `debug_sync` frames.
 #[cfg(feature = "backtrace")]
-fn get_construction_location(backtrace: &Backtrace) -> (String, Option<u32>) {
-	// Find the first frame that is after `debug_sync` (or that is in our tests) and use
-	// that as the mutex construction site. Note that the first few frames may be in
-	// the `backtrace` crate, so we have to ignore those.
+fn locate_call_symbol(backtrace: &Backtrace) -> (String, Option<u32>) {
+	// Find the earliest `debug_sync` frame (or that is in our tests) and use the frame preceding it
+	// as the callsite. Note that the first few frames may be in the `backtrace` crate, so we have
+	// to ignore those.
 	let sync_mutex_constr_regex = regex::Regex::new(r"lightning.*debug_sync").unwrap();
 	let mut found_debug_sync = false;
-	for frame in backtrace.frames() {
-		for symbol in frame.symbols() {
-			let symbol_name = symbol.name().unwrap().as_str().unwrap();
-			if !sync_mutex_constr_regex.is_match(symbol_name) {
-				if found_debug_sync {
-					return (format!("{}:{}", symbol.filename().unwrap().display(), symbol.lineno().unwrap()), symbol.colno());
-				}
-			} else { found_debug_sync = true; }
+	let mut symbol_after_latest_debug_sync = None;
+	for frame in backtrace.frames().iter() {
+		for symbol in frame.symbols().iter() {
+			if let Some(symbol_name) = symbol.name().map(|name| name.as_str()).flatten() {
+				if !sync_mutex_constr_regex.is_match(symbol_name) {
+					if found_debug_sync {
+						symbol_after_latest_debug_sync = Some(symbol);
+						found_debug_sync = false;
+					}
+				} else { found_debug_sync = true; }
+			}
 		}
 	}
-	panic!("Couldn't find mutex construction callsite");
+	let symbol = symbol_after_latest_debug_sync.expect("Couldn't find lock call symbol");
+	(format!("{}:{}", symbol.filename().unwrap().display(), symbol.lineno().unwrap()), symbol.colno())
 }
 
 impl LockMetadata {
@@ -108,13 +121,13 @@ impl LockMetadata {
 		#[cfg(feature = "backtrace")]
 		{
 			let (lock_constr_location, lock_constr_colno) =
-				get_construction_location(&res._lock_construction_bt);
+				locate_call_symbol(&res._lock_construction_bt);
 			LOCKS_INIT.call_once(|| { unsafe { LOCKS = Some(StdMutex::new(HashMap::new())); } });
 			let mut locks = unsafe { LOCKS.as_ref() }.unwrap().lock().unwrap();
 			match locks.entry(lock_constr_location) {
 				hash_map::Entry::Occupied(e) => {
 					assert_eq!(lock_constr_colno,
-						get_construction_location(&e.get()._lock_construction_bt).1,
+						locate_call_symbol(&e.get()._lock_construction_bt).1,
 						"Because Windows doesn't support column number results in backtraces, we cannot construct two mutexes on the same line or we risk lockorder detection false positives.");
 					return Arc::clone(e.get())
 				},
@@ -126,9 +139,8 @@ impl LockMetadata {
 
 	fn pre_lock(this: &Arc<LockMetadata>, _double_lock_self_allowed: bool) {
 		LOCKS_HELD.with(|held| {
-			// For each lock which is currently locked, check that no lock's locked-before
-			// set includes the lock we're about to lock, which would imply a lockorder
-			// inversion.
+			// For each lock that is currently held, check that no lock's `locked_before` set
+			// includes the lock we're about to hold, which would imply a lockorder inversion.
 			for (locked_idx, _locked) in held.borrow().iter() {
 				if *locked_idx == this.lock_idx {
 					// Note that with `feature = "backtrace"` set, we may be looking at different
@@ -138,23 +150,34 @@ impl LockMetadata {
 					#[cfg(feature = "backtrace")]
 					debug_assert!(_double_lock_self_allowed,
 						"Tried to acquire a lock while it was held!\nLock constructed at {}",
-						get_construction_location(&this._lock_construction_bt).0);
+						locate_call_symbol(&this._lock_construction_bt).0);
 					#[cfg(not(feature = "backtrace"))]
 					panic!("Tried to acquire a lock while it was held!");
 				}
 			}
 			for (_locked_idx, locked) in held.borrow().iter() {
 				for (locked_dep_idx, _locked_dep) in locked.locked_before.lock().unwrap().iter() {
-					if *locked_dep_idx == this.lock_idx && *locked_dep_idx != locked.lock_idx {
-						#[cfg(feature = "backtrace")]
-						panic!("Tried to violate existing lockorder.\nMutex that should be locked after the current lock was created at the following backtrace.\nNote that to get a backtrace for the lockorder violation, you should set RUST_BACKTRACE=1\nLock being taken constructed at: {} ({}):\n{:?}\nLock constructed at: {} ({})\n{:?}\n\nLock dep created at:\n{:?}\n\n",
-							get_construction_location(&this._lock_construction_bt).0,
-							this.lock_idx, this._lock_construction_bt,
-							get_construction_location(&locked._lock_construction_bt).0,
-							locked.lock_idx, locked._lock_construction_bt,
-							_locked_dep._lockdep_trace);
-						#[cfg(not(feature = "backtrace"))]
-						panic!("Tried to violate existing lockorder. Build with the backtrace feature for more info.");
+					let is_dep_this_lock = *locked_dep_idx == this.lock_idx;
+					let has_same_construction = *locked_dep_idx == locked.lock_idx;
+					if is_dep_this_lock && !has_same_construction {
+						#[allow(unused_mut, unused_assignments)]
+						let mut has_same_callsite = false;
+						#[cfg(feature = "backtrace")] {
+							has_same_callsite = _double_lock_self_allowed &&
+								locate_call_symbol(&_locked_dep._lockdep_trace) ==
+									locate_call_symbol(&Backtrace::new());
+						}
+						if !has_same_callsite {
+							#[cfg(feature = "backtrace")]
+							panic!("Tried to violate existing lockorder.\nMutex that should be locked after the current lock was created at the following backtrace.\nNote that to get a backtrace for the lockorder violation, you should set RUST_BACKTRACE=1\nLock being taken constructed at: {} ({}):\n{:?}\nLock constructed at: {} ({})\n{:?}\n\nLock dep created at:\n{:?}\n\n",
+								locate_call_symbol(&this._lock_construction_bt).0,
+								this.lock_idx, this._lock_construction_bt,
+								locate_call_symbol(&locked._lock_construction_bt).0,
+								locked.lock_idx, locked._lock_construction_bt,
+								_locked_dep._lockdep_trace);
+							#[cfg(not(feature = "backtrace"))]
+							panic!("Tried to violate existing lockorder. Build with the backtrace feature for more info.");
+						}
 					}
 				}
 				// Insert any already-held locks in our locked-before set.

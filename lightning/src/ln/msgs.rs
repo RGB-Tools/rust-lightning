@@ -44,16 +44,21 @@ use core::fmt::Debug;
 use crate::io::{self, Read};
 use crate::io_extras::read_to_end;
 
-use crate::util::events::{MessageSendEventsProvider, OnionMessageProvider};
+use crate::events::{MessageSendEventsProvider, OnionMessageProvider};
 use crate::util::logger;
-use crate::util::ser::{LengthReadable, Readable, ReadableArgs, Writeable, Writer, FixedLengthReader, HighZeroBytesDroppedBigSize, Hostname};
+use crate::util::ser::{LengthReadable, Readable, ReadableArgs, Writeable, Writer, WithoutLength, FixedLengthReader, HighZeroBytesDroppedBigSize, Hostname};
 
 use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
 
-use crate::routing::gossip::NodeId;
+use crate::routing::gossip::{NodeAlias, NodeId};
 
 /// 21 million * 10^8 * 1000
 pub(crate) const MAX_VALUE_MSAT: u64 = 21_000_000_0000_0000_000;
+
+#[cfg(taproot)]
+/// A partial signature that also contains the Musig2 nonce its signer used
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialSignatureWithNonce(pub musig2::types::PartialSignature, pub musig2::types::PublicNonce);
 
 /// An error in decoding a message or struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +255,9 @@ pub struct AcceptChannel {
 	/// our feature bits with our counterparty's feature bits from the [`Init`] message.
 	/// This is required to match the equivalent field in [`OpenChannel::channel_type`].
 	pub channel_type: Option<ChannelTypeFeatures>,
+	#[cfg(taproot)]
+	/// Next nonce the channel initiator should use to create a funding output signature against
+	pub next_local_nonce: Option<musig2::types::PublicNonce>,
 }
 
 /// A [`funding_created`] message to be sent to or received from a peer.
@@ -265,6 +273,12 @@ pub struct FundingCreated {
 	pub funding_output_index: u16,
 	/// The signature of the channel initiator (funder) on the initial commitment transaction
 	pub signature: Signature,
+	#[cfg(taproot)]
+	/// The partial signature of the channel initiator (funder)
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
+	#[cfg(taproot)]
+	/// Next nonce the channel acceptor should use to finalize the funding output signature
+	pub next_local_nonce: Option<musig2::types::PublicNonce>
 }
 
 /// A [`funding_signed`] message to be sent to or received from a peer.
@@ -276,6 +290,9 @@ pub struct FundingSigned {
 	pub channel_id: [u8; 32],
 	/// The signature of the channel acceptor (fundee) on the initial commitment transaction
 	pub signature: Signature,
+	#[cfg(taproot)]
+	/// The partial signature of the channel acceptor (fundee)
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`channel_ready`] message to be sent to or received from a peer.
@@ -417,6 +434,9 @@ pub struct CommitmentSigned {
 	pub signature: Signature,
 	/// Signatures on the HTLC transactions
 	pub htlc_signatures: Vec<Signature>,
+	#[cfg(taproot)]
+	/// The partial Taproot signature on the commitment transaction
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -430,6 +450,9 @@ pub struct RevokeAndACK {
 	pub per_commitment_secret: [u8; 32],
 	/// The next sender-broadcast commitment transaction's per-commitment point
 	pub next_per_commitment_point: PublicKey,
+	#[cfg(taproot)]
+	/// Musig nonce the recipient should use in their next commitment signature message
+	pub next_local_nonce: Option<musig2::types::PublicNonce>
 }
 
 /// An [`update_fee`] message to be sent to or received from a peer
@@ -679,7 +702,7 @@ pub struct UnsignedNodeAnnouncement {
 	/// An alias, for UI purposes.
 	///
 	/// This should be sanitized before use. There is no guarantee of uniqueness.
-	pub alias: [u8; 32],
+	pub alias: NodeAlias,
 	/// List of addresses on which this node is reachable
 	pub addresses: Vec<NetAddress>,
 	pub(crate) excess_address_data: Vec<u8>,
@@ -949,7 +972,7 @@ pub struct CommitmentUpdate {
 /// [`OptionalField`] simply gets `Present` if there are enough bytes to read into it), we have a
 /// separate enum type for them.
 ///
-/// (C-not exported) due to a free generic in `T`
+/// This is not exported to bindings users due to a free generic in `T`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OptionalField<T> {
 	/// Optional field is included in message
@@ -1155,6 +1178,7 @@ mod fuzzy_internal_msgs {
 		},
 		FinalNode {
 			payment_data: Option<FinalOnionHopData>,
+			payment_metadata: Option<Vec<u8>>,
 			keysend_preimage: Option<PaymentPreimage>,
 		},
 	}
@@ -1298,7 +1322,7 @@ impl Readable for OptionalField<u64> {
 	}
 }
 
-
+#[cfg(not(taproot))]
 impl_writeable_msg!(AcceptChannel, {
 	temporary_channel_id,
 	dust_limit_satoshis,
@@ -1317,6 +1341,28 @@ impl_writeable_msg!(AcceptChannel, {
 	shutdown_scriptpubkey
 }, {
 	(1, channel_type, option),
+});
+
+#[cfg(taproot)]
+impl_writeable_msg!(AcceptChannel, {
+	temporary_channel_id,
+	dust_limit_satoshis,
+	max_htlc_value_in_flight_msat,
+	channel_reserve_satoshis,
+	htlc_minimum_msat,
+	minimum_depth,
+	to_self_delay,
+	max_accepted_htlcs,
+	funding_pubkey,
+	revocation_basepoint,
+	payment_point,
+	delayed_payment_basepoint,
+	htlc_basepoint,
+	first_per_commitment_point,
+	shutdown_scriptpubkey
+}, {
+	(1, channel_type, option),
+	(4, next_local_nonce, option),
 });
 
 impl_writeable_msg!(AnnouncementSignatures, {
@@ -1373,11 +1419,21 @@ impl_writeable!(ClosingSignedFeeRange, {
 	max_fee_satoshis
 });
 
+#[cfg(not(taproot))]
 impl_writeable_msg!(CommitmentSigned, {
 	channel_id,
 	signature,
 	htlc_signatures
 }, {});
+
+#[cfg(taproot)]
+impl_writeable_msg!(CommitmentSigned, {
+	channel_id,
+	signature,
+	htlc_signatures
+}, {
+	(2, partial_signature_with_nonce, option)
+});
 
 impl_writeable!(DecodedOnionErrorPacket, {
 	hmac,
@@ -1385,17 +1441,37 @@ impl_writeable!(DecodedOnionErrorPacket, {
 	pad
 });
 
+#[cfg(not(taproot))]
 impl_writeable_msg!(FundingCreated, {
 	temporary_channel_id,
 	funding_txid,
 	funding_output_index,
 	signature
 }, {});
+#[cfg(taproot)]
+impl_writeable_msg!(FundingCreated, {
+	temporary_channel_id,
+	funding_txid,
+	funding_output_index,
+	signature
+}, {
+	(2, partial_signature_with_nonce, option),
+	(4, next_local_nonce, option)
+});
 
+#[cfg(not(taproot))]
 impl_writeable_msg!(FundingSigned, {
 	channel_id,
 	signature
 }, {});
+
+#[cfg(taproot)]
+impl_writeable_msg!(FundingSigned, {
+	channel_id,
+	signature
+}, {
+	(2, partial_signature_with_nonce, option)
+});
 
 impl_writeable_msg!(ChannelReady, {
 	channel_id,
@@ -1481,11 +1557,21 @@ impl Writeable for ConsignmentEndpoint {
 	}
 }
 
+#[cfg(not(taproot))]
 impl_writeable_msg!(RevokeAndACK, {
 	channel_id,
 	per_commitment_secret,
 	next_per_commitment_point
 }, {});
+
+#[cfg(taproot)]
+impl_writeable_msg!(RevokeAndACK, {
+	channel_id,
+	per_commitment_secret,
+	next_per_commitment_point
+}, {
+	(4, next_local_nonce, option)
+});
 
 impl_writeable_msg!(Shutdown, {
 	channel_id,
@@ -1612,11 +1698,12 @@ impl Writeable for OnionHopData {
 					(6, short_channel_id, required)
 				});
 			},
-			OnionHopDataFormat::FinalNode { ref payment_data, ref keysend_preimage } => {
+			OnionHopDataFormat::FinalNode { ref payment_data, ref payment_metadata, ref keysend_preimage } => {
 				_encode_varint_length_prefixed_tlv!(w, {
 					(2, HighZeroBytesDroppedBigSize(self.amt_to_forward), required),
 					(4, HighZeroBytesDroppedBigSize(self.outgoing_cltv_value), required),
 					(8, payment_data, option),
+					(16, payment_metadata.as_ref().map(|m| WithoutLength(m)), option),
 					(5482373484, keysend_preimage, option)
 				});
 			},
@@ -1631,29 +1718,33 @@ impl Readable for OnionHopData {
 		let mut cltv_value = HighZeroBytesDroppedBigSize(0u32);
 		let mut short_id: Option<u64> = None;
 		let mut payment_data: Option<FinalOnionHopData> = None;
+		let mut payment_metadata: Option<WithoutLength<Vec<u8>>> = None;
 		let mut keysend_preimage: Option<PaymentPreimage> = None;
 		read_tlv_fields!(r, {
 			(2, amt, required),
 			(4, cltv_value, required),
 			(6, short_id, option),
 			(8, payment_data, option),
+			(16, payment_metadata, option),
 			// See https://github.com/lightning/blips/blob/master/blip-0003.md
 			(5482373484, keysend_preimage, option)
 		});
 
 		let format = if let Some(short_channel_id) = short_id {
 			if payment_data.is_some() { return Err(DecodeError::InvalidValue); }
+			if payment_metadata.is_some() { return Err(DecodeError::InvalidValue); }
 			OnionHopDataFormat::NonFinalNode {
 				short_channel_id,
 			}
 		} else {
-			if let &Some(ref data) = &payment_data {
+			if let Some(data) = &payment_data {
 				if data.total_msat > MAX_VALUE_MSAT {
 					return Err(DecodeError::InvalidValue);
 				}
 			}
 			OnionHopDataFormat::FinalNode {
 				payment_data,
+				payment_metadata: payment_metadata.map(|w| w.0),
 				keysend_preimage,
 			}
 		};
@@ -1900,7 +1991,7 @@ impl Readable for UnsignedNodeAnnouncement {
 		let node_id: NodeId = Readable::read(r)?;
 		let mut rgb = [0; 3];
 		r.read_exact(&mut rgb)?;
-		let alias: [u8; 32] = Readable::read(r)?;
+		let alias: NodeAlias = Readable::read(r)?;
 
 		let addr_len: u16 = Readable::read(r)?;
 		let mut addresses: Vec<NetAddress> = Vec::new();
@@ -2108,7 +2199,7 @@ mod tests {
 	use crate::ln::features::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, NodeFeatures};
 	use crate::ln::msgs;
 	use crate::ln::msgs::{FinalOnionHopData, OptionalField, OnionErrorPacket, OnionHopDataFormat};
-	use crate::routing::gossip::NodeId;
+	use crate::routing::gossip::{NodeAlias, NodeId};
 	use crate::util::ser::{Writeable, Readable, Hostname};
 
 	use bitcoin::hashes::hex::FromHex;
@@ -2303,7 +2394,7 @@ mod tests {
 			timestamp: 20190119,
 			node_id: NodeId::from_pubkey(&pubkey_1),
 			rgb: [32; 3],
-			alias: [16;32],
+			alias: NodeAlias([16;32]),
 			addresses,
 			excess_address_data: if excess_address_data { vec![33, 108, 40, 11, 83, 149, 162, 84, 110, 126, 75, 38, 99, 224, 79, 129, 22, 34, 241, 90, 79, 146, 232, 58, 162, 233, 43, 162, 165, 115, 193, 57, 20, 44, 84, 174, 99, 7, 42, 30, 193, 238, 125, 192, 192, 75, 222, 92, 132, 120, 6, 23, 42, 160, 92, 146, 194, 42, 232, 227, 8, 209, 210, 105] } else { Vec::new() },
 			excess_data: if excess_data { vec![59, 18, 204, 25, 92, 224, 162, 209, 189, 166, 168, 139, 239, 161, 159, 160, 127, 81, 202, 167, 92, 232, 56, 55, 242, 137, 101, 96, 11, 138, 172, 171, 8, 85, 255, 176, 231, 65, 236, 95, 124, 65, 66, 30, 152, 41, 169, 212, 134, 17, 200, 200, 49, 247, 27, 229, 234, 115, 230, 101, 148, 151, 127, 253] } else { Vec::new() },
@@ -2499,6 +2590,8 @@ mod tests {
 			first_per_commitment_point: pubkey_6,
 			shutdown_scriptpubkey: if shutdown { OptionalField::Present(Address::p2pkh(&::bitcoin::PublicKey{compressed: true, inner: pubkey_1}, Network::Testnet).script_pubkey()) } else { OptionalField::Absent },
 			channel_type: None,
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		};
 		let encoded_value = accept_channel.encode();
 		let mut target_value = hex::decode("020202020202020202020202020202020202020202020202020202020202020212345678901234562334032891223698321446687011447600083a840000034d000c89d4c0bcc0bc031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076602531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f703f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a").unwrap();
@@ -2524,6 +2617,10 @@ mod tests {
 			funding_txid: Txid::from_hex("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e").unwrap(),
 			funding_output_index: 255,
 			signature: sig_1,
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		};
 		let encoded_value = funding_created.encode();
 		let target_value = hex::decode("02020202020202020202020202020202020202020202020202020202020202026e96fe9f8b0ddcd729ba03cfafa5a27b050b39d354dd980814268dfa9a44d4c200ffd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -2538,6 +2635,8 @@ mod tests {
 		let funding_signed = msgs::FundingSigned {
 			channel_id: [2; 32],
 			signature: sig_1,
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
 		};
 		let encoded_value = funding_signed.encode();
 		let target_value = hex::decode("0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -2701,6 +2800,8 @@ mod tests {
 			channel_id: [2; 32],
 			signature: sig_1,
 			htlc_signatures: if htlcs { vec![sig_2, sig_3, sig_4] } else { Vec::new() },
+			#[cfg(taproot)]
+			partial_signature_with_nonce: None,
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = hex::decode("0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -2726,6 +2827,8 @@ mod tests {
 			channel_id: [2; 32],
 			per_commitment_secret: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 			next_per_commitment_point: pubkey_1,
+			#[cfg(taproot)]
+			next_local_nonce: None,
 		};
 		let encoded_value = raa.encode();
 		let target_value = hex::decode("02020202020202020202020202020202020202020202020202020202020202020101010101010101010101010101010101010101010101010101010101010101031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
@@ -2838,6 +2941,7 @@ mod tests {
 		let mut msg = msgs::OnionHopData {
 			format: OnionHopDataFormat::FinalNode {
 				payment_data: None,
+				payment_metadata: None,
 				keysend_preimage: None,
 			},
 			amt_to_forward: 0x0badf00d01020304,
@@ -2861,6 +2965,7 @@ mod tests {
 					payment_secret: expected_payment_secret,
 					total_msat: 0x1badca1f
 				}),
+				payment_metadata: None,
 				keysend_preimage: None,
 			},
 			amt_to_forward: 0x0badf00d01020304,
@@ -2875,6 +2980,7 @@ mod tests {
 				payment_secret,
 				total_msat: 0x1badca1f
 			}),
+			payment_metadata: None,
 			keysend_preimage: None,
 		} = msg.format {
 			assert_eq!(payment_secret, expected_payment_secret);

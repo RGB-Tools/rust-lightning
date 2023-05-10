@@ -8,7 +8,7 @@
 // licenses.
 
 //! Various utilities for building scripts and deriving keys related to channels. These are
-//! largely of interest for those implementing chain::keysinterface::Sign message signing by hand.
+//! largely of interest for those implementing the traits on [`chain::keysinterface`] by hand.
 
 use bitcoin::blockdata::script::{Script,Builder};
 use bitcoin::blockdata::opcodes;
@@ -21,6 +21,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::ripemd160::Hash as Ripemd160;
 use bitcoin::hash_types::{Txid, PubkeyHash};
 
+use crate::chain::keysinterface::EntropySource;
 use crate::ln::{PaymentHash, PaymentPreimage};
 use crate::ln::msgs::DecodeError;
 use crate::rgb_utils::color_htlc;
@@ -41,7 +42,7 @@ use crate::util::transaction_utils::sort_outputs;
 use crate::ln::channel::{INITIAL_COMMITMENT_NUMBER, ANCHOR_OUTPUT_VALUE_SATOSHI};
 use core::ops::Deref;
 use crate::chain;
-use crate::util::crypto::sign;
+use crate::util::crypto::{sign, sign_with_aux_rand};
 
 /// Maximum number of one-way in-flight HTLC (protocol-level value).
 pub const MAX_HTLCS: u16 = 483;
@@ -816,7 +817,7 @@ pub fn build_anchor_input_witness(funding_key: &PublicKey, funding_sig: &Signatu
 ///
 /// Normally, this is converted to the broadcaster/countersignatory-organized DirectedChannelTransactionParameters
 /// before use, via the as_holder_broadcastable and as_counterparty_broadcastable functions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelTransactionParameters {
 	/// Holder public keys
 	pub holder_pubkeys: ChannelPublicKeys,
@@ -840,7 +841,7 @@ pub struct ChannelTransactionParameters {
 }
 
 /// Late-bound per-channel counterparty data used to build transactions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CounterpartyChannelTransactionParameters {
 	/// Counter-party public keys
 	pub pubkeys: ChannelPublicKeys,
@@ -989,7 +990,7 @@ impl_writeable_tlv_based!(HolderCommitmentTransaction, {
 
 impl HolderCommitmentTransaction {
 	#[cfg(test)]
-	pub fn dummy() -> Self {
+	pub fn dummy(htlcs: &mut Vec<(HTLCOutputInCommitment, ())>) -> Self {
 		let secp_ctx = Secp256k1::new();
 		let dummy_key = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let dummy_sig = sign(&secp_ctx, &secp256k1::Message::from_slice(&[42; 32]).unwrap(), &SecretKey::from_slice(&[42; 32]).unwrap());
@@ -1017,12 +1018,16 @@ impl HolderCommitmentTransaction {
 			opt_anchors: None,
 			opt_non_zero_fee_anchors: None,
 		};
-		let mut htlcs_with_aux: Vec<(_, ())> = Vec::new();
-		let inner = CommitmentTransaction::new_with_auxiliary_htlc_data(0, 0, 0, false, dummy_key.clone(), dummy_key.clone(), keys, 0, &mut htlcs_with_aux, &channel_parameters.as_counterparty_broadcastable());
+		let mut counterparty_htlc_sigs = Vec::new();
+		for _ in 0..htlcs.len() {
+			counterparty_htlc_sigs.push(dummy_sig);
+		}
+		let inner = CommitmentTransaction::new_with_auxiliary_htlc_data(0, 0, 0, false, dummy_key.clone(), dummy_key.clone(), keys, 0, htlcs, &channel_parameters.as_counterparty_broadcastable());
+		htlcs.sort_by_key(|htlc| htlc.0.transaction_output_index);
 		HolderCommitmentTransaction {
 			inner,
 			counterparty_sig: dummy_sig,
-			counterparty_htlc_sigs: Vec::new(),
+			counterparty_htlc_sigs,
 			holder_sig_first: false
 		}
 	}
@@ -1082,11 +1087,19 @@ impl BuiltCommitmentTransaction {
 		hash_to_message!(sighash)
 	}
 
-	/// Sign a transaction, either because we are counter-signing the counterparty's transaction or
-	/// because we are about to broadcast a holder transaction.
-	pub fn sign<T: secp256k1::Signing>(&self, funding_key: &SecretKey, funding_redeemscript: &Script, channel_value_satoshis: u64, secp_ctx: &Secp256k1<T>) -> Signature {
+	/// Signs the counterparty's commitment transaction.
+	pub fn sign_counterparty_commitment<T: secp256k1::Signing>(&self, funding_key: &SecretKey, funding_redeemscript: &Script, channel_value_satoshis: u64, secp_ctx: &Secp256k1<T>) -> Signature {
 		let sighash = self.get_sighash_all(funding_redeemscript, channel_value_satoshis);
 		sign(secp_ctx, &sighash, funding_key)
+	}
+
+	/// Signs the holder commitment transaction because we are about to broadcast it.
+	pub fn sign_holder_commitment<T: secp256k1::Signing, ES: Deref>(
+		&self, funding_key: &SecretKey, funding_redeemscript: &Script, channel_value_satoshis: u64,
+		entropy_source: &ES, secp_ctx: &Secp256k1<T>
+	) -> Signature where ES::Target: EntropySource {
+		let sighash = self.get_sighash_all(funding_redeemscript, channel_value_satoshis);
+		sign_with_aux_rand(secp_ctx, &sighash, funding_key, entropy_source)
 	}
 }
 
@@ -1277,7 +1290,7 @@ impl CommitmentTransaction {
 	///
 	/// Only include HTLCs that are above the dust limit for the channel.
 	///
-	/// (C-not exported) due to the generic though we likely should expose a version without
+	/// This is not exported to bindings users due to the generic though we likely should expose a version without
 	pub fn new_with_auxiliary_htlc_data<T>(commitment_number: u64, to_broadcaster_value_sat: u64, to_countersignatory_value_sat: u64, opt_anchors: bool, broadcaster_funding_key: PublicKey, countersignatory_funding_key: PublicKey, keys: TxCreationKeys, feerate_per_kw: u32, htlcs_with_aux: &mut Vec<(HTLCOutputInCommitment, T)>, channel_parameters: &DirectedChannelTransactionParameters) -> CommitmentTransaction {
 		// Sort outputs and populate output indices while keeping track of the auxiliary data
 		let (outputs, htlcs) = Self::internal_build_outputs(&keys, to_broadcaster_value_sat, to_countersignatory_value_sat, htlcs_with_aux, channel_parameters, opt_anchors, &broadcaster_funding_key, &countersignatory_funding_key).unwrap();
@@ -1303,7 +1316,7 @@ impl CommitmentTransaction {
 
 	/// Use non-zero fee anchors
 	///
-	/// (C-not exported) due to move, and also not likely to be useful for binding users
+	/// This is not exported to bindings users due to move, and also not likely to be useful for binding users
 	pub fn with_non_zero_fee_anchors(mut self) -> Self {
 		self.opt_non_zero_fee_anchors = Some(());
 		self
@@ -1484,7 +1497,7 @@ impl CommitmentTransaction {
 	/// which were included in this commitment transaction in output order.
 	/// The transaction index is always populated.
 	///
-	/// (C-not exported) as we cannot currently convert Vec references to/from C, though we should
+	/// This is not exported to bindings users as we cannot currently convert Vec references to/from C, though we should
 	/// expose a less effecient version which creates a Vec of references in the future.
 	pub fn htlcs(&self) -> &Vec<HTLCOutputInCommitment> {
 		&self.htlcs
@@ -1564,7 +1577,10 @@ impl<'a> TrustedCommitmentTransaction<'a> {
 	/// The returned Vec has one entry for each HTLC, and in the same order.
 	///
 	/// This function is only valid in the holder commitment context, it always uses EcdsaSighashType::All.
-	pub fn get_htlc_sigs<T: secp256k1::Signing>(&self, htlc_base_key: &SecretKey, channel_parameters: &DirectedChannelTransactionParameters, secp_ctx: &Secp256k1<T>, ldk_data_dir: &PathBuf) -> Result<Vec<Signature>, ()> {
+	pub fn get_htlc_sigs<T: secp256k1::Signing, ES: Deref>(
+		&self, htlc_base_key: &SecretKey, channel_parameters: &DirectedChannelTransactionParameters,
+		entropy_source: &ES, secp_ctx: &Secp256k1<T>, ldk_data_dir: &PathBuf,
+	) -> Result<Vec<Signature>, ()> where ES::Target: EntropySource {
 		let inner = self.inner;
 		let keys = &inner.keys;
 		let txid = inner.built.txid;
@@ -1582,7 +1598,7 @@ impl<'a> TrustedCommitmentTransaction<'a> {
 			let htlc_redeemscript = get_htlc_redeemscript_with_explicit_keys(&this_htlc, self.opt_anchors(), &keys.broadcaster_htlc_key, &keys.countersignatory_htlc_key, &keys.revocation_key);
 
 			let sighash = hash_to_message!(&sighash::SighashCache::new(&htlc_tx).segwit_signature_hash(0, &htlc_redeemscript, this_htlc.amount_msat / 1000, EcdsaSighashType::All).unwrap()[..]);
-			ret.push(sign(secp_ctx, &sighash, &holder_htlc_key));
+			ret.push(sign_with_aux_rand(secp_ctx, &sighash, &holder_htlc_key, entropy_source));
 		}
 		Ok(ret)
 	}

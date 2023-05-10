@@ -8,64 +8,19 @@
 // licenses.
 
 //! A socket handling library for those running in Tokio environments who wish to use
-//! rust-lightning with native TcpStreams.
+//! rust-lightning with native [`TcpStream`]s.
 //!
 //! Designed to be as simple as possible, the high-level usage is almost as simple as "hand over a
-//! TcpStream and a reference to a PeerManager and the rest is handled", except for the
-//! [Event](../lightning/util/events/enum.Event.html) handling mechanism; see example below.
+//! [`TcpStream`] and a reference to a [`PeerManager`] and the rest is handled".
 //!
-//! The PeerHandler, due to the fire-and-forget nature of this logic, must be an Arc, and must use
-//! the SocketDescriptor provided here as the PeerHandler's SocketDescriptor.
+//! The [`PeerManager`], due to the fire-and-forget nature of this logic, must be a reference,
+//! (e.g. an [`Arc`]) and must use the [`SocketDescriptor`] provided here as the [`PeerManager`]'s
+//! `SocketDescriptor` implementation.
 //!
-//! Three methods are exposed to register a new connection for handling in tokio::spawn calls; see
-//! their individual docs for details.
+//! Three methods are exposed to register a new connection for handling in [`tokio::spawn`] calls;
+//! see their individual docs for details.
 //!
-//! # Example
-//! ```
-//! use std::net::TcpStream;
-//! use bitcoin::secp256k1::PublicKey;
-//! use lightning::util::events::{Event, EventHandler, EventsProvider};
-//! use std::net::SocketAddr;
-//! use std::sync::Arc;
-//!
-//! // Define concrete types for our high-level objects:
-//! type TxBroadcaster = dyn lightning::chain::chaininterface::BroadcasterInterface + Send + Sync;
-//! type FeeEstimator = dyn lightning::chain::chaininterface::FeeEstimator + Send + Sync;
-//! type Logger = dyn lightning::util::logger::Logger + Send + Sync;
-//! type NodeSigner = dyn lightning::chain::keysinterface::NodeSigner + Send + Sync;
-//! type UtxoLookup = dyn lightning::routing::utxo::UtxoLookup + Send + Sync;
-//! type ChainFilter = dyn lightning::chain::Filter + Send + Sync;
-//! type DataPersister = dyn lightning::chain::chainmonitor::Persist<lightning::chain::keysinterface::InMemorySigner> + Send + Sync;
-//! type ChainMonitor = lightning::chain::chainmonitor::ChainMonitor<lightning::chain::keysinterface::InMemorySigner, Arc<ChainFilter>, Arc<TxBroadcaster>, Arc<FeeEstimator>, Arc<Logger>, Arc<DataPersister>>;
-//! type ChannelManager = Arc<lightning::ln::channelmanager::SimpleArcChannelManager<ChainMonitor, TxBroadcaster, FeeEstimator, Logger>>;
-//! type PeerManager = Arc<lightning::ln::peer_handler::SimpleArcPeerManager<lightning_net_tokio::SocketDescriptor, ChainMonitor, TxBroadcaster, FeeEstimator, UtxoLookup, Logger>>;
-//!
-//! // Connect to node with pubkey their_node_id at addr:
-//! async fn connect_to_node(peer_manager: PeerManager, chain_monitor: Arc<ChainMonitor>, channel_manager: ChannelManager, their_node_id: PublicKey, addr: SocketAddr) {
-//! 	lightning_net_tokio::connect_outbound(peer_manager, their_node_id, addr).await;
-//! 	loop {
-//! 		let event_handler = |event: Event| {
-//! 			// Handle the event!
-//! 		};
-//! 		channel_manager.await_persistable_update();
-//! 		channel_manager.process_pending_events(&event_handler);
-//! 		chain_monitor.process_pending_events(&event_handler);
-//! 	}
-//! }
-//!
-//! // Begin reading from a newly accepted socket and talk to the peer:
-//! async fn accept_socket(peer_manager: PeerManager, chain_monitor: Arc<ChainMonitor>, channel_manager: ChannelManager, socket: TcpStream) {
-//! 	lightning_net_tokio::setup_inbound(peer_manager, socket);
-//! 	loop {
-//! 		let event_handler = |event: Event| {
-//! 			// Handle the event!
-//! 		};
-//! 		channel_manager.await_persistable_update();
-//! 		channel_manager.process_pending_events(&event_handler);
-//! 		chain_monitor.process_pending_events(&event_handler);
-//! 	}
-//! }
-//! ```
+//! [`PeerManager`]: lightning::ln::peer_handler::PeerManager
 
 // Prefix these with `rustdoc::` when we update our MSRV to be >= 1.52 to remove warnings.
 #![deny(broken_intra_doc_links)]
@@ -205,7 +160,7 @@ impl Connection {
 			tokio::select! {
 				v = write_avail_receiver.recv() => {
 					assert!(v.is_some()); // We can't have dropped the sending end, its in the us Arc!
-					if let Err(_) = peer_manager.write_buffer_space_avail(&mut our_descriptor) {
+					if peer_manager.write_buffer_space_avail(&mut our_descriptor).is_err() {
 						break Disconnect::CloseConnection;
 					}
 				},
@@ -234,7 +189,7 @@ impl Connection {
 			// our timeslice to another task we may just spin on this peer, starving other peers
 			// and eventually disconnecting them for ping timeouts. Instead, we explicitly yield
 			// here.
-			tokio::task::yield_now().await;
+			let _ = tokio::task::yield_now().await;
 		};
 		let writer_option = us.lock().unwrap().writer.take();
 		if let Some(mut writer) = writer_option {
@@ -313,7 +268,7 @@ pub fn setup_inbound<PM, CMH, RMH, OMH, L, UMH, NS>(
 	#[cfg(test)]
 	let last_us = Arc::clone(&us);
 
-	let handle_opt = if let Ok(_) = peer_manager.new_inbound_connection(SocketDescriptor::new(us.clone()), remote_addr) {
+	let handle_opt = if peer_manager.new_inbound_connection(SocketDescriptor::new(us.clone()), remote_addr).is_ok() {
 		Some(tokio::spawn(Connection::schedule_read(peer_manager, us, reader, read_receiver, write_receiver)))
 	} else {
 		// Note that we will skip socket_disconnected here, in accordance with the PeerManager
@@ -586,7 +541,7 @@ mod tests {
 	use lightning::ln::peer_handler::{MessageHandler, PeerManager};
 	use lightning::ln::features::NodeFeatures;
 	use lightning::routing::gossip::NodeId;
-	use lightning::util::events::*;
+	use lightning::events::*;
 	use lightning::util::test_utils::TestNodeSigner;
 	use bitcoin::secp256k1::{Secp256k1, SecretKey, PublicKey};
 

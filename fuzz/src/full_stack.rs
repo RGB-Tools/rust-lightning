@@ -35,21 +35,20 @@ use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget,
 use lightning::chain::chainmonitor;
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::keysinterface::{InMemorySigner, Recipient, KeyMaterial, EntropySource, NodeSigner, SignerProvider};
+use lightning::events::Event;
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentId};
+use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentId, RecipientOnionFields, Retry};
 use lightning::ln::peer_handler::{MessageHandler,PeerManager,SocketDescriptor,IgnoringMessageHandler};
 use lightning::ln::msgs::{self, DecodeError};
 use lightning::ln::script::ShutdownScript;
 use lightning::routing::gossip::{P2PGossipSync, NetworkGraph};
 use lightning::routing::utxo::UtxoLookup;
-use lightning::routing::router::{find_route, InFlightHtlcs, PaymentParameters, Route, RouteParameters, Router};
-use lightning::routing::scoring::FixedPenaltyScorer;
+use lightning::routing::router::{InFlightHtlcs, PaymentParameters, Route, RouteParameters, Router};
 use lightning::util::config::UserConfig;
 use lightning::util::errors::APIError;
-use lightning::util::events::Event;
 use lightning::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
 use lightning::util::logger::Logger;
-use lightning::util::ser::{Readable, Writeable};
+use lightning::util::ser::{Readable, ReadableArgs, Writeable};
 
 use crate::utils::test_logger;
 use crate::utils::test_persister::TestPersister;
@@ -348,6 +347,7 @@ impl SignerProvider for KeyProvider {
 				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, ctr],
 				channel_value_satoshis,
 				channel_keys_id,
+				channel_keys_id,
 			)
 		} else {
 			InMemorySigner::new(
@@ -360,12 +360,13 @@ impl SignerProvider for KeyProvider {
 				[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, ctr],
 				channel_value_satoshis,
 				channel_keys_id,
+				channel_keys_id,
 			)
 		}, state, false)
 	}
 
 	fn read_chan_signer(&self, mut data: &[u8]) -> Result<EnforcingSigner, DecodeError> {
-		let inner: InMemorySigner = Readable::read(&mut data)?;
+		let inner: InMemorySigner = ReadableArgs::read(&mut data, self)?;
 		let state = Arc::new(Mutex::new(EnforcementState::new()));
 
 		Ok(EnforcingSigner::new_with_revoked(
@@ -449,10 +450,8 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 	// keys subsequently generated in this test. Rather than regenerating all the messages manually,
 	// it's easier to just increment the counter here so the keys don't change.
 	keys_manager.counter.fetch_sub(3, Ordering::AcqRel);
-	let our_id = &keys_manager.get_node_id(Recipient::Node).unwrap();
 	let network_graph = Arc::new(NetworkGraph::new(network, Arc::clone(&logger)));
 	let gossip_sync = Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
-	let scorer = FixedPenaltyScorer::with_penalty(0);
 
 	let peers = RefCell::new([false; 256]);
 	let mut loss_detector = MoneyLossDetector::new(&peers, channelmanager.clone(), monitor.clone(), PeerManager::new(MessageHandler {
@@ -514,18 +513,16 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 					payment_params,
 					final_value_msat,
 				};
-				let random_seed_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
-				let route = match find_route(&our_id, &params, &network_graph, None, Arc::clone(&logger), &scorer, &random_seed_bytes) {
-					Ok(route) => route,
-					Err(_) => return,
-				};
 				let mut payment_hash = PaymentHash([0; 32]);
 				payment_hash.0[0..8].copy_from_slice(&be64_to_array(payments_sent));
 				let mut sha = Sha256::engine();
 				sha.input(&payment_hash.0[..]);
 				payment_hash.0 = Sha256::from_engine(sha).into_inner();
 				payments_sent += 1;
-				match channelmanager.send_payment(&route, payment_hash, &None, PaymentId(payment_hash.0)) {
+				match channelmanager.send_payment(payment_hash,
+					RecipientOnionFields::spontaneous_empty(), PaymentId(payment_hash.0), params,
+					Retry::Attempts(0))
+				{
 					Ok(_) => {},
 					Err(_) => return,
 				}
@@ -537,12 +534,6 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 					payment_params,
 					final_value_msat,
 				};
-				let random_seed_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
-				let mut route = match find_route(&our_id, &params, &network_graph, None, Arc::clone(&logger), &scorer, &random_seed_bytes) {
-					Ok(route) => route,
-					Err(_) => return,
-				};
-				route.paths.push(route.paths[0].clone());
 				let mut payment_hash = PaymentHash([0; 32]);
 				payment_hash.0[0..8].copy_from_slice(&be64_to_array(payments_sent));
 				let mut sha = Sha256::engine();
@@ -552,7 +543,10 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 				let mut payment_secret = PaymentSecret([0; 32]);
 				payment_secret.0[0..8].copy_from_slice(&be64_to_array(payments_sent));
 				payments_sent += 1;
-				match channelmanager.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)) {
+				match channelmanager.send_payment(payment_hash,
+					RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0),
+					params, Retry::Attempts(0))
+				{
 					Ok(_) => {},
 					Err(_) => return,
 				}
@@ -861,7 +855,7 @@ mod tests {
 		// 0085 3d00000000000000000000000000000000000000000000000000000000000000 0900000000000000000000000000000000000000000000000000000000000000 020b00000000000000000000000000000000000000000000000000000000000000 03000000000000000000000000000000 - revoke_and_ack and mac
 		//
 		// 07 - process the now-pending HTLC forward
-		// - client now sends id 1 update_add_htlc and commitment_signed (CHECK 7: SendHTLCs event for node 03020000 with 1 HTLCs for channel 3f000000)
+		// - client now sends id 1 update_add_htlc and commitment_signed (CHECK 7: UpdateHTLCs event for node 03020000 with 1 HTLCs for channel 3f000000)
 		//
 		// - we respond with commitment_signed then revoke_and_ack (a weird, but valid, order)
 		// 030112 - inbound read from peer id 1 of len 18

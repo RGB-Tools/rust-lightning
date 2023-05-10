@@ -16,6 +16,7 @@ use bitcoin::secp256k1;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::hex::FromHex;
 use bitcoin::hash_types::BlockHash;
 
 use bitcoin::network::constants::Network;
@@ -23,6 +24,7 @@ use bitcoin::blockdata::constants::genesis_block;
 
 use rgb::ContractId;
 
+use crate::events::{MessageSendEvent, MessageSendEventsProvider};
 use crate::ln::features::{ChannelFeatures, NodeFeatures, InitFeatures};
 use crate::ln::msgs::{DecodeError, ErrorAction, Init, LightningError, RoutingMessageHandler, NetAddress, MAX_VALUE_MSAT};
 use crate::ln::msgs::{ChannelAnnouncement, ChannelUpdate, NodeAnnouncement, GossipTimestampFilter};
@@ -31,7 +33,6 @@ use crate::ln::msgs;
 use crate::routing::utxo::{self, UtxoLookup};
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, MaybeReadable};
 use crate::util::logger::{Logger, Level};
-use crate::util::events::{MessageSendEvent, MessageSendEventsProvider};
 use crate::util::scid_utils::{block_from_scid, scid_from_parts, MAX_SCID_BLOCK};
 use crate::util::string::PrintableString;
 use crate::util::indexed_map::{IndexedMap, Entry as IndexedMapEntry};
@@ -40,11 +41,13 @@ use crate::io;
 use crate::io_extras::{copy, sink};
 use crate::prelude::*;
 use core::{cmp, fmt};
+use core::convert::TryFrom;
 use crate::sync::{RwLock, RwLockReadGuard};
 #[cfg(feature = "std")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Mutex;
 use core::ops::{Bound, Deref};
+use core::str::FromStr;
 
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,6 +80,11 @@ impl NodeId {
 	/// Get the public key slice from this NodeId
 	pub fn as_slice(&self) -> &[u8] {
 		&self.0
+	}
+
+	/// Get the public key from this NodeId
+	pub fn as_pubkey(&self) -> Result<PublicKey, secp256k1::Error> {
+		PublicKey::from_slice(&self.0)
 	}
 }
 
@@ -132,6 +140,29 @@ impl Readable for NodeId {
 	}
 }
 
+impl From<PublicKey> for NodeId {
+	fn from(pubkey: PublicKey) -> Self {
+		Self::from_pubkey(&pubkey)
+	}
+}
+
+impl TryFrom<NodeId> for PublicKey {
+	type Error = secp256k1::Error;
+
+	fn try_from(node_id: NodeId) -> Result<Self, Self::Error> {
+		node_id.as_pubkey()
+	}
+}
+
+impl FromStr for NodeId {
+	type Err = bitcoin::hashes::hex::Error;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let data: [u8; PUBLIC_KEY_SIZE] = FromHex::from_hex(s)?;
+		Ok(NodeId(data))
+	}
+}
+
 /// Represents the network as nodes and channels between them
 pub struct NetworkGraph<L: Deref> where L::Target: Logger {
 	secp_ctx: Secp256k1<secp256k1::VerifyOnly>,
@@ -183,7 +214,7 @@ pub enum NetworkUpdate {
 		msg: ChannelUpdate,
 	},
 	/// An error indicating that a channel failed to route a payment, which should be applied via
-	/// [`NetworkGraph::channel_failed`].
+	/// [`NetworkGraph::channel_failed_permanent`] if permanent.
 	ChannelFailure {
 		/// The short channel id of the closed channel.
 		short_channel_id: u64,
@@ -236,7 +267,7 @@ impl<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref> P2PGossipSync<G, U, L
 where U::Target: UtxoLookup, L::Target: Logger
 {
 	/// Creates a new tracker of the actual state of the network of channels and nodes,
-	/// assuming an existing Network Graph.
+	/// assuming an existing [`NetworkGraph`].
 	/// UTXO lookup is used to make sure announced channels exist on-chain, channel data is
 	/// correct, and the announcement is signed with channel owners' keys.
 	pub fn new(network_graph: G, utxo_lookup: Option<U>, logger: L) -> Self {
@@ -260,7 +291,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 	/// Gets a reference to the underlying [`NetworkGraph`] which was provided in
 	/// [`P2PGossipSync::new`].
 	///
-	/// (C-not exported) as bindings don't support a reference-to-a-reference yet
+	/// This is not exported to bindings users as bindings don't support a reference-to-a-reference yet
 	pub fn network_graph(&self) -> &G {
 		&self.network_graph
 	}
@@ -312,7 +343,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 	/// Handles any network updates originating from [`Event`]s.
 	///
-	/// [`Event`]: crate::util::events::Event
+	/// [`Event`]: crate::events::Event
 	pub fn handle_network_update(&self, network_update: &NetworkUpdate) {
 		match *network_update {
 			NetworkUpdate::ChannelUpdateMessage { ref msg } => {
@@ -323,9 +354,10 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				let _ = self.update_channel(msg);
 			},
 			NetworkUpdate::ChannelFailure { short_channel_id, is_permanent } => {
-				let action = if is_permanent { "Removing" } else { "Disabling" };
-				log_debug!(self.logger, "{} channel graph entry for {} due to a payment failure.", action, short_channel_id);
-				self.channel_failed(short_channel_id, is_permanent);
+				if is_permanent {
+					log_debug!(self.logger, "Removing channel graph entry for {} due to a payment failure.", short_channel_id);
+					self.channel_failed_permanent(short_channel_id);
+				}
 			},
 			NetworkUpdate::NodeFailure { ref node_id, is_permanent } => {
 				if is_permanent {
@@ -434,14 +466,20 @@ where U::Target: UtxoLookup, L::Target: Logger
 	}
 
 	/// Initiates a stateless sync of routing gossip information with a peer
-	/// using gossip_queries. The default strategy used by this implementation
+	/// using [`gossip_queries`]. The default strategy used by this implementation
 	/// is to sync the full block range with several peers.
 	///
-	/// We should expect one or more reply_channel_range messages in response
-	/// to our query_channel_range. Each reply will enqueue a query_scid message
+	/// We should expect one or more [`reply_channel_range`] messages in response
+	/// to our [`query_channel_range`]. Each reply will enqueue a [`query_scid`] message
 	/// to request gossip messages for each channel. The sync is considered complete
-	/// when the final reply_scids_end message is received, though we are not
+	/// when the final [`reply_scids_end`] message is received, though we are not
 	/// tracking this directly.
+	///
+	/// [`gossip_queries`]: https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#query-messages
+	/// [`reply_channel_range`]: msgs::ReplyChannelRange
+	/// [`query_channel_range`]: msgs::QueryChannelRange
+	/// [`query_scid`]: msgs::QueryShortChannelIds
+	/// [`reply_scids_end`]: msgs::ReplyShortChannelIdsEnd
 	fn peer_connected(&self, their_node_id: &PublicKey, init_msg: &Init, _inbound: bool) -> Result<(), ()> {
 		// We will only perform a sync with peers that support gossip_queries.
 		if !init_msg.features.supports_gossip_queries() {
@@ -1054,8 +1092,6 @@ pub struct NodeAnnouncementInfo {
 	/// May be invalid or malicious (eg control chars),
 	/// should not be exposed to the user.
 	pub alias: NodeAlias,
-	/// Internet-level addresses via which one can connect to the node
-	pub addresses: Vec<NetAddress>,
 	/// An initial announcement of the node
 	/// Mostly redundant with the data we store in fields explicitly.
 	/// Everything else is useful only for sending out for initial routing sync.
@@ -1063,20 +1099,51 @@ pub struct NodeAnnouncementInfo {
 	pub announcement_message: Option<NodeAnnouncement>
 }
 
-impl_writeable_tlv_based!(NodeAnnouncementInfo, {
-	(0, features, required),
-	(2, last_update, required),
-	(4, rgb, required),
-	(6, alias, required),
-	(8, announcement_message, option),
-	(10, addresses, vec_type),
-});
+impl NodeAnnouncementInfo {
+	/// Internet-level addresses via which one can connect to the node
+	pub fn addresses(&self) -> &[NetAddress] {
+		self.announcement_message.as_ref()
+			.map(|msg| msg.contents.addresses.as_slice())
+			.unwrap_or_default()
+	}
+}
+
+impl Writeable for NodeAnnouncementInfo {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		let empty_addresses = Vec::<NetAddress>::new();
+		write_tlv_fields!(writer, {
+			(0, self.features, required),
+			(2, self.last_update, required),
+			(4, self.rgb, required),
+			(6, self.alias, required),
+			(8, self.announcement_message, option),
+			(10, empty_addresses, vec_type), // Versions prior to 0.0.115 require this field
+		});
+		Ok(())
+	}
+}
+
+impl Readable for NodeAnnouncementInfo {
+    fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		_init_and_read_tlv_fields!(reader, {
+			(0, features, required),
+			(2, last_update, required),
+			(4, rgb, required),
+			(6, alias, required),
+			(8, announcement_message, option),
+			(10, _addresses, vec_type), // deprecated, not used anymore
+		});
+		let _: Option<Vec<NetAddress>> = _addresses;
+		Ok(Self { features: features.0.unwrap(), last_update: last_update.0.unwrap(), rgb: rgb.0.unwrap(),
+			alias: alias.0.unwrap(), announcement_message })
+    }
+}
 
 /// A user-defined name for a node, which may be used when displaying the node in a graph.
 ///
 /// Since node aliases are provided by third parties, they are a potential avenue for injection
 /// attacks. Care must be taken when processing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeAlias(pub [u8; 32]);
 
 impl fmt::Display for NodeAlias {
@@ -1141,7 +1208,7 @@ impl Writeable for NodeInfo {
 	}
 }
 
-// A wrapper allowing for the optional deseralization of `NodeAnnouncementInfo`. Utilizing this is
+// A wrapper allowing for the optional deserialization of `NodeAnnouncementInfo`. Utilizing this is
 // necessary to maintain compatibility with previous serializations of `NetAddress` that have an
 // invalid hostname set. We ignore and eat all errors until we are either able to read a
 // `NodeAnnouncementInfo` or hit a `ShortRead`, i.e., read the TLV field to the end.
@@ -1369,8 +1436,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 					features: msg.features.clone(),
 					last_update: msg.timestamp,
 					rgb: msg.rgb,
-					alias: NodeAlias(msg.alias),
-					addresses: msg.addresses.clone(),
+					alias: msg.alias,
 					announcement_message: if should_relay { full_msg.cloned() } else { None },
 				});
 
@@ -1577,40 +1643,27 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		Ok(())
 	}
 
-	/// Marks a channel in the graph as failed if a corresponding HTLC fail was sent.
-	/// If permanent, removes a channel from the local storage.
-	/// May cause the removal of nodes too, if this was their last channel.
-	/// If not permanent, makes channels unavailable for routing.
-	pub fn channel_failed(&self, short_channel_id: u64, is_permanent: bool) {
+	/// Marks a channel in the graph as failed permanently.
+	///
+	/// The channel and any node for which this was their last channel are removed from the graph.
+	pub fn channel_failed_permanent(&self, short_channel_id: u64) {
 		#[cfg(feature = "std")]
 		let current_time_unix = Some(SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs());
 		#[cfg(not(feature = "std"))]
 		let current_time_unix = None;
 
-		self.channel_failed_with_time(short_channel_id, is_permanent, current_time_unix)
+		self.channel_failed_permanent_with_time(short_channel_id, current_time_unix)
 	}
 
-	/// Marks a channel in the graph as failed if a corresponding HTLC fail was sent.
-	/// If permanent, removes a channel from the local storage.
-	/// May cause the removal of nodes too, if this was their last channel.
-	/// If not permanent, makes channels unavailable for routing.
-	fn channel_failed_with_time(&self, short_channel_id: u64, is_permanent: bool, current_time_unix: Option<u64>) {
+	/// Marks a channel in the graph as failed permanently.
+	///
+	/// The channel and any node for which this was their last channel are removed from the graph.
+	fn channel_failed_permanent_with_time(&self, short_channel_id: u64, current_time_unix: Option<u64>) {
 		let mut channels = self.channels.write().unwrap();
-		if is_permanent {
-			if let Some(chan) = channels.remove(&short_channel_id) {
-				let mut nodes = self.nodes.write().unwrap();
-				self.removed_channels.lock().unwrap().insert(short_channel_id, current_time_unix);
-				Self::remove_channel_in_nodes(&mut nodes, &chan, short_channel_id);
-			}
-		} else {
-			if let Some(chan) = channels.get_mut(&short_channel_id) {
-				if let Some(one_to_two) = chan.one_to_two.as_mut() {
-					one_to_two.enabled = false;
-				}
-				if let Some(two_to_one) = chan.two_to_one.as_mut() {
-					two_to_one.enabled = false;
-				}
-			}
+		if let Some(chan) = channels.remove(&short_channel_id) {
+			let mut nodes = self.nodes.write().unwrap();
+			self.removed_channels.lock().unwrap().insert(short_channel_id, current_time_unix);
+			Self::remove_channel_in_nodes(&mut nodes, &chan, short_channel_id);
 		}
 	}
 
@@ -1888,7 +1941,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 impl ReadOnlyNetworkGraph<'_> {
 	/// Returns all known valid channels' short ids along with announced channel info.
 	///
-	/// (C-not exported) because we don't want to return lifetime'd references
+	/// This is not exported to bindings users because we don't want to return lifetime'd references
 	pub fn channels(&self) -> &IndexedMap<u64, ChannelInfo> {
 		&*self.channels
 	}
@@ -1906,7 +1959,7 @@ impl ReadOnlyNetworkGraph<'_> {
 
 	/// Returns all known nodes' public keys along with announced node info.
 	///
-	/// (C-not exported) because we don't want to return lifetime'd references
+	/// This is not exported to bindings users because we don't want to return lifetime'd references
 	pub fn nodes(&self) -> &IndexedMap<NodeId, NodeInfo> {
 		&*self.nodes
 	}
@@ -1926,18 +1979,15 @@ impl ReadOnlyNetworkGraph<'_> {
 	/// Returns None if the requested node is completely unknown,
 	/// or if node announcement for the node was never received.
 	pub fn get_addresses(&self, pubkey: &PublicKey) -> Option<Vec<NetAddress>> {
-		if let Some(node) = self.nodes.get(&NodeId::from_pubkey(&pubkey)) {
-			if let Some(node_info) = node.announcement_info.as_ref() {
-				return Some(node_info.addresses.clone())
-			}
-		}
-		None
+		self.nodes.get(&NodeId::from_pubkey(&pubkey))
+			.and_then(|node| node.announcement_info.as_ref().map(|ann| ann.addresses().to_vec()))
 	}
 }
 
 /*
 #[cfg(test)]
 pub(crate) mod tests {
+	use crate::events::{MessageSendEvent, MessageSendEventsProvider};
 	use crate::ln::channelmanager;
 	use crate::ln::chan_utils::make_funding_redeemscript;
 	#[cfg(feature = "std")]
@@ -1949,8 +1999,7 @@ pub(crate) mod tests {
 		ReplyChannelRange, QueryChannelRange, QueryShortChannelIds, MAX_VALUE_MSAT};
 	use crate::util::config::UserConfig;
 	use crate::util::test_utils;
-	use crate::util::ser::{ReadableArgs, Writeable};
-	use crate::util::events::{MessageSendEvent, MessageSendEventsProvider};
+	use crate::util::ser::{ReadableArgs, Readable, Writeable};
 	use crate::util::scid_utils::scid_from_parts;
 
 	use crate::routing::gossip::REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS;
@@ -2010,7 +2059,7 @@ pub(crate) mod tests {
 			timestamp: 100,
 			node_id,
 			rgb: [0; 3],
-			alias: [0; 32],
+			alias: NodeAlias([0; 32]),
 			addresses: Vec::new(),
 			excess_address_data: Vec::new(),
 			excess_data: Vec::new(),
@@ -2400,7 +2449,7 @@ pub(crate) mod tests {
 			assert!(network_graph.read_only().channels().get(&short_channel_id).unwrap().one_to_two.is_some());
 		}
 
-		// Non-permanent closing just disables a channel
+		// Non-permanent failure doesn't touch the channel at all
 		{
 			match network_graph.read_only().channels().get(&short_channel_id) {
 				None => panic!(),
@@ -2417,7 +2466,7 @@ pub(crate) mod tests {
 			match network_graph.read_only().channels().get(&short_channel_id) {
 				None => panic!(),
 				Some(channel_info) => {
-					assert!(!channel_info.one_to_two.as_ref().unwrap().enabled);
+					assert!(channel_info.one_to_two.as_ref().unwrap().enabled);
 				}
 			};
 		}
@@ -2551,7 +2600,7 @@ pub(crate) mod tests {
 
 			// Mark the channel as permanently failed. This will also remove the two nodes
 			// and all of the entries will be tracked as removed.
-			network_graph.channel_failed_with_time(short_channel_id, true, Some(tracking_time));
+			network_graph.channel_failed_permanent_with_time(short_channel_id, Some(tracking_time));
 
 			// Should not remove from tracking if insufficient time has passed
 			network_graph.remove_stale_channels_and_tracking_with_time(
@@ -2584,7 +2633,7 @@ pub(crate) mod tests {
 
 			// Mark the channel as permanently failed. This will also remove the two nodes
 			// and all of the entries will be tracked as removed.
-			network_graph.channel_failed(short_channel_id, true);
+			network_graph.channel_failed_permanent(short_channel_id);
 
 			// The first time we call the following, the channel will have a removal time assigned.
 			network_graph.remove_stale_channels_and_tracking_with_time(removal_time);
@@ -3255,26 +3304,25 @@ pub(crate) mod tests {
 
 	#[test]
 	fn node_info_is_readable() {
-		use std::convert::TryFrom;
-
 		// 1. Check we can read a valid NodeAnnouncementInfo and fail on an invalid one
-		let valid_netaddr = crate::ln::msgs::NetAddress::Hostname { hostname: crate::util::ser::Hostname::try_from("A".to_string()).unwrap(), port: 1234 };
+		let announcement_message = hex::decode("d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000122013413a7031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2020201010101010101010101010101010101010101010101010101010101010101010000701fffefdfc2607").unwrap();
+		let announcement_message = NodeAnnouncement::read(&mut announcement_message.as_slice()).unwrap();
 		let valid_node_ann_info = NodeAnnouncementInfo {
 			features: channelmanager::provided_node_features(&UserConfig::default()),
 			last_update: 0,
 			rgb: [0u8; 3],
 			alias: NodeAlias([0u8; 32]),
-			addresses: vec![valid_netaddr],
-			announcement_message: None,
+			announcement_message: Some(announcement_message)
 		};
 
 		let mut encoded_valid_node_ann_info = Vec::new();
 		assert!(valid_node_ann_info.write(&mut encoded_valid_node_ann_info).is_ok());
-		let read_valid_node_ann_info: NodeAnnouncementInfo = crate::util::ser::Readable::read(&mut encoded_valid_node_ann_info.as_slice()).unwrap();
+		let read_valid_node_ann_info = NodeAnnouncementInfo::read(&mut encoded_valid_node_ann_info.as_slice()).unwrap();
 		assert_eq!(read_valid_node_ann_info, valid_node_ann_info);
+		assert_eq!(read_valid_node_ann_info.addresses().len(), 1);
 
 		let encoded_invalid_node_ann_info = hex::decode("3f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d2").unwrap();
-		let read_invalid_node_ann_info_res: Result<NodeAnnouncementInfo, crate::ln::msgs::DecodeError> = crate::util::ser::Readable::read(&mut encoded_invalid_node_ann_info.as_slice());
+		let read_invalid_node_ann_info_res = NodeAnnouncementInfo::read(&mut encoded_invalid_node_ann_info.as_slice());
 		assert!(read_invalid_node_ann_info_res.is_err());
 
 		// 2. Check we can read a NodeInfo anyways, but set the NodeAnnouncementInfo to None if invalid
@@ -3285,12 +3333,21 @@ pub(crate) mod tests {
 
 		let mut encoded_valid_node_info = Vec::new();
 		assert!(valid_node_info.write(&mut encoded_valid_node_info).is_ok());
-		let read_valid_node_info: NodeInfo = crate::util::ser::Readable::read(&mut encoded_valid_node_info.as_slice()).unwrap();
+		let read_valid_node_info = NodeInfo::read(&mut encoded_valid_node_info.as_slice()).unwrap();
 		assert_eq!(read_valid_node_info, valid_node_info);
 
 		let encoded_invalid_node_info_hex = hex::decode("4402403f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d20400").unwrap();
-		let read_invalid_node_info: NodeInfo = crate::util::ser::Readable::read(&mut encoded_invalid_node_info_hex.as_slice()).unwrap();
+		let read_invalid_node_info = NodeInfo::read(&mut encoded_invalid_node_info_hex.as_slice()).unwrap();
 		assert_eq!(read_invalid_node_info.announcement_info, None);
+	}
+
+	#[test]
+	fn test_node_info_keeps_compatibility() {
+		let old_ann_info_with_addresses = hex::decode("3f0009000708a000080a51220204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014104d2").unwrap();
+		let ann_info_with_addresses = NodeAnnouncementInfo::read(&mut old_ann_info_with_addresses.as_slice())
+				.expect("to be able to read an old NodeAnnouncementInfo with addresses");
+		// This serialized info has an address field but no announcement_message, therefore the addresses returned by our function will still be empty
+		assert!(ann_info_with_addresses.addresses().is_empty());
 	}
 }
 

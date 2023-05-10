@@ -14,15 +14,16 @@ use crate::chain::chaininterface::LowerBoundedFeeEstimator;
 use crate::chain::channelmonitor::ChannelMonitor;
 use crate::chain::keysinterface::EntropySource;
 use crate::chain::transaction::OutPoint;
-use crate::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs, PaymentId};
+use crate::events::{ClosureReason, Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
+use crate::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs, PaymentId, RecipientOnionFields};
 use crate::ln::msgs;
 use crate::ln::msgs::{ChannelMessageHandler, RoutingMessageHandler, ErrorAction};
 use crate::util::enforcing_trait_impls::EnforcingSigner;
 use crate::util::test_utils;
 use crate::util::errors::APIError;
-use crate::util::events::{ClosureReason, Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
 use crate::util::ser::{Writeable, ReadableArgs};
 use crate::util::config::UserConfig;
+use crate::util::string::UntrustedString;
 
 use bitcoin::hash_types::BlockHash;
 
@@ -260,6 +261,9 @@ fn test_manager_serialize_deserialize_events() {
 	}
 	// Normally, this is where node_a would broadcast the funding transaction, but the test de/serializes first instead
 
+	expect_channel_pending_event(&node_a, &node_b.node.get_our_node_id());
+	expect_channel_pending_event(&node_b, &node_a.node.get_our_node_id());
+
 	nodes.push(node_a);
 	nodes.push(node_b);
 
@@ -422,20 +426,22 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	nodes_0_deserialized = nodes_0_deserialized_tmp;
 	assert!(nodes_0_read.is_empty());
 
-	{ // Channel close should result in a commitment tx
-		let txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
-		assert_eq!(txn.len(), 1);
-		check_spends!(txn[0], funding_tx);
-		assert_eq!(txn[0].input[0].previous_output.txid, funding_tx.txid());
-	}
-
 	for monitor in node_0_monitors.drain(..) {
 		assert_eq!(nodes[0].chain_monitor.watch_channel(monitor.get_funding_txo().0, monitor),
 			ChannelMonitorUpdateStatus::Completed);
 		check_added_monitors!(nodes[0], 1);
 	}
 	nodes[0].node = &nodes_0_deserialized;
+
 	check_closed_event!(nodes[0], 1, ClosureReason::OutdatedChannelManager);
+	{ // Channel close should result in a commitment tx
+		nodes[0].node.timer_tick_occurred();
+		let txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		assert_eq!(txn.len(), 1);
+		check_spends!(txn[0], funding_tx);
+		assert_eq!(txn[0].input[0].previous_output.txid, funding_tx.txid());
+	}
+	check_added_monitors!(nodes[0], 1);
 
 	// nodes[1] and nodes[2] have no lost state with nodes[0]...
 	reconnect_nodes(&nodes[0], &nodes[1], (false, false), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (false, false));
@@ -566,7 +572,7 @@ fn do_test_data_loss_protect(reconnect_panicing: bool) {
 	nodes[1].node.handle_error(&nodes[0].node.get_our_node_id(), &err_msgs_0[0]);
 	assert!(nodes[1].node.list_usable_channels().is_empty());
 	check_added_monitors!(nodes[1], 1);
-	check_closed_event!(nodes[1], 1, ClosureReason::CounterpartyForceClosed { peer_msg: format!("Got a message for a channel from the wrong node! No such channel for the passed counterparty_node_id {}", &nodes[1].node.get_our_node_id()) });
+	check_closed_event!(nodes[1], 1, ClosureReason::CounterpartyForceClosed { peer_msg: UntrustedString(format!("Got a message for a channel from the wrong node! No such channel for the passed counterparty_node_id {}", &nodes[1].node.get_our_node_id())) });
 	check_closed_broadcast!(nodes[1], false);
 }
 
@@ -600,7 +606,8 @@ fn test_forwardable_regen() {
 
 	// First send a payment to nodes[1]
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[1], 100_000);
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -613,7 +620,8 @@ fn test_forwardable_regen() {
 
 	// Next send a payment which is forwarded by nodes[1]
 	let (route_2, payment_hash_2, payment_preimage_2, payment_secret_2) = get_route_and_payment_hash!(nodes[0], nodes[2], 200_000);
-	nodes[0].node.send_payment(&route_2, payment_hash_2, &Some(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route_2, payment_hash_2,
+		RecipientOnionFields::secret_only(payment_secret_2), PaymentId(payment_hash_2.0)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -691,11 +699,12 @@ fn do_test_partial_claim_before_restart(persist_both_monitors: bool) {
 	assert_eq!(route.paths.len(), 2);
 	route.paths.sort_by(|path_a, _| {
 		// Sort the path so that the path through nodes[1] comes first
-		if path_a[0].pubkey == nodes[1].node.get_our_node_id() {
+		if path_a.hops[0].pubkey == nodes[1].node.get_our_node_id() {
 			core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater }
 	});
 
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
 	check_added_monitors!(nodes[0], 2);
 
 	// Send the payment through to nodes[3] *without* clearing the PaymentClaimable event
@@ -847,11 +856,12 @@ fn do_forwarded_payment_no_manager_persistence(use_cs_commitment: bool, claim_ht
 	let (mut route, payment_hash, payment_preimage, payment_secret) =
 		get_route_and_payment_hash!(nodes[0], nodes[2], 1_000_000);
 	if use_intercept {
-		route.paths[0][1].short_channel_id = intercept_scid;
+		route.paths[0].hops[1].short_channel_id = intercept_scid;
 	}
 	let payment_id = PaymentId(nodes[0].keys_manager.backing.get_secure_random_bytes());
 	let htlc_expiry = nodes[0].best_block_info().1 + TEST_FINAL_CLTV;
-	nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret), payment_id).unwrap();
+	nodes[0].node.send_payment_with_route(&route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), payment_id).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
 	let payment_event = SendEvent::from_node(&nodes[0]);
@@ -920,8 +930,10 @@ fn do_forwarded_payment_no_manager_persistence(use_cs_commitment: bool, claim_ht
 		});
 	}
 
+	nodes[1].node.timer_tick_occurred();
 	let bs_commitment_tx = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 	assert_eq!(bs_commitment_tx.len(), 1);
+	check_added_monitors!(nodes[1], 1);
 
 	nodes[0].node.peer_disconnected(&nodes[1].node.get_our_node_id());
 	reconnect_nodes(&nodes[0], &nodes[1], (false, false), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (false, false));
@@ -936,7 +948,7 @@ fn do_forwarded_payment_no_manager_persistence(use_cs_commitment: bool, claim_ht
 		if claim_htlc {
 			confirm_transaction(&nodes[1], &cs_commitment_tx[1]);
 		} else {
-			connect_blocks(&nodes[1], htlc_expiry - nodes[1].best_block_info().1);
+			connect_blocks(&nodes[1], htlc_expiry - nodes[1].best_block_info().1 + 1);
 			let bs_htlc_timeout_tx = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
 			assert_eq!(bs_htlc_timeout_tx.len(), 1);
 			confirm_transaction(&nodes[1], &bs_htlc_timeout_tx[0]);
