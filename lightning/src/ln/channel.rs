@@ -22,7 +22,7 @@ use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
 
-use invoice::ConsignmentEndpoint;
+use rgbwallet::RgbTransport;
 
 use crate::ln::{PaymentPreimage, PaymentHash};
 use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
@@ -754,7 +754,7 @@ pub(super) struct Channel<Signer: ChannelSigner> {
 	pending_monitor_updates: Vec<ChannelMonitorUpdate>,
 
 	/// The consignment endpoint used to exchange the RGB consignment
-	pub(super) consignment_endpoint: ConsignmentEndpoint,
+	pub(super) consignment_endpoint: RgbTransport,
 
 	ldk_data_dir: PathBuf,
 }
@@ -768,12 +768,14 @@ struct CommitmentTxInfoCached {
 	feerate: u32,
 }
 
-pub const DEFAULT_MAX_HTLCS: u16 = 50;
+pub const DEFAULT_MAX_HTLCS: u16 = 5;
 
 pub(crate) fn commitment_tx_base_weight(opt_anchors: bool) -> u64 {
 	const COMMITMENT_TX_BASE_WEIGHT: u64 = 724;
 	const COMMITMENT_TX_BASE_ANCHOR_WEIGHT: u64 = 1124;
-	if opt_anchors { COMMITMENT_TX_BASE_ANCHOR_WEIGHT } else { COMMITMENT_TX_BASE_WEIGHT }
+	let base_weight = if opt_anchors { COMMITMENT_TX_BASE_ANCHOR_WEIGHT } else { COMMITMENT_TX_BASE_WEIGHT };
+	// add OP_RETURN weight (RGB coloring)
+	base_weight + 172
 }
 
 #[cfg(not(test))]
@@ -950,9 +952,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 	// Constructors:
 	pub fn new_outbound<ES: Deref, SP: Deref, F: Deref>(
-		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
+		_fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
-		outbound_scid_alias: u64, consignment_endpoint: ConsignmentEndpoint, ldk_data_dir: PathBuf
+		outbound_scid_alias: u64, consignment_endpoint: RgbTransport, ldk_data_dir: PathBuf
 	) -> Result<Channel<Signer>, APIError>
 	where ES::Target: EntropySource,
 	      SP::Target: SignerProvider<Signer = Signer>,
@@ -986,7 +988,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let channel_type = Self::get_initial_channel_type(&config, their_features);
 		debug_assert!(channel_type.is_subset(&channelmanager::provided_channel_type_features(&config)));
 
-		let feerate = fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::Normal);
+		let feerate = 2500;
 
 		let value_to_self_msat = channel_value_satoshis * 1000 - push_msat;
 		let commitment_tx_fee = Self::commit_tx_fee_msat(feerate, MIN_AFFORDABLE_HTLC_COUNT, channel_type.requires_anchors_zero_fee_htlc_tx());
@@ -6865,7 +6867,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let mut channel_keys_id: Option<[u8; 32]> = None;
 		let mut temporary_channel_id: Option<[u8; 32]> = None;
 		let mut holder_max_accepted_htlcs: Option<u16> = None;
-		let mut consignment_endpoint: Option<ConsignmentEndpoint> = None;
+		let mut consignment_endpoint: Option<RgbTransport> = None;
 		let mut ldk_data_dir: Option<PathBuf> = None;
 
 		read_tlv_fields!(reader, {

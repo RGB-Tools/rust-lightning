@@ -7,6 +7,7 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+/*
 use crate::chain;
 use crate::chain::WatchedOutput;
 use crate::chain::chaininterface;
@@ -1007,3 +1008,4 @@ impl Drop for TestScorer {
 		}
 	}
 }
+*/

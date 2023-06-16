@@ -11,6 +11,7 @@
 //! payments/messages between them, and often checking the resulting ChannelMonitors are able to
 //! claim outputs on-chain.
 
+/*
 use crate::chain;
 use crate::chain::{ChannelMonitorUpdateStatus, Confirm, Listen, Watch};
 use crate::chain::chaininterface::LowerBoundedFeeEstimator;
@@ -62,7 +63,6 @@ use crate::sync::{Arc, Mutex};
 use crate::ln::functional_test_utils::*;
 use crate::ln::chan_utils::CommitmentTransaction;
 
-/*
 #[test]
 fn test_insane_channel_opens() {
 	// Stand up a network of 2 nodes

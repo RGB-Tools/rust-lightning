@@ -15,7 +15,7 @@ use lightning::ln::inbound_payment::{create, create_from_hash, ExpandedKey};
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{RouteHint, RouteHintHop, Router};
 use lightning::util::logger::Logger;
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 use secp256k1::PublicKey;
 use core::ops::Deref;
 use core::time::Duration;

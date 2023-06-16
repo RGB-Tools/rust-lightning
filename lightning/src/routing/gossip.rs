@@ -22,7 +22,7 @@ use bitcoin::hash_types::BlockHash;
 use bitcoin::network::constants::Network;
 use bitcoin::blockdata::constants::genesis_block;
 
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 
 use crate::events::{MessageSendEvent, MessageSendEventsProvider};
 use crate::ln::features::{ChannelFeatures, NodeFeatures, InitFeatures};

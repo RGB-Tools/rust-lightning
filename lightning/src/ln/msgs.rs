@@ -30,9 +30,9 @@ use bitcoin::secp256k1;
 use bitcoin::blockdata::script::Script;
 use bitcoin::hash_types::{Txid, BlockHash};
 
-use invoice::ConsignmentEndpoint;
+use rgbwallet::RgbTransport;
 
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 
 use crate::ln::features::{ChannelFeatures, ChannelTypeFeatures, InitFeatures, NodeFeatures};
 use crate::ln::onion_utils;
@@ -211,7 +211,7 @@ pub struct OpenChannel {
 	/// feature bits with our counterparty's feature bits from the [`Init`] message.
 	pub channel_type: Option<ChannelTypeFeatures>,
 	/// The consignment endpoint used to exchange the RGB consignment
-	pub consignment_endpoint: ConsignmentEndpoint,
+	pub consignment_endpoint: RgbTransport,
 }
 
 /// An [`accept_channel`] message to be sent to or received from a peer.
@@ -1533,7 +1533,7 @@ impl_writeable_msg!(OpenChannel, {
 	(1, channel_type, option),
 });
 
-impl Readable for ConsignmentEndpoint {
+impl Readable for RgbTransport {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		use std::str::FromStr;
 
@@ -1542,13 +1542,13 @@ impl Readable for ConsignmentEndpoint {
 		consignment_endpoint_str_vec.resize(sz, 0);
 		r.read_exact(&mut consignment_endpoint_str_vec)?;
 		match String::from_utf8(consignment_endpoint_str_vec) {
-			Ok(s) => return Ok(ConsignmentEndpoint::from_str(&s).unwrap()),
+			Ok(s) => return Ok(RgbTransport::from_str(&s).unwrap()),
 			Err(_) => return Err(DecodeError::InvalidValue),
 		}
 	}
 }
 
-impl Writeable for ConsignmentEndpoint {
+impl Writeable for RgbTransport {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		let consignment_endpoint_str = format!("{self}");
 		(consignment_endpoint_str.len() as u16).write(w)?;
@@ -1825,10 +1825,8 @@ impl Writeable for UnsignedChannelAnnouncement {
 
 impl Readable for ContractId {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
-		use commit_verify::tagged_hash::TaggedHash;
-
 		let buf: [u8; 32] = Readable::read(r)?;
-		let contract_id = ContractId::from_bytes(buf).unwrap();
+		let contract_id = ContractId::from_slice(buf).unwrap();
 		Ok(contract_id)
 	}
 }

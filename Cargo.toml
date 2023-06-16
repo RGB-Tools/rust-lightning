@@ -40,3 +40,8 @@ panic = "abort"
 opt-level = 3
 codegen-units = 1
 lto = true
+
+[patch.crates-io]
+commit_verify = { path = "../client_side_validation/commit_verify" }
+rgb-std = { path = "../rgb-wallet/std" }
+rgb-wallet = { path = "../rgb-wallet" }

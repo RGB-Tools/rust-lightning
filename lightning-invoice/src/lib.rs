@@ -57,7 +57,7 @@ use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::RouteHint;
 use lightning::util::invoice::construct_invoice_preimage;
 
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 use secp256k1::PublicKey;
 use secp256k1::{Message, Secp256k1};
 use secp256k1::ecdsa::RecoverableSignature;

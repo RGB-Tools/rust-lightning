@@ -13,7 +13,7 @@ use bitcoin::{PubkeyHash, ScriptHash};
 use bitcoin::util::address::WitnessVersion;
 use bitcoin_hashes::Hash;
 use bitcoin_hashes::sha256;
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 use crate::prelude::*;
 use lightning::ln::PaymentSecret;
 use lightning::routing::gossip::RoutingFees;

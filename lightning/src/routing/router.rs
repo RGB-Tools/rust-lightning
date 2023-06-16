@@ -13,7 +13,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256::Hash as Sha256;
 
-use rgb::ContractId;
+use rgbstd::contract::ContractId;
 
 use crate::blinded_path::{BlindedHop, BlindedPath};
 use crate::ln::PaymentHash;
