@@ -624,6 +624,15 @@ pub enum Event {
 		/// check that whatever fee you want has been included here or subtract it as required. Further,
 		/// LDK will not stop you from forwarding more than you received.
 		expected_outbound_amount_msat: u64,
+
+		/// Inbound assets, if any
+		inbound_rgb_amount: Option<u64>,
+		/// How much assets should be forwarded, if any
+		expected_outbound_rgb_amount: Option<u64>,
+		/// Whether the intercept is a swap
+		is_swap: bool,
+		/// Previous short channel id
+		prev_short_channel_id: u64,
 	},
 	/// Used to indicate that an output which you should know how to spend was confirmed on chain
 	/// and is now spendable.
@@ -903,7 +912,7 @@ impl Writeable for Event {
 					(0, WithoutLength(outputs), required),
 				});
 			},
-			&Event::HTLCIntercepted { requested_next_hop_scid, payment_hash, inbound_amount_msat, expected_outbound_amount_msat, intercept_id } => {
+			&Event::HTLCIntercepted { requested_next_hop_scid, payment_hash, inbound_amount_msat, expected_outbound_amount_msat, inbound_rgb_amount, expected_outbound_rgb_amount, intercept_id, is_swap, prev_short_channel_id } => {
 				6u8.write(writer)?;
 				let intercept_scid = InterceptNextHop::FakeScid { requested_next_hop_scid };
 				write_tlv_fields!(writer, {
@@ -912,6 +921,10 @@ impl Writeable for Event {
 					(4, payment_hash, required),
 					(6, inbound_amount_msat, required),
 					(8, expected_outbound_amount_msat, required),
+					(10, inbound_rgb_amount, option),
+					(12, expected_outbound_rgb_amount, option),
+					(14, is_swap, required),
+					(16, prev_short_channel_id, required),
 				});
 			}
 			&Event::PaymentForwarded {
@@ -1174,12 +1187,20 @@ impl MaybeReadable for Event {
 				let mut requested_next_hop_scid = InterceptNextHop::FakeScid { requested_next_hop_scid: 0 };
 				let mut inbound_amount_msat = 0;
 				let mut expected_outbound_amount_msat = 0;
+				let mut inbound_rgb_amount = None;
+				let mut expected_outbound_rgb_amount = None;
+				let mut is_swap = false;
+				let mut prev_short_channel_id = 0;
 				read_tlv_fields!(reader, {
 					(0, intercept_id, required),
 					(2, requested_next_hop_scid, required),
 					(4, payment_hash, required),
 					(6, inbound_amount_msat, required),
 					(8, expected_outbound_amount_msat, required),
+					(10, inbound_rgb_amount, option),
+					(12, expected_outbound_rgb_amount, option),
+					(14, is_swap, required),
+					(16, prev_short_channel_id, required),
 				});
 				let next_scid = match requested_next_hop_scid {
 					InterceptNextHop::FakeScid { requested_next_hop_scid: scid } => scid
@@ -1189,7 +1210,11 @@ impl MaybeReadable for Event {
 					requested_next_hop_scid: next_scid,
 					inbound_amount_msat,
 					expected_outbound_amount_msat,
+					inbound_rgb_amount,
+					expected_outbound_rgb_amount,
 					intercept_id,
+					is_swap,
+					prev_short_channel_id,
 				}))
 			},
 			7u8 => {

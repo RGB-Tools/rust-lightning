@@ -72,6 +72,8 @@ pub struct RgbPaymentInfo {
 	pub local_rgb_amount: u64,
 	/// RGB remote amount
 	pub remote_rgb_amount: u64,
+	/// Override RGB amount in route
+	pub override_route_amount: Option<u64>,
 }
 
 /// RGB UTXO
@@ -131,6 +133,11 @@ pub fn read_rgb_transfer_info(path: &str) -> TransferInfo {
 	serde_json::from_str(&serialized_info).expect("valid transfer info")
 }
 
+/// Whether a transfer is colored
+pub fn is_transfer_colored(path: &str) -> bool {
+	PathBuf::from(path).exists()
+}
+
 /// Write TransferInfo file
 pub fn write_rgb_transfer_info(path: &PathBuf, info: &TransferInfo) {
 	let serialized_info = serde_json::to_string(&info).expect("valid transfer info");
@@ -181,9 +188,10 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 		} else {
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id: rgb_info.contract_id,
-				amount: htlc.amount_rgb,
+				amount: htlc.amount_rgb.unwrap(),
 				local_rgb_amount: rgb_info.local_rgb_amount,
 				remote_rgb_amount: rgb_info.remote_rgb_amount,
+				override_route_amount: None,
 			};
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 			fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
@@ -318,7 +326,7 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 	let seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, seal_vout, STATIC_BLINDING));
 	beneficiaries.push(seal);
 	asset_transition_builder = asset_transition_builder
-		.add_raw_state_static(assignment_id, seal, TypedState::Amount(htlc.amount_rgb)).expect("ok");
+		.add_raw_state_static(assignment_id, seal, TypedState::Amount(htlc.amount_rgb.expect("this is a rgb channel"))).expect("ok");
 
 	let prev_outputs = psbt
 		.unsigned_tx
@@ -495,6 +503,11 @@ pub fn get_rgb_channel_info(channel_id: &[u8; 32], ldk_data_dir: &Path) -> (RgbI
 	(info, info_file_path)
 }
 
+/// Whether the channel data for a channel exist
+pub fn is_channel_rgb(channel_id: &[u8; 32], ldk_data_dir: &PathBuf) -> bool {
+	ldk_data_dir.join(hex::encode(channel_id)).exists()
+}
+
 /// Write RgbInfo file
 pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 	let serialized_info = serde_json::to_string(&rgb_info).expect("valid rgb info");
@@ -502,13 +515,14 @@ pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 }
 
 /// Write RGB payment info to file
-pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64) {
+pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, override_route_amount: Option<u64>) {
 	let rgb_payment_info_path = ldk_data_dir.join(hex::encode(payment_hash.0));
 	let rgb_payment_info = RgbPaymentInfo {
 		contract_id,
 		amount: amount_rgb,
 		local_rgb_amount: 0,
 		remote_rgb_amount: 0,
+		override_route_amount,
 	};
 	let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 	std::fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
@@ -633,6 +647,11 @@ pub(crate) fn update_rgb_channel_amount(channel_id: &[u8; 32], rgb_offered_htlc:
 	}
 
 	write_rgb_channel_info(&info_file_path, &rgb_info)
+}
+
+/// Whether the payment is colored
+pub(crate) fn is_payment_rgb(ldk_data_dir: &PathBuf, payment_hash: &PaymentHash) -> bool {
+	ldk_data_dir.join(hex::encode(payment_hash.0)).exists()
 }
 
 /// Filter first_hops for contract_id
