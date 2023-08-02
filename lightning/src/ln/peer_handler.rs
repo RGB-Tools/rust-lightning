@@ -2072,7 +2072,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 						|| peer.awaiting_pong_timer_tick_intervals as u64 >
 							MAX_BUFFER_DRAIN_TICK_INTERVALS_PER_PEER as u64 * peers_lock.len() as u64
 					{
-						println!("PeerManager timer_tick_occurred skip disconnect push");
+						log_info!(self.logger, "PeerManager timer_tick_occurred skip disconnect push");
 						peer.awaiting_pong_timer_tick_intervals = 0;
 						peer.received_message_since_timer_tick = true;
 						continue 'outer;

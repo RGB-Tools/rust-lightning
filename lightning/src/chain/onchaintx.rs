@@ -1185,7 +1185,6 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner>
 				}
 			}
 		}
-		println!("COMPLETED GET_FULLY_SIGNED_HTLC_TX");
 		htlc_tx
 	}
 
