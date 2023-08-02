@@ -1185,6 +1185,9 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner>
 				}
 			}
 		}
+		if std::env::var_os("TEST_PRINTS").is_some() {
+			println!("COMPLETED GET_FULLY_SIGNED_HTLC_TX");
+		}
 		htlc_tx
 	}
 
