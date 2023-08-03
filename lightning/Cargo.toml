@@ -51,19 +51,19 @@ backtrace = { version = "0.3", optional = true }
 core2 = { version = "0.3.0", optional = true, default-features = false }
 
 # RGB and related
-amplify = "=4.0.0"
+amplify = "=4.0.1"
 base64 = "0.13.0"
-bp-core = { version = "=0.10.5", features = ["serde"] }
-bp-seals = "=0.10.5"
-commit_verify = "=0.10.4"
+bp-core = { version = "=0.10.9", features = ["serde"] }
+bp-seals = "=0.10.9"
+commit_verify = "=0.10.5"
 futures = "0.3"
 hex = { version = "0.4" }
 reqwest = { version = "0.11", default-features = false, features = ["json", "blocking"] }
-rgb-contracts = { version = "=0.10.0-rc.2", features = ["all", "electrum"] }
-rgb_core = { package = "rgb-core", version = "=0.10.5" }
-rgb-schemata = "=0.10.0-rc.1"
-rgb-std = { version = "=0.10.3", features = ["all"] }
-rgb-wallet = { version = "=0.10.3", features = ["all"] }
+rgb-contracts = { version = "=0.10.0-rc.5", features = ["all", "electrum"] }
+rgb_core = { package = "rgb-core", version = "=0.10.7" }
+rgb-schemata = "=0.10.0-rc.3"
+rgb-std = { version = "=0.10.7", features = ["all"] }
+rgb-wallet = { version = "=0.10.7", features = ["all"] }
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 strict_encoding = "=2.5.0"

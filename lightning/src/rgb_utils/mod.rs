@@ -19,7 +19,7 @@ use bp::Outpoint as RgbOutpoint;
 use bp::Txid as BpTxid;
 use bp::seals::txout::CloseMethod;
 use commit_verify::mpc::MerkleBlock;
-use rgb::Runtime;
+use rgb::{BlockchainResolver, Runtime};
 use rgb_core::validation::Validity;
 use rgb_core::{Operation, Assign, Anchor, TransitionBundle};
 use seals::txout::TxPtr;
@@ -103,10 +103,15 @@ pub struct TransferInfo {
 	pub vout: u32,
 }
 
+/// Get a blockchain resolver
+pub fn get_resolver(ldk_data_dir: &Path) -> BlockchainResolver {
+	let electrum_url = fs::read_to_string(ldk_data_dir.join("electrum_url")).expect("able to read");
+	BlockchainResolver::with(&electrum_url).expect("able to get resolver")
+}
+
 /// Get an instance of the RGB runtime
 pub fn get_rgb_runtime(ldk_data_dir: &Path) -> Runtime {
 	let rgb_network_str = fs::read_to_string(ldk_data_dir.join("rgb_network")).expect("able to read");
-	let electrum_url = fs::read_to_string(ldk_data_dir.join("electrum_url")).expect("able to read");
 	let lock_file_path = ldk_data_dir.join(RGB_RUNTIME_LOCK_FILE);
 	loop {
 		match OpenOptions::new().write(true).create_new(true).open(lock_file_path.clone()) {
@@ -116,8 +121,7 @@ pub fn get_rgb_runtime(ldk_data_dir: &Path) -> Runtime {
 	}
 	Runtime::load(
 		ldk_data_dir.to_path_buf(),
-		Chain::from_str(&rgb_network_str).unwrap(),
-		&electrum_url).expect("RGB runtime should be available")
+		Chain::from_str(&rgb_network_str).unwrap()).expect("RGB runtime should be available")
 }
 
 /// Drop the lock file for write access to the RGB runtime
@@ -164,9 +168,9 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 
 		let htlc_payment_hash = hex::encode(htlc.payment_hash.0);
 		let htlc_proxy_id = format!("{chan_id}{htlc_payment_hash}");
-		let rgb_payment_info_path = ldk_data_dir.clone().join(htlc_proxy_id);
+		let rgb_payment_info_path = ldk_data_dir.join(htlc_proxy_id);
 
-		let rgb_payment_info_hash_path = ldk_data_dir.clone().join(htlc_payment_hash);
+		let rgb_payment_info_hash_path = ldk_data_dir.join(htlc_payment_hash);
 		if rgb_payment_info_hash_path.exists() {
 			let mut rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path);
 			rgb_payment_info.local_rgb_amount = rgb_info.local_rgb_amount;
@@ -277,7 +281,7 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 	let modified_tx = psbt.extract_tx();
 	let txid = modified_tx.txid();
 	commitment_tx.built = BuiltCommitmentTransaction {
-		transaction: modified_tx.clone(),
+		transaction: modified_tx,
 		txid,
 	};
 
@@ -460,7 +464,7 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 	let psbt = PartiallySignedTransaction::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 	let txid = modified_tx.txid();
-	closing_tx.built = modified_tx.clone();
+	closing_tx.built = modified_tx;
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo {
@@ -548,18 +552,19 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	let consignment = consignment_res.expect("successful get_consignment proxy call").result.expect("result");
 	let consignment_bytes = base64::decode(consignment).expect("valid consignment");
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", funding_txid));
-	fs::write(consignment_path.clone(), consignment_bytes.clone()).expect("unable to write file");
+	fs::write(consignment_path, consignment_bytes.clone()).expect("unable to write file");
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", hex::encode(temporary_channel_id)));
 	fs::write(consignment_path.clone(), consignment_bytes).expect("unable to write file");
 	let consignment = Bindle::<RgbTransfer>::load(consignment_path).expect("successful consignment load");
 	let transfer: RgbTransfer = consignment.clone().unbindle();
 
 	let mut runtime = get_rgb_runtime(ldk_data_dir);
+	let mut resolver = get_resolver(ldk_data_dir);
 
 	let funding_seal = BlindSeal::with_blinding(CloseMethod::OpretFirst, TxPtr::WitnessTx, 0, STATIC_BLINDING);
 	runtime.store_seal_secret(funding_seal).expect("valid seal");
 
-	let validated_transfer = match transfer.clone().validate(runtime.resolver()) {
+	let validated_transfer = match transfer.clone().validate(&mut resolver) {
 		Ok(consignment) => consignment,
 		Err(consignment) => consignment,
 	};
@@ -569,15 +574,15 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 		return Err(MsgHandleErrInternal::send_err_msg_no_close("Invalid RGB consignment for funding".to_owned(), *temporary_channel_id));
 	}
 
-	let mut minimal_contract = transfer.clone().into_contract();
+	let mut minimal_contract = transfer.into_contract();
 	minimal_contract.bundles = none!();
 	minimal_contract.terminals = none!();
-	let minimal_contract_validated = match minimal_contract.clone().validate(runtime.resolver()) {
+	let minimal_contract_validated = match minimal_contract.validate(&mut resolver) {
 		Ok(consignment) => consignment,
 		Err(consignment) => consignment,
 	};
 	runtime
-		.import_contract(minimal_contract_validated)
+		.import_contract(minimal_contract_validated, &mut resolver)
 		.expect("failure importing issued contract");
 
 	let contract_id = consignment.contract_id();
@@ -602,7 +607,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 			}
 		}
 	};
-	let _status = runtime.accept_transfer(validated_transfer.clone(), true).expect("valid transfer");
+	let _status = runtime.accept_transfer(validated_transfer, &mut resolver, true).expect("valid transfer");
 
 	drop(runtime);
 	drop_rgb_runtime(ldk_data_dir);
