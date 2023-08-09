@@ -35,10 +35,16 @@ pub struct JsonRpcResponse<R> {
     pub(crate) error: Option<JsonRpcError>,
 }
 
-/// Blinded UTXO parameter
 #[derive(Debug, Deserialize, Serialize)]
-pub struct BlindedUtxoParam {
-    blinded_utxo: String,
+pub(crate) struct RecipientIDParam {
+    recipient_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct GetConsignmentResponse {
+    pub(crate) consignment: String,
+    pub(crate) txid: String,
+    pub(crate) vout: Option<u32>,
 }
 
 fn get_blocking_client() -> BlockingClient {
@@ -50,20 +56,20 @@ fn get_blocking_client() -> BlockingClient {
 
 pub(crate) fn get_consignment(
     url: &str,
-    consignment_id: String,
-) -> Result<JsonRpcResponse<String>, reqwest::Error> {
+    recipient_id: String,
+) -> Result<JsonRpcResponse<GetConsignmentResponse>, reqwest::Error> {
     task::block_in_place(|| {
         let body = JsonRpcRequest {
             method: s!("consignment.get"),
             jsonrpc: s!("2.0"),
             id: None,
-            params: Some(BlindedUtxoParam { blinded_utxo: consignment_id }),
+            params: Some(RecipientIDParam { recipient_id }),
         };
         get_blocking_client()
             .post(url)
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()?
-            .json::<JsonRpcResponse<String>>()
+            .json::<JsonRpcResponse<GetConsignmentResponse>>()
     })
 }

@@ -10,22 +10,23 @@ use crate::ln::channel::ChannelError;
 
 use alloc::collections::BTreeMap;
 use amplify::none;
-use bitcoin::{OutPoint as BtcOutPoint, TxOut, Script};
+use bitcoin::{TxOut, Script};
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::psbt::PartiallySignedTransaction;
 use bitcoin_30::psbt::PartiallySignedTransaction as RgbPsbt;
 use bitcoin_30::hashes::Hash;
 use bp::Outpoint as RgbOutpoint;
 use bp::Txid as BpTxid;
-use bp::seals::txout::CloseMethod;
+use bp::seals::txout::blind::BlindSeal;
+use bp::seals::txout::{CloseMethod, TxPtr};
 use commit_verify::mpc::MerkleBlock;
-use rgb::{BlockchainResolver, Runtime};
+use rgb::BlockchainResolver;
 use rgb_core::validation::Validity;
 use rgb_core::{Operation, Assign, Anchor, TransitionBundle};
-use seals::txout::TxPtr;
-use seals::txout::blind::BlindSeal;
+use rgb_lib::BitcoinNetwork;
+use rgb_lib::utils::{load_rgb_runtime, RgbRuntime};
 use serde::{Deserialize, Serialize};
-use rgbstd::{Chain, Txid as RgbTxid};
+use rgbstd::Txid as RgbTxid;
 use rgbstd::containers::{Transfer as RgbTransfer, Bindle, BuilderSeal};
 use rgbstd::contract::{ContractId, GraphSeal};
 use rgbstd::interface::TypedState;
@@ -36,19 +37,16 @@ use rgbwallet::psbt::{PsbtDbc, RgbExt, RgbInExt};
 use rgbwallet::psbt::opret::OutputOpret;
 use strict_encoding::{TypeName, FieldName};
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::convert::TryFrom;
 use std::path::{PathBuf, Path};
 use std::str::FromStr;
-use std::{thread, time};
 
 
 use self::proxy::get_consignment;
 
 /// Static blinding costant (will be removed in the future)
 pub const STATIC_BLINDING: u64 = 777;
-
-const RGB_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
 
 /// RGB channel info
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,22 +72,6 @@ pub struct RgbPaymentInfo {
 	pub remote_rgb_amount: u64,
 }
 
-/// RGB UTXO
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RgbUtxo {
-	/// Outpoint
-	pub outpoint: BtcOutPoint,
-	/// Whether the UTXO is colored
-	pub colored: bool,
-}
-
-/// RGB UTXO list
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RgbUtxos {
-	/// The list of RGB UTXOs
-	pub utxos: Vec<RgbUtxo>,
-}
-
 /// RGB transfer info
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransferInfo {
@@ -99,34 +81,25 @@ pub struct TransferInfo {
 	pub bundles: BTreeMap<ContractId, TransitionBundle>,
 	/// Transfer contract ID
 	pub contract_id: ContractId,
-	/// Transfer vout
-	pub vout: u32,
+	/// Transfer RGB amount
+	pub rgb_amount: u64,
 }
 
-/// Get a blockchain resolver
-pub fn get_resolver(ldk_data_dir: &Path) -> BlockchainResolver {
+fn _get_resolver(ldk_data_dir: &Path) -> BlockchainResolver {
 	let electrum_url = fs::read_to_string(ldk_data_dir.join("electrum_url")).expect("able to read");
 	BlockchainResolver::with(&electrum_url).expect("able to get resolver")
 }
 
-/// Get an instance of the RGB runtime
-pub fn get_rgb_runtime(ldk_data_dir: &Path) -> Runtime {
-	let rgb_network_str = fs::read_to_string(ldk_data_dir.join("rgb_network")).expect("able to read");
-	let lock_file_path = ldk_data_dir.join(RGB_RUNTIME_LOCK_FILE);
-	loop {
-		match OpenOptions::new().write(true).create_new(true).open(lock_file_path.clone()) {
-			Ok(_) => break,
-			Err(_) => thread::sleep(time::Duration::from_millis(400)),
-		}
-	}
-	Runtime::load(
-		ldk_data_dir.to_path_buf(),
-		Chain::from_str(&rgb_network_str).unwrap()).expect("RGB runtime should be available")
+fn _get_rgb_wallet_dir(ldk_data_dir: &Path) -> PathBuf {
+	let wallet_fingerprint = fs::read_to_string(ldk_data_dir.join("wallet_fingerprint")).expect("able to read");
+	ldk_data_dir.parent().unwrap().join(wallet_fingerprint)
 }
 
-/// Drop the lock file for write access to the RGB runtime
-pub fn drop_rgb_runtime(ldk_data_dir: &Path) {
-	fs::remove_file(ldk_data_dir.join(RGB_RUNTIME_LOCK_FILE)).expect("should be able to delete file")
+/// Get an instance of the RGB runtime
+pub fn get_rgb_runtime(ldk_data_dir: &Path) -> RgbRuntime {
+	let bitcoin_network_str = fs::read_to_string(ldk_data_dir.join("bitcoin_network")).expect("able to read");
+	let bitcoin_network = BitcoinNetwork::from_str(&bitcoin_network_str).unwrap();
+	load_rgb_runtime(_get_rgb_wallet_dir(ldk_data_dir), bitcoin_network).expect("RGB runtime should be available")
 }
 
 /// Read TransferInfo file
@@ -158,7 +131,7 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 	let mut rgb_received_htlc = 0;
 	let mut last_rgb_payment_info = None;
 	let mut htlc_vouts: Vec<u32> = vec![];
-	let mut asset_transition_builder = runtime.transition_builder(rgb_info.contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
+	let mut asset_transition_builder = runtime.runtime.transition_builder(rgb_info.contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
 	let assignment_id = asset_transition_builder
 		.assignments_type(&FieldName::from("beneficiary")).expect("valid assignment");
 
@@ -200,10 +173,12 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 			rgb_offered_htlc += rgb_payment_info.amount
 		};
 
-		let htlc_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, htlc_vout, STATIC_BLINDING));
-		beneficiaries.push(htlc_seal);
-		asset_transition_builder = asset_transition_builder
-			.add_raw_state_static(assignment_id, htlc_seal, TypedState::Amount(rgb_payment_info.amount)).expect("ok");
+		if rgb_payment_info.amount > 0 {
+			let htlc_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, htlc_vout, STATIC_BLINDING));
+			beneficiaries.push(htlc_seal);
+			asset_transition_builder = asset_transition_builder
+				.add_raw_state_static(assignment_id, htlc_seal, TypedState::Amount(rgb_payment_info.amount)).expect("ok");
+		}
 
 		last_rgb_payment_info = Some(rgb_payment_info);
 	}
@@ -224,14 +199,18 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 	let (vout_p2wpkh, _) = non_htlc_outputs.iter().find(|(_, txout)| txout.script_pubkey.is_v0_p2wpkh()).unwrap();
 	let (vout_p2wsh, _) = non_htlc_outputs.iter().find(|(index, _)| index != vout_p2wpkh).unwrap();
 
-	let seal_p2wpkh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wpkh, STATIC_BLINDING));
-	beneficiaries.push(seal_p2wpkh);
-	asset_transition_builder = asset_transition_builder
-		.add_raw_state_static(assignment_id, seal_p2wpkh, TypedState::Amount(vout_p2wpkh_amt)).expect("ok");
-	let seal_p2wsh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wsh, STATIC_BLINDING));
-	beneficiaries.push(seal_p2wsh);
-	asset_transition_builder = asset_transition_builder
-		.add_raw_state_static(assignment_id, seal_p2wsh, TypedState::Amount(vout_p2wsh_amt)).expect("ok");
+	if vout_p2wpkh_amt > 0 {
+		let seal_p2wpkh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wpkh, STATIC_BLINDING));
+		beneficiaries.push(seal_p2wpkh);
+		asset_transition_builder = asset_transition_builder
+			.add_raw_state_static(assignment_id, seal_p2wpkh, TypedState::Amount(vout_p2wpkh_amt)).expect("ok");
+	}
+	if vout_p2wsh_amt > 0 {
+		let seal_p2wsh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wsh, STATIC_BLINDING));
+		beneficiaries.push(seal_p2wsh);
+		asset_transition_builder = asset_transition_builder
+			.add_raw_state_static(assignment_id, seal_p2wsh, TypedState::Amount(vout_p2wsh_amt)).expect("ok");
+	}
 
 	let prev_outputs = psbt
 		.unsigned_tx
@@ -240,12 +219,12 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 		.map(|txin| txin.previous_output)
 		.map(|outpoint| RgbOutpoint::new(outpoint.txid.to_byte_array().into(), outpoint.vout))
 		.collect::<Vec<_>>();
-	for (opout, _state) in runtime.state_for_outpoints(rgb_info.contract_id, prev_outputs.iter().copied()).expect("ok") {
+	for (opout, _state) in runtime.runtime.state_for_outpoints(rgb_info.contract_id, prev_outputs.iter().copied()).expect("ok") {
 		asset_transition_builder = asset_transition_builder.add_input(opout).expect("valid input");
 	}
 	let transition = asset_transition_builder
 		.complete_transition(rgb_info.contract_id).expect("should complete transition");
-	let inputs = vec![RgbOutpoint::new(RgbTxid::from_str(&funding_outpoint.txid.to_string()).unwrap(), funding_outpoint.index as u32)];
+	let inputs = [RgbOutpoint::new(RgbTxid::from_str(&funding_outpoint.txid.to_string()).unwrap(), funding_outpoint.index as u32)];
 	for (input, txin) in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input) {
 		let prevout = txin.previous_output;
 		let outpoint = RgbOutpoint::new(prevout.txid.to_byte_array().into(), prevout.vout);
@@ -274,9 +253,6 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 	psbt.rgb_bundle_to_lnpbp4().expect("ok");
 	let anchor = psbt.dbc_conclude_static(CloseMethod::OpretFirst).expect("should conclude");
 
-	drop(runtime);
-	drop_rgb_runtime(ldk_data_dir);
-
 	let psbt = PartiallySignedTransaction::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 	let txid = modified_tx.txid();
@@ -285,21 +261,36 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 		txid,
 	};
 
-	// save RGB transfer data to disk
-	let transfer_info = TransferInfo {
-		anchor,
-		bundles,
-		contract_id: rgb_info.contract_id,
-		vout: *vout_p2wpkh,
-	};
-	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
-	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
+    // save RGB transfer data to disk
+	if counterparty {
+		let transfer_info = TransferInfo {
+			anchor,
+			bundles,
+			contract_id: rgb_info.contract_id,
+			rgb_amount: vout_p2wpkh_amt + rgb_offered_htlc,
+		};
+		let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
+		write_rgb_transfer_info(&transfer_info_path, &transfer_info);
+	} else {
+		let transfer_info = TransferInfo {
+			anchor,
+			bundles,
+			contract_id: rgb_info.contract_id,
+			rgb_amount: vout_p2wsh_amt + rgb_received_htlc,
+		};
+		let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
+		write_rgb_transfer_info(&transfer_info_path, &transfer_info);
+	}
 
 	Ok(())
 }
 
 /// Color HTLC transaction
 pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitment, ldk_data_dir: &Path) -> Result<(), ChannelError> {
+	if htlc.amount_rgb == 0 {
+		return Ok(())
+	}
+
 	htlc_tx.output.push(TxOut { value: 0, script_pubkey: Script::new_op_return(&[1]) });
 	let psbt = PartiallySignedTransaction::from_unsigned_tx(htlc_tx.clone()).expect("valid transaction");
 	let mut psbt = RgbPsbt::from_str(&psbt.to_string()).unwrap();
@@ -314,7 +305,7 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 	let contract_id = transfer_info.contract_id;
 
 	let mut beneficiaries = vec![];
-	let mut asset_transition_builder = runtime.transition_builder(contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
+	let mut asset_transition_builder = runtime.runtime.transition_builder(contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
 	let assignment_id = asset_transition_builder
 		.assignments_type(&FieldName::from("beneficiary")).expect("valid assignment");
 
@@ -331,12 +322,12 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 		.map(|txin| txin.previous_output)
 		.map(|outpoint| RgbOutpoint::new(outpoint.txid.to_byte_array().into(), outpoint.vout))
 		.collect::<Vec<_>>();
-	for (opout, _state) in runtime.state_for_outpoints(contract_id, prev_outputs.iter().copied()).expect("ok") {
+	for (opout, _state) in runtime.runtime.state_for_outpoints(contract_id, prev_outputs.iter().copied()).expect("ok") {
 		asset_transition_builder = asset_transition_builder.add_input(opout).expect("valid input");
 	}
 	let transition = asset_transition_builder
 		.complete_transition(contract_id).expect("should complete transition");
-	let inputs = vec![RgbOutpoint::new(RgbTxid::from_str(&commitment_txid.to_string()).unwrap(), htlc_tx.input.first().unwrap().previous_output.vout)];
+	let inputs = [RgbOutpoint::new(RgbTxid::from_str(&commitment_txid.to_string()).unwrap(), htlc_tx.input.first().unwrap().previous_output.vout)];
 	for (input, txin) in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input) {
 		let prevout = txin.previous_output;
 		let outpoint = RgbOutpoint::new(prevout.txid.to_byte_array().into(), prevout.vout);
@@ -365,9 +356,6 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 	psbt.rgb_bundle_to_lnpbp4().expect("ok");
 	let anchor = psbt.dbc_conclude_static(CloseMethod::OpretFirst).expect("should conclude");
 
-	drop(runtime);
-	drop_rgb_runtime(ldk_data_dir);
-
 	let psbt = PartiallySignedTransaction::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 	let modified_txid = &modified_tx.txid();
@@ -378,7 +366,7 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 		anchor,
 		bundles,
 		contract_id,
-		vout: seal_vout,
+		rgb_amount: htlc.amount_rgb,
 	};
 	let transfer_info_path = ldk_data_dir.join(format!("{modified_txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
@@ -404,18 +392,22 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 	let counterparty_vout_amount = rgb_info.remote_rgb_amount;
 
 	let mut beneficiaries = vec![];
-	let mut asset_transition_builder = runtime.transition_builder(rgb_info.contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
+	let mut asset_transition_builder = runtime.runtime.transition_builder(rgb_info.contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
 	let assignment_id = asset_transition_builder
 		.assignments_type(&FieldName::from("beneficiary")).expect("valid assignment");
 
-	let holder_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, holder_vout as u32, STATIC_BLINDING));
-	beneficiaries.push(holder_seal);
-	asset_transition_builder = asset_transition_builder
-		.add_raw_state_static(assignment_id, holder_seal, TypedState::Amount(holder_vout_amount)).expect("ok");
-	let counterparty_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, counterparty_vout as u32, STATIC_BLINDING));
-	beneficiaries.push(counterparty_seal);
-	asset_transition_builder = asset_transition_builder
-		.add_raw_state_static(assignment_id, counterparty_seal, TypedState::Amount(counterparty_vout_amount)).expect("ok");
+	if holder_vout_amount > 0 {
+		let holder_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, holder_vout as u32, STATIC_BLINDING));
+		beneficiaries.push(holder_seal);
+		asset_transition_builder = asset_transition_builder
+			.add_raw_state_static(assignment_id, holder_seal, TypedState::Amount(holder_vout_amount)).expect("ok");
+	}
+	if counterparty_vout_amount > 0 {
+		let counterparty_seal = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, counterparty_vout as u32, STATIC_BLINDING));
+		beneficiaries.push(counterparty_seal);
+		asset_transition_builder = asset_transition_builder
+			.add_raw_state_static(assignment_id, counterparty_seal, TypedState::Amount(counterparty_vout_amount)).expect("ok");
+	}
 
 	let prev_outputs = psbt
 		.unsigned_tx
@@ -424,12 +416,12 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 		.map(|txin| txin.previous_output)
 		.map(|outpoint| RgbOutpoint::new(outpoint.txid.to_byte_array().into(), outpoint.vout))
 		.collect::<Vec<_>>();
-	for (opout, _state) in runtime.state_for_outpoints(rgb_info.contract_id, prev_outputs.iter().copied()).expect("ok") {
+	for (opout, _state) in runtime.runtime.state_for_outpoints(rgb_info.contract_id, prev_outputs.iter().copied()).expect("ok") {
 		asset_transition_builder = asset_transition_builder.add_input(opout).expect("valid input");
 	}
 	let transition = asset_transition_builder
 		.complete_transition(rgb_info.contract_id).expect("should complete transition");
-	let inputs = vec![RgbOutpoint::new(RgbTxid::from_str(&funding_outpoint.txid.to_string()).unwrap(), funding_outpoint.index as u32)];
+	let inputs = [RgbOutpoint::new(RgbTxid::from_str(&funding_outpoint.txid.to_string()).unwrap(), funding_outpoint.index as u32)];
 	for (input, txin) in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input) {
 		let prevout = txin.previous_output;
 		let outpoint = RgbOutpoint::new(prevout.txid.to_byte_array().into(), prevout.vout);
@@ -458,9 +450,6 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 	psbt.rgb_bundle_to_lnpbp4().expect("ok");
 	let anchor = psbt.dbc_conclude_static(CloseMethod::OpretFirst).expect("should conclude");
 
-	drop(runtime);
-	drop_rgb_runtime(ldk_data_dir);
-
 	let psbt = PartiallySignedTransaction::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 	let txid = modified_tx.txid();
@@ -471,7 +460,7 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 		anchor,
 		bundles,
 		contract_id: rgb_info.contract_id,
-		vout: holder_vout as u32,
+		rgb_amount: holder_vout_amount,
 	};
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
@@ -479,9 +468,14 @@ pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, 
 	Ok(())
 }
 
+/// Get RgbPaymentInfo file path
+pub fn get_rgb_payment_info_path(payment_hash: &PaymentHash, ldk_data_dir: &Path) -> PathBuf {
+	ldk_data_dir.join(hex::encode(payment_hash.0))
+}
+
 /// Get RgbPaymentInfo file
 pub fn get_rgb_payment_info(payment_hash: &PaymentHash, ldk_data_dir: &Path) -> RgbPaymentInfo {
-	let rgb_payment_info_path = ldk_data_dir.join(hex::encode(payment_hash.0));
+	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir);
 	parse_rgb_payment_info(&rgb_payment_info_path)
 }
 
@@ -528,8 +522,10 @@ pub(crate) fn rename_rgb_files(channel_id: &[u8; 32], temporary_channel_id: &[u8
 	fs::rename(temporary_channel_id_path, channel_id_path).expect("rename ok");
 
 	let funding_consignment_tmp = ldk_data_dir.join(format!("consignment_{}", temp_chan_id));
-	let funding_consignment = ldk_data_dir.join(format!("consignment_{}", chan_id));
-	fs::rename(funding_consignment_tmp, funding_consignment).expect("rename ok");
+	if funding_consignment_tmp.exists() {
+		let funding_consignment = ldk_data_dir.join(format!("consignment_{}", chan_id));
+		fs::rename(funding_consignment_tmp, funding_consignment).expect("rename ok");
+	}
 }
 
 /// Handle funding on the receiver side
@@ -549,8 +545,8 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
 		return Err(MsgHandleErrInternal::send_err_msg_no_close("Failed to find RGB consignment".to_owned(), *temporary_channel_id));
 	}
-	let consignment = consignment_res.expect("successful get_consignment proxy call").result.expect("result");
-	let consignment_bytes = base64::decode(consignment).expect("valid consignment");
+	let consignment_res = consignment_res.expect("successful get_consignment proxy call").result.expect("result");
+	let consignment_bytes = base64::decode(consignment_res.consignment).expect("valid consignment");
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", funding_txid));
 	fs::write(consignment_path, consignment_bytes.clone()).expect("unable to write file");
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", hex::encode(temporary_channel_id)));
@@ -559,10 +555,10 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	let transfer: RgbTransfer = consignment.clone().unbindle();
 
 	let mut runtime = get_rgb_runtime(ldk_data_dir);
-	let mut resolver = get_resolver(ldk_data_dir);
+	let mut resolver = _get_resolver(ldk_data_dir);
 
 	let funding_seal = BlindSeal::with_blinding(CloseMethod::OpretFirst, TxPtr::WitnessTx, 0, STATIC_BLINDING);
-	runtime.store_seal_secret(funding_seal).expect("valid seal");
+	runtime.runtime.store_seal_secret(funding_seal).expect("valid seal");
 
 	let validated_transfer = match transfer.clone().validate(&mut resolver) {
 		Ok(consignment) => consignment,
@@ -570,7 +566,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	};
 	let validation_status = validated_transfer.clone().into_validation_status().unwrap();
 	let validity = validation_status.validity();
-	if !vec![Validity::Valid, Validity::UnminedTerminals].contains(&validity) {
+	if ![Validity::Valid, Validity::UnminedTerminals].contains(&validity) {
 		return Err(MsgHandleErrInternal::send_err_msg_no_close("Invalid RGB consignment for funding".to_owned(), *temporary_channel_id));
 	}
 
@@ -581,7 +577,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 		Ok(consignment) => consignment,
 		Err(consignment) => consignment,
 	};
-	runtime
+	runtime.runtime
 		.import_contract(minimal_contract_validated, &mut resolver)
 		.expect("failure importing issued contract");
 
@@ -607,10 +603,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 			}
 		}
 	};
-	let _status = runtime.accept_transfer(validated_transfer, &mut resolver, true).expect("valid transfer");
-
-	drop(runtime);
-	drop_rgb_runtime(ldk_data_dir);
+	let _status = runtime.runtime.accept_transfer(validated_transfer, &mut resolver, true).expect("valid transfer");
 
 	let rgb_info_path = ldk_data_dir.join(hex::encode(temporary_channel_id));
 	let rgb_info = RgbInfo {
