@@ -47,6 +47,12 @@ use self::proxy::get_consignment;
 
 /// Static blinding costant (will be removed in the future)
 pub const STATIC_BLINDING: u64 = 777;
+/// Name of the file containing the bitcoin network
+pub const BITCOIN_NETWORK_FNAME: &str = "bitcoin_network";
+/// Name of the file containing the electrum URL
+pub const ELECTRUM_URL_FNAME: &str = "electrum_url";
+/// Name of the file containing the wallet fingerprint
+pub const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
 
 /// RGB channel info
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,18 +92,18 @@ pub struct TransferInfo {
 }
 
 fn _get_resolver(ldk_data_dir: &Path) -> BlockchainResolver {
-	let electrum_url = fs::read_to_string(ldk_data_dir.join("electrum_url")).expect("able to read");
+	let electrum_url = fs::read_to_string(ldk_data_dir.parent().unwrap().join(ELECTRUM_URL_FNAME)).expect("able to read");
 	BlockchainResolver::with(&electrum_url).expect("able to get resolver")
 }
 
 fn _get_rgb_wallet_dir(ldk_data_dir: &Path) -> PathBuf {
-	let wallet_fingerprint = fs::read_to_string(ldk_data_dir.join("wallet_fingerprint")).expect("able to read");
+	let wallet_fingerprint = fs::read_to_string(ldk_data_dir.parent().unwrap().join(WALLET_FINGERPRINT_FNAME)).expect("able to read");
 	ldk_data_dir.parent().unwrap().join(wallet_fingerprint)
 }
 
 /// Get an instance of the RGB runtime
 pub fn get_rgb_runtime(ldk_data_dir: &Path) -> RgbRuntime {
-	let bitcoin_network_str = fs::read_to_string(ldk_data_dir.join("bitcoin_network")).expect("able to read");
+	let bitcoin_network_str = fs::read_to_string(ldk_data_dir.parent().unwrap().join(BITCOIN_NETWORK_FNAME)).expect("able to read");
 	let bitcoin_network = BitcoinNetwork::from_str(&bitcoin_network_str).unwrap();
 	load_rgb_runtime(_get_rgb_wallet_dir(ldk_data_dir), bitcoin_network).expect("RGB runtime should be available")
 }
