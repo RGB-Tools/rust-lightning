@@ -23,7 +23,7 @@ use commit_verify::mpc::MerkleBlock;
 use rgb::BlockchainResolver;
 use rgb_core::validation::Validity;
 use rgb_core::{Operation, Assign, Anchor, TransitionBundle};
-use rgb_lib::BitcoinNetwork;
+use rgb_lib::{BitcoinNetwork, AssetSchema};
 use rgb_lib::utils::{load_rgb_runtime, RgbRuntime};
 use serde::{Deserialize, Serialize};
 use rgbstd::Txid as RgbTxid;
@@ -558,6 +558,11 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", hex::encode(temporary_channel_id)));
 	fs::write(consignment_path.clone(), consignment_bytes).expect("unable to write file");
 	let consignment = Bindle::<RgbTransfer>::load(consignment_path).expect("successful consignment load");
+	let schema_id = consignment.schema_id().to_string();
+	match AssetSchema::from_schema_id(schema_id) {
+		Ok(AssetSchema::Nia) => {}
+		_ => return Err(MsgHandleErrInternal::send_err_msg_no_close("Unsupported RGB schema".to_owned(), *temporary_channel_id))
+	}
 	let transfer: RgbTransfer = consignment.clone().unbindle();
 
 	let mut runtime = get_rgb_runtime(ldk_data_dir);
