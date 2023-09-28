@@ -66,6 +66,7 @@ impl FilesystemPersister {
 			ES::Target: EntropySource + Sized,
 			SP::Target: SignerProvider + Sized
 	{
+		let ldk_data_dir = PathBuf::from(&self.path_to_channel_data);
 		let mut path = PathBuf::from(&self.path_to_channel_data);
 		path.push("monitors");
 		if !Path::new(&path).exists() {
@@ -105,7 +106,7 @@ impl FilesystemPersister {
 
 			let contents = fs::read(&file.path())?;
 			let mut buffer = Cursor::new(&contents);
-			match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>::read(&mut buffer, (&*entropy_source, &*signer_provider)) {
+			match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>::read(&mut buffer, (&*entropy_source, &*signer_provider, ldk_data_dir.clone())) {
 				Ok((blockhash, channel_monitor)) => {
 					if channel_monitor.get_funding_txo().0.txid != txid || channel_monitor.get_funding_txo().0.index != index {
 						return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,

@@ -962,7 +962,6 @@ impl Writeable for InMemorySigner {
 		self.channel_parameters.write(writer)?;
 		self.channel_value_satoshis.write(writer)?;
 		self.channel_keys_id.write(writer)?;
-		self.ldk_data_dir.write(writer)?;
 
 		write_tlv_fields!(writer, {});
 
@@ -970,9 +969,12 @@ impl Writeable for InMemorySigner {
 	}
 }
 
-impl<ES: Deref> ReadableArgs<ES> for InMemorySigner where ES::Target: EntropySource {
-	fn read<R: io::Read>(reader: &mut R, entropy_source: ES) -> Result<Self, DecodeError> {
+impl<ES: Deref> ReadableArgs<(ES, PathBuf)> for InMemorySigner where ES::Target: EntropySource {
+	fn read<R: io::Read>(reader: &mut R, args: (ES, PathBuf)) -> Result<Self, DecodeError> {
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
+
+		let entropy_source = args.0;
+		let ldk_data_dir = args.1;
 
 		let funding_key = Readable::read(reader)?;
 		let revocation_base_key = Readable::read(reader)?;
@@ -987,7 +989,6 @@ impl<ES: Deref> ReadableArgs<ES> for InMemorySigner where ES::Target: EntropySou
 			InMemorySigner::make_holder_keys(&secp_ctx, &funding_key, &revocation_base_key,
 				 &payment_key, &delayed_payment_base_key, &htlc_base_key);
 		let keys_id = Readable::read(reader)?;
-		let ldk_data_dir = Readable::read(reader)?;
 
 		read_tlv_fields!(reader, {});
 
@@ -1384,7 +1385,7 @@ impl SignerProvider for KeysManager {
 	}
 
 	fn read_chan_signer(&self, reader: &[u8]) -> Result<Self::Signer, DecodeError> {
-		InMemorySigner::read(&mut io::Cursor::new(reader), self)
+		InMemorySigner::read(&mut io::Cursor::new(reader), (self, self.ldk_data_dir.clone()))
 	}
 
 	fn get_destination_script(&self) -> Script {

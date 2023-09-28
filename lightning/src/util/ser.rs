@@ -44,8 +44,6 @@ use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
 
 use crate::util::byte_utils::{be48_to_array, slice_to_be48};
 
-use std::path::PathBuf;
-
 /// serialization buffer size
 pub const MAX_BUF_SIZE: usize = 64 * 1024;
 
@@ -1207,28 +1205,6 @@ impl Readable for String {
 		let v: Vec<u8> = Readable::read(r)?;
 		let ret = String::from_utf8(v).map_err(|_| DecodeError::InvalidValue)?;
 		Ok(ret)
-	}
-}
-
-impl Writeable for PathBuf {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		let path_str = self.to_string_lossy();
-		(path_str.len() as u16).write(w)?;
-		w.write_all(path_str.as_bytes())?;
-		Ok(())
-	}
-}
-
-impl Readable for PathBuf {
-	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
-		let sz: usize = <u16 as Readable>::read(r)? as usize;
-		let mut path_str_vec = Vec::with_capacity(sz);
-		path_str_vec.resize(sz, 0);
-		r.read_exact(&mut path_str_vec)?;
-		match String::from_utf8(path_str_vec) {
-			Ok(s) => return Ok(PathBuf::from(s)),
-			Err(_) => return Err(DecodeError::InvalidValue),
-		}
 	}
 }
 

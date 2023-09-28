@@ -317,8 +317,6 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner>
 
 		self.channel_transaction_parameters.write(writer)?;
 
-		self.ldk_data_dir.write(writer)?;
-
 		let mut key_data = VecWriter(Vec::new());
 		self.signer.write(&mut key_data)?;
 		assert!(key_data.0.len() < core::usize::MAX);
@@ -358,12 +356,13 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner> OnchainTxHandler<ChannelSigner>
 	}
 }
 
-impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP, u64, [u8; 32])> for OnchainTxHandler<SP::Signer> {
-	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u64, [u8; 32])) -> Result<Self, DecodeError> {
+impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP, u64, [u8; 32], PathBuf)> for OnchainTxHandler<SP::Signer> {
+	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u64, [u8; 32], PathBuf)) -> Result<Self, DecodeError> {
 		let entropy_source = args.0;
 		let signer_provider = args.1;
 		let channel_value_satoshis = args.2;
 		let channel_keys_id = args.3;
+		let ldk_data_dir = args.4;
 
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
@@ -375,8 +374,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let prev_holder_htlc_sigs = Readable::read(reader)?;
 
 		let channel_parameters = Readable::read(reader)?;
-
-		let ldk_data_dir = Readable::read(reader)?;
 
 		// Read the serialized signer bytes, but don't deserialize them, as we'll obtain our signer
 		// by re-deriving the private key material.

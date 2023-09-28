@@ -3774,9 +3774,9 @@ where
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
 
-impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP)>
+impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP, PathBuf)>
 		for (BlockHash, ChannelMonitor<SP::Signer>) {
-	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP)) -> Result<Self, DecodeError> {
+	fn read<R: io::Read>(reader: &mut R, args: (&'a ES, &'b SP, PathBuf)) -> Result<Self, DecodeError> {
 		macro_rules! unwrap_obj {
 			($key: expr) => {
 				match $key {
@@ -3786,7 +3786,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			}
 		}
 
-		let (entropy_source, signer_provider) = args;
+		let (entropy_source, signer_provider, ldk_data_dir) = args;
 
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
@@ -3963,7 +3963,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			}
 		}
 		let onchain_tx_handler: OnchainTxHandler<SP::Signer> = ReadableArgs::read(
-			reader, (entropy_source, signer_provider, channel_value_satoshis, channel_keys_id)
+			reader, (entropy_source, signer_provider, channel_value_satoshis, channel_keys_id, ldk_data_dir)
 		)?;
 
 		let lockdown_from_offchain = Readable::read(reader)?;

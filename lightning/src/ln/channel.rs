@@ -6588,7 +6588,6 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 			(29, self.temporary_channel_id, option),
 			(31, channel_pending_event_emitted, option),
 			(33, self.consignment_endpoint, required),
-			(35, self.ldk_data_dir, required),
 		});
 
 		Ok(())
@@ -6596,13 +6595,13 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 }
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
-impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)> for Channel<<SP::Target as SignerProvider>::Signer>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures, PathBuf)> for Channel<<SP::Target as SignerProvider>::Signer>
 		where
 			ES::Target: EntropySource,
 			SP::Target: SignerProvider
 {
-	fn read<R : io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)) -> Result<Self, DecodeError> {
-		let (entropy_source, signer_provider, serialized_height, our_supported_features) = args;
+	fn read<R : io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u32, &'c ChannelTypeFeatures, PathBuf)) -> Result<Self, DecodeError> {
+		let (entropy_source, signer_provider, serialized_height, our_supported_features, ldk_data_dir) = args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
 		// `user_id` used to be a single u64 value. In order to remain backwards compatible with
@@ -6868,7 +6867,6 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let mut temporary_channel_id: Option<[u8; 32]> = None;
 		let mut holder_max_accepted_htlcs: Option<u16> = None;
 		let mut consignment_endpoint: Option<RgbTransport> = None;
-		let mut ldk_data_dir: Option<PathBuf> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -6893,7 +6891,6 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			(29, temporary_channel_id, option),
 			(31, channel_pending_event_emitted, option),
 			(33, consignment_endpoint, option),
-			(35, ldk_data_dir, option),
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
@@ -7067,7 +7064,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 			consignment_endpoint: consignment_endpoint.unwrap(),
 
-			ldk_data_dir: ldk_data_dir.unwrap(),
+			ldk_data_dir,
 		})
 	}
 }

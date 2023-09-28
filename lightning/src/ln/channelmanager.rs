@@ -7559,7 +7559,7 @@ where
 		let mut pending_background_events = Vec::new();
 		for _ in 0..channel_count {
 			let mut channel: Channel<<SP::Target as SignerProvider>::Signer> = Channel::read(reader, (
-				&args.entropy_source, &args.signer_provider, best_block_height, &provided_channel_type_features(&args.default_config)
+				&args.entropy_source, &args.signer_provider, best_block_height, &provided_channel_type_features(&args.default_config), args.ldk_data_dir.clone(),
 			))?;
 			let funding_txo = channel.get_funding_txo().ok_or(DecodeError::InvalidValue)?;
 			funding_txo_set.insert(funding_txo.clone());
