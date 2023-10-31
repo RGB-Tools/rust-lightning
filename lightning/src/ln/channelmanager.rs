@@ -2726,10 +2726,10 @@ where
 		let rgb_payment_info_hash_path = self.ldk_data_dir.join(htlc_payment_hash);
 		let path = if rgb_payment_info_hash_path.exists() {
 			let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path);
-			if let Some(override_amount) = rgb_payment_info.override_route_amount {
+			if !rgb_payment_info.override_route_amount {
 				let mut path = path.clone();
 				for hop in &mut path.hops {
-					hop.rgb_amount = Some(override_amount);
+					hop.rgb_amount = Some(rgb_payment_info.amount);
 				}
 				path
 			} else {
