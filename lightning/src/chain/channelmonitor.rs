@@ -948,7 +948,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for ChannelMonitorImpl<Signe
 				writer.write_all(&$htlc_output.cltv_expiry.to_be_bytes())?;
 				writer.write_all(&$htlc_output.payment_hash.0[..])?;
 				$htlc_output.transaction_output_index.write(writer)?;
-				writer.write_all(&$htlc_output.amount_rgb.to_be_bytes())?;
+				$htlc_output.amount_rgb.write(writer)?;
 			}
 		}
 
@@ -3853,7 +3853,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 					let cltv_expiry: u32 = Readable::read(reader)?;
 					let payment_hash: PaymentHash = Readable::read(reader)?;
 					let transaction_output_index: Option<u32> = Readable::read(reader)?;
-					let amount_rgb: u64 = Readable::read(reader)?;
+					let amount_rgb: Option<u64> = Readable::read(reader)?;
 
 					HTLCOutputInCommitment {
 						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index, amount_rgb

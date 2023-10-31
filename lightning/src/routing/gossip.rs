@@ -1634,7 +1634,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			announcement_message: if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
 				{ full_msg.cloned() } else { None },
 			announcement_received_time,
-			contract_id: Some(msg.contract_id),
+			contract_id: msg.contract_id,
 		};
 
 		self.add_channel_between_nodes(msg.short_channel_id, chan_info, utxo_value)?;

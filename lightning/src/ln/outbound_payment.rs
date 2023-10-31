@@ -18,8 +18,8 @@ use crate::events::{self, PaymentFailureReason};
 use crate::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::ln::channelmanager::{ChannelDetails, HTLCSource, IDEMPOTENCY_TIMEOUT_TICKS, PaymentId};
 use crate::ln::onion_utils::HTLCFailReason;
-use crate::rgb_utils::filter_first_hops;
-use crate::routing::router::{InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters, Router};
+use crate::rgb_utils::{filter_first_hops, is_payment_rgb};
+use crate::routing::router::{InFlightHtlcs, PaymentParameters, Route, RouteParameters, Path, Router};
 use crate::util::errors::APIError;
 use crate::util::logger::Logger;
 use crate::util::time::Time;
@@ -530,7 +530,7 @@ impl OutboundPayments {
 		payment_id: PaymentId, retry_strategy: Retry, route_params: RouteParameters, router: &R,
 		first_hops: Vec<ChannelDetails>, inflight_htlcs: IH, entropy_source: &ES,
 		node_signer: &NS, best_block_height: u32, logger: &L,
-		pending_events: &Mutex<Vec<events::Event>>, send_payment_along_path: SP,
+		pending_events: &Mutex<Vec<events::Event>>, send_payment_along_path: SP
 	) -> Result<PaymentHash, RetryableSendFailure>
 	where
 		R::Target: Router,
@@ -668,7 +668,9 @@ impl OutboundPayments {
 		}
 
 		let mut filtered_first_hops = first_hops.iter().collect::<Vec<_>>();
-		let contract_id = filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops);
+		let contract_id = is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
+		});
 
 		let route = router.find_route_with_id(
 			&node_signer.get_node_id(Recipient::Node).unwrap(), &route_params,
@@ -719,7 +721,7 @@ impl OutboundPayments {
 		let route = match router.find_route_with_id(
 			&node_signer.get_node_id(Recipient::Node).unwrap(), &route_params,
 			Some(&filtered_first_hops), &inflight_htlcs(),
-			payment_hash, payment_id, contract_id,
+			payment_hash, payment_id, Some(contract_id),
 		) {
 			Ok(route) => route,
 			Err(e) => {
@@ -1441,7 +1443,7 @@ mod tests {
 	use crate::ln::msgs::{ErrorAction, LightningError};
 	use crate::ln::outbound_payment::{OutboundPayments, Retry, RetryableSendFailure};
 	use crate::routing::gossip::NetworkGraph;
-	use crate::routing::router::{InFlightHtlcs, Path, PaymentParameters, Route, RouteHop, RouteParameters};
+	use crate::routing::router::{InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters};
 	use crate::sync::{Arc, Mutex};
 	use crate::util::errors::APIError;
 	use crate::util::test_utils;

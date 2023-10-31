@@ -160,7 +160,7 @@ struct InboundHTLCOutput {
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
 	state: InboundHTLCState,
-	amount_rgb: u64,
+	amount_rgb: Option<u64>,
 }
 
 enum OutboundHTLCState {
@@ -227,7 +227,7 @@ struct OutboundHTLCOutput {
 	payment_hash: PaymentHash,
 	state: OutboundHTLCState,
 	source: HTLCSource,
-	amount_rgb: u64,
+	amount_rgb: Option<u64>,
 }
 
 /// See AwaitingRemoteRevoke ChannelState for more info
@@ -239,7 +239,7 @@ enum HTLCUpdateAwaitingACK {
 		payment_hash: PaymentHash,
 		source: HTLCSource,
 		onion_routing_packet: msgs::OnionPacket,
-		amount_rgb: u64,
+		amount_rgb: Option<u64>,
 	},
 	ClaimHTLC {
 		payment_preimage: PaymentPreimage,
@@ -754,7 +754,7 @@ pub(super) struct Channel<Signer: ChannelSigner> {
 	pending_monitor_updates: Vec<ChannelMonitorUpdate>,
 
 	/// The consignment endpoint used to exchange the RGB consignment
-	pub(super) consignment_endpoint: RgbTransport,
+	pub(super) consignment_endpoint: Option<RgbTransport>,
 
 	ldk_data_dir: PathBuf,
 }
@@ -954,7 +954,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	pub fn new_outbound<ES: Deref, SP: Deref, F: Deref>(
 		_fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
-		outbound_scid_alias: u64, consignment_endpoint: RgbTransport, ldk_data_dir: PathBuf
+		outbound_scid_alias: u64, consignment_endpoint: Option<RgbTransport>, ldk_data_dir: PathBuf
 	) -> Result<Channel<Signer>, APIError>
 	where ES::Target: EntropySource,
 	      SP::Target: SignerProvider<Signer = Signer>,
@@ -1724,7 +1724,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		                                                             keys.clone(),
 		                                                             feerate_per_kw,
 		                                                             &mut included_non_dust_htlcs,
-		                                                             &channel_parameters
+		                                                             &channel_parameters,
+		                                                             self.is_colored(),
 		);
 		let mut htlcs_included = included_non_dust_htlcs;
 		// The unwrap is safe, because all non-dust HTLCs have been assigned an output index
@@ -1814,7 +1815,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
 
 		let mut closing_transaction = ClosingTransaction::new(value_to_holder as u64, value_to_counterparty as u64, holder_shutdown_script, counterparty_shutdown_script, funding_outpoint);
-		color_closing(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut closing_transaction, &self.ldk_data_dir)?;
+		if self.is_colored() {
+			color_closing(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut closing_transaction, &self.ldk_data_dir)?;
+		}
 		Ok((closing_transaction, total_fee_satoshis))
 	}
 
@@ -2272,7 +2275,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 		let mut initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger).tx;
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.ldk_data_dir, false)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.ldk_data_dir, false)?; }
 		{
 			let trusted_tx = initial_commitment_tx.trust();
 			let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
@@ -2287,7 +2290,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?; }
 
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
@@ -2381,7 +2384,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.channel_state = ChannelState::FundingSent as u32;
 		let temporary_channel_id = self.channel_id;
 		self.channel_id = funding_txo.to_channel_id();
-		rename_rgb_files(&self.channel_id, &temporary_channel_id, &self.ldk_data_dir);
+		if self.is_colored() {
+			rename_rgb_files(&self.channel_id, &temporary_channel_id, &self.ldk_data_dir);
+		}
 		self.cur_counterparty_commitment_transaction_number -= 1;
 		self.cur_holder_commitment_transaction_number -= 1;
 
@@ -2423,7 +2428,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?; }
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 
@@ -2432,7 +2437,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let holder_signer = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 		let mut initial_commitment_tx = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &holder_signer, true, false, logger).tx;
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.ldk_data_dir, false)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.ldk_data_dir, false)?; }
 		{
 			let trusted_tx = initial_commitment_tx.trust();
 			let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
@@ -3117,7 +3122,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 
 		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, false, logger);
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false)?; }
 		let commitment_txid = {
 			let trusted_tx = commitment_stats.tx.trust();
 			let bitcoin_tx = trusted_tx.built_transaction();
@@ -3190,7 +3195,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_stats.feerate_per_kw,
 					self.get_counterparty_selected_contest_delay().unwrap(), &htlc, self.opt_anchors(),
 					false, &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
-				color_htlc(&mut htlc_tx, &htlc, &self.ldk_data_dir)?;
+				if self.is_colored() {
+					color_htlc(&mut htlc_tx, &htlc, &self.ldk_data_dir)?;
+				}
 
 				let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, self.opt_anchors(), &keys);
 				let htlc_sighashtype = if self.opt_anchors() { EcdsaSighashType::SinglePlusAnyoneCanPay } else { EcdsaSighashType::All };
@@ -3568,6 +3575,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 						log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
 						htlc.state = InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info);
 						require_commitment = true;
+
+						if let Some(amount_rgb) = htlc.amount_rgb {
+							rgb_received_htlc += amount_rgb;
+						}
 					} else if let InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info) = state {
 						match forward_info {
 							PendingHTLCStatus::Fail(fail_msg) => {
@@ -3592,7 +3603,6 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 						}
 					}
 				}
-				rgb_received_htlc += htlc.amount_rgb;
 			}
 			for htlc in pending_outbound_htlcs.iter_mut() {
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
@@ -3607,11 +3617,15 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 					require_commitment = true;
 				}
-				rgb_offered_htlc += htlc.amount_rgb;
+				if let Some(amount_rgb) = htlc.amount_rgb {
+					rgb_offered_htlc += amount_rgb;
+				}
 			}
 		}
 		self.value_to_self_msat = (self.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
-		update_rgb_channel_amount(&self.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.ldk_data_dir);
+		if self.is_colored() {
+			update_rgb_channel_amount(&self.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.ldk_data_dir);
+		}
 
 		if let Some((feerate, update_state)) = self.pending_update_fee {
 			match update_state {
@@ -3721,12 +3735,14 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let outbound_stats = self.get_outbound_pending_htlc_stats(Some(feerate_per_kw));
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
-		match color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false) {
-			Err(e) => {
-				log_debug!(logger, "Cannot color commitment: {e:?}");
-				return None;
+		if self.is_colored() {
+			match color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false) {
+				Err(e) => {
+					log_debug!(logger, "Cannot color commitment: {e:?}");
+					return None;
+				}
+				_ => {}
 			}
-			_ => {}
 		}
 		let buffer_fee_msat = Channel::<Signer>::commit_tx_fee_sat(feerate_per_kw, commitment_stats.num_nondust_htlcs + outbound_stats.on_holder_tx_holding_cell_htlcs_count as usize + CONCURRENT_INBOUND_HTLC_FEE_BUFFER as usize, self.opt_anchors()) * 1000;
 		let holder_balance_msat = commitment_stats.local_balance_msat - outbound_stats.holding_cell_msat;
@@ -4998,6 +5014,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		(self.channel_state & ChannelState::MonitorUpdateInProgress as u32) != 0
 	}
 
+	pub fn is_colored(&self) -> bool {
+		self.consignment_endpoint.is_some()
+	}
+
 	pub fn get_next_monitor_update(&self) -> Option<&ChannelMonitorUpdate> {
 		self.pending_monitor_updates.first()
 	}
@@ -5460,7 +5480,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	fn get_outbound_funding_created_signature<L: Deref>(&mut self, logger: &L) -> Result<Signature, ChannelError> where L::Target: Logger {
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.ldk_data_dir, true)?; }
 		Ok(self.holder_signer.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.secp_ctx)
 				.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0)
 	}
@@ -5503,7 +5523,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		self.channel_state = ChannelState::FundingCreated as u32;
 		self.channel_id = funding_txo.to_channel_id();
-		rename_rgb_files(&self.channel_id, &temporary_channel_id, &self.ldk_data_dir);
+		if self.is_colored() {
+			rename_rgb_files(&self.channel_id, &temporary_channel_id, &self.ldk_data_dir);
+		}
 		self.funding_transaction = Some(funding_transaction);
 
 		Ok(msgs::FundingCreated {
@@ -5542,7 +5564,12 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let counterparty_node_id = NodeId::from_pubkey(&self.get_counterparty_node_id());
 		let were_node_one = node_id.as_slice() < counterparty_node_id.as_slice();
 
-		let (rgb_info, _) = get_rgb_channel_info(&self.channel_id, &self.ldk_data_dir);
+		let contract_id = if self.is_colored() {
+			let (rgb_info, _) = get_rgb_channel_info(&self.channel_id, &self.ldk_data_dir);
+			Some(rgb_info.contract_id)
+		} else {
+			None
+		};
 		let msg = msgs::UnsignedChannelAnnouncement {
 			features: channelmanager::provided_channel_features(&user_config),
 			chain_hash,
@@ -5551,7 +5578,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			node_id_2: if were_node_one { counterparty_node_id } else { node_id },
 			bitcoin_key_1: NodeId::from_pubkey(if were_node_one { &self.get_holder_pubkeys().funding_pubkey } else { self.counterparty_funding_pubkey() }),
 			bitcoin_key_2: NodeId::from_pubkey(if were_node_one { self.counterparty_funding_pubkey() } else { &self.get_holder_pubkeys().funding_pubkey }),
-			contract_id: rgb_info.contract_id,
+			contract_id,
 			excess_data: Vec::new(),
 		};
 
@@ -5750,7 +5777,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	///
 	/// `Err`s will only be [`ChannelError::Ignore`].
 	pub fn queue_add_htlc<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
-		onion_routing_packet: msgs::OnionPacket, logger: &L, amount_rgb: u64)
+		onion_routing_packet: msgs::OnionPacket, logger: &L, amount_rgb: Option<u64>)
 	-> Result<(), ChannelError> where L::Target: Logger {
 		self
 			.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, true, logger, amount_rgb)
@@ -5779,7 +5806,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	///
 	/// `Err`s will only be [`ChannelError::Ignore`].
 	fn send_htlc<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource,
-		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool, logger: &L, amount_rgb: u64)
+		onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool, logger: &L, amount_rgb: Option<u64>)
 	-> Result<Option<msgs::UpdateAddHTLC>, ChannelError> where L::Target: Logger {
 		if (self.channel_state & (ChannelState::ChannelReady as u32 | BOTH_SIDES_SHUTDOWN_MASK)) != (ChannelState::ChannelReady as u32) {
 			return Err(ChannelError::Ignore("Cannot send HTLC until channel is fully established and we haven't started shutting down".to_owned()));
@@ -5819,7 +5846,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let keys = self.build_holder_transaction_keys(self.cur_holder_commitment_transaction_number);
 		let mut commitment_stats = self.build_commitment_transaction(self.cur_holder_commitment_transaction_number, &keys, true, true, logger);
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, false)?; }
 		if !self.is_outbound() {
 			// Check that we won't violate the remote channel reserve by adding this HTLC.
 			let htlc_candidate = HTLCCandidate::new(amount_msat, HTLCInitiator::LocalOffered);
@@ -5922,6 +5949,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
 		// is acceptable.
+		let mut rgb_received_htlc = 0;
 		for htlc in self.pending_inbound_htlcs.iter_mut() {
 			let new_state = if let &InboundHTLCState::AwaitingRemoteRevokeToAnnounce(ref forward_info) = &htlc.state {
 				Some(InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info.clone()))
@@ -5929,6 +5957,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			if let Some(state) = new_state {
 				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
 				htlc.state = state;
+
+				if let Some(amount_rgb) = htlc.amount_rgb {
+					rgb_received_htlc += amount_rgb;
+				}
 			}
 		}
 		for htlc in self.pending_outbound_htlcs.iter_mut() {
@@ -5939,6 +5971,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				mem::swap(outcome, &mut reason);
 				htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 			}
+		}
+		if self.is_colored() {
+			update_rgb_channel_amount(&self.channel_id, 0, rgb_received_htlc, &self.ldk_data_dir);
 		}
 		if let Some((feerate, update_state)) = self.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {
@@ -5975,7 +6010,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	fn build_commitment_no_state_update<L: Deref>(&self, logger: &L) -> (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>) where L::Target: Logger {
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let mut commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, true).expect("successful commitment coloring");
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, true).expect("successful commitment coloring"); }
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
 
 		#[cfg(any(test, fuzzing))]
@@ -6008,7 +6043,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let mut commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
-		color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, true)?;
+		if self.is_colored() { color_commitment(&self.channel_id, &self.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.ldk_data_dir, true)?; }
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
 		let (signature, htlc_signatures);
 
@@ -6051,7 +6086,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	///
 	/// Shorthand for calling [`Self::send_htlc`] followed by a commitment update, see docs on
 	/// [`Self::send_htlc`] and [`Self::build_commitment_no_state_update`] for more info.
-	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L, amount_rgb: u64) -> Result<Option<&ChannelMonitorUpdate>, ChannelError> where L::Target: Logger {
+	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L, amount_rgb: Option<u64>) -> Result<Option<&ChannelMonitorUpdate>, ChannelError> where L::Target: Logger {
 		let send_res = self.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, false, logger, amount_rgb);
 		if let Err(e) = &send_res { if let ChannelError::Ignore(_) = e {} else { debug_assert!(false, "Sending cannot trigger channel failure"); } }
 		match send_res? {
@@ -6587,7 +6622,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 			(28, holder_max_accepted_htlcs, option),
 			(29, self.temporary_channel_id, option),
 			(31, channel_pending_event_emitted, option),
-			(33, self.consignment_endpoint, required),
+			(33, self.consignment_endpoint, option),
 		});
 
 		Ok(())
@@ -7062,7 +7097,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 			pending_monitor_updates: Vec::new(),
 
-			consignment_endpoint: consignment_endpoint.unwrap(),
+			consignment_endpoint: consignment_endpoint,
 
 			ldk_data_dir,
 		})
