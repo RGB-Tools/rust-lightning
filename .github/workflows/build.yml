@@ -22,7 +22,6 @@ jobs:
         include:
           - toolchain: stable
             platform: ubuntu-latest
-            coverage: true
           # 1.48.0 is the MSRV for all crates except lightning-transaction-sync and Win/Mac
           - toolchain: 1.48.0
             platform: ubuntu-latest
@@ -37,11 +36,9 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v3
       - name: Install Rust ${{ matrix.toolchain }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-          profile: minimal
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ matrix.toolchain }}
+          rustup override set ${{ matrix.toolchain }}
       - name: Install no-std-check dependencies for ARM Embedded
         if: "matrix.platform == 'ubuntu-latest'"
         run: |
@@ -52,46 +49,31 @@ jobs:
         run: |
           sudo apt-get -y install shellcheck
           shellcheck ci/ci-tests.sh
-      - name: Run CI script with coverage generation
-        if: matrix.coverage
-        shell: bash # Default on Winblows is powershell
-        run: LDK_COVERAGE_BUILD=true ./ci/ci-tests.sh
       - name: Run CI script
-        if: "!matrix.coverage"
         shell: bash # Default on Winblows is powershell
-        run: ./ci/ci-tests.sh
-      - name: Install deps for kcov
-        if: matrix.coverage
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install binutils-dev libcurl4-openssl-dev zlib1g-dev libdw-dev libiberty-dev
-      - name: Install kcov
-        if: matrix.coverage
-        run: |
-          wget https://github.com/SimonKagstrom/kcov/archive/master.tar.gz
-          tar xzf master.tar.gz
-          cd kcov-master && mkdir build && cd build
-          cmake ..
-          make
-          make install DESTDIR=../../kcov-build
-          cd ../.. && rm -rf kcov-master master.tar.gz
-      - name: Generate coverage report
-        if: matrix.coverage
-        run: |
-          for file in target/debug/deps/lightning*; do
-            [ -x "${file}" ] || continue;
-            mkdir -p "target/cov/$(basename $file)";
-            ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file";
-          done
-      - name: Upload coverage
-        if: matrix.coverage
-        uses: codecov/codecov-action@v3
+        run: CI_MINIMIZE_DISK_USAGE=1 ./ci/ci-tests.sh
+
+  coverage:
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v3
         with:
+          fetch-depth: 0
+      - name: Install Rust stable toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal
+      - name: Run tests with coverage generation
+        run: |
+          cargo install cargo-llvm-cov
+          export RUSTFLAGS="-Clink-dead-code -Coverflow-checks=off"
+          cargo llvm-cov --features rest-client,rpc-client,tokio,futures,serde --codecov --hide-instantiations --output-path=target/codecov.json
           # Could you use this to fake the coverage report for your PR? Sure.
           # Will anyone be impressed by your amazing coverage? No
           # Maybe if codecov wasn't broken we wouldn't need to do this...
-          token: f421b687-4dc2-4387-ac3d-dc3b2528af57
-          fail_ci_if_error: true
+          bash <(curl -s https://codecov.io/bash) -f target/codecov.json -t "f421b687-4dc2-4387-ac3d-dc3b2528af57"
 
   benchmark:
     runs-on: ubuntu-latest
@@ -101,11 +83,9 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v3
       - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-          profile: minimal
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
       - name: Cache routing graph snapshot
         id: cache-graph
         uses: actions/cache@v3
@@ -141,23 +121,26 @@ jobs:
           cd ..
       - name: Run benchmarks on Rust ${{ matrix.toolchain }}
         run: |
-          RUSTC_BOOTSTRAP=1 cargo bench --features _bench_unstable
+          cd bench
+          RUSTFLAGS="--cfg=ldk_bench --cfg=require_route_graph_test" cargo bench
+      - name: Run benchmarks with hashbrown on Rust ${{ matrix.toolchain }}
+        run: |
+          cd bench
+          RUSTFLAGS="--cfg=ldk_bench --cfg=require_route_graph_test" cargo bench --features hashbrown
 
   check_commits:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.57.0
+      TOOLCHAIN: stable
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-          profile: minimal
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
       - name: Fetch full tree and rebase on upstream
         run: |
           git remote add upstream https://github.com/lightningdevkit/rust-lightning
@@ -178,18 +161,15 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-          profile: minimal
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
       - name: Run cargo check for release build.
         run: |
           cargo check --release
           cargo check --no-default-features --features=no-std --release
           cargo check --no-default-features --features=futures --release
           cargo doc --release
-          RUSTDOCFLAGS="--cfg=anchors" cargo doc --release
       - name: Run cargo check for Taproot build.
         run: |
           cargo check --release
@@ -197,22 +177,20 @@ jobs:
           cargo check --no-default-features --features=futures --release
           cargo doc --release
         env:
-          RUSTFLAGS: '--cfg=anchors --cfg=taproot'
-          RUSTDOCFLAGS: '--cfg=anchors --cfg=taproot'
+          RUSTFLAGS: '--cfg=taproot'
+          RUSTDOCFLAGS: '--cfg=taproot'
 
   fuzz:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: stable
+      TOOLCHAIN: 1.58
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3
-      - name: Install Rust 1.58 toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.58
-          override: true
-          profile: minimal
+      - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
       - name: Install dependencies for honggfuzz
         run: |
           sudo apt-get update
@@ -232,11 +210,9 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v3
       - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-          profile: minimal
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
       - name: Install clippy
         run: |
           rustup component add clippy

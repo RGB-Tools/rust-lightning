@@ -10,7 +10,7 @@
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, MIN_CHAN_DUST_LIMIT_SATOSHIS};
 use crate::ln::chan_utils::{HTLCOutputInCommitment, ChannelPublicKeys, HolderCommitmentTransaction, CommitmentTransaction, ChannelTransactionParameters, TrustedCommitmentTransaction, ClosingTransaction};
 use crate::ln::{chan_utils, msgs, PaymentPreimage};
-use crate::chain::keysinterface::{WriteableEcdsaChannelSigner, InMemorySigner, ChannelSigner, EcdsaChannelSigner};
+use crate::sign::{WriteableEcdsaChannelSigner, InMemorySigner, ChannelSigner, EcdsaChannelSigner};
 
 use crate::prelude::*;
 use core::cmp;
@@ -23,10 +23,10 @@ use bitcoin::util::sighash;
 use bitcoin::secp256k1;
 use bitcoin::secp256k1::{SecretKey, PublicKey};
 use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
-#[cfg(anchors)]
-use crate::events::bump_transaction::HTLCDescriptor;
+use crate::sign::HTLCDescriptor;
 use crate::util::ser::{Writeable, Writer};
 use crate::io::Error;
+use crate::ln::features::ChannelTypeFeatures;
 
 /// Initial value for revoked commitment downward counter
 pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
@@ -51,21 +51,21 @@ pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
 /// Note that before we do so we should ensure its serialization format has backwards- and
 /// forwards-compatibility prefix/suffixes!
 #[derive(Clone)]
-pub struct EnforcingSigner {
+pub struct TestChannelSigner {
 	pub inner: InMemorySigner,
 	/// Channel state used for policy enforcement
 	pub state: Arc<Mutex<EnforcementState>>,
 	pub disable_revocation_policy_check: bool,
 }
 
-impl PartialEq for EnforcingSigner {
+impl PartialEq for TestChannelSigner {
 	fn eq(&self, o: &Self) -> bool {
 		Arc::ptr_eq(&self.state, &o.state)
 	}
 }
 
-impl EnforcingSigner {
-	/// Construct an EnforcingSigner
+impl TestChannelSigner {
+	/// Construct an TestChannelSigner
 	pub fn new(inner: InMemorySigner) -> Self {
 		let state = Arc::new(Mutex::new(EnforcementState::new()));
 		Self {
@@ -75,7 +75,7 @@ impl EnforcingSigner {
 		}
 	}
 
-	/// Construct an EnforcingSigner with externally managed storage
+	/// Construct an TestChannelSigner with externally managed storage
 	///
 	/// Since there are multiple copies of this struct for each channel, some coordination is needed
 	/// so that all copies are aware of enforcement state.  A pointer to this state is provided
@@ -88,7 +88,7 @@ impl EnforcingSigner {
 		}
 	}
 
-	pub fn opt_anchors(&self) -> bool { self.inner.opt_anchors() }
+	pub fn channel_type_features(&self) -> &ChannelTypeFeatures { self.inner.channel_type_features().unwrap() }
 
 	#[cfg(test)]
 	pub fn get_enforcement_state(&self) -> MutexGuard<EnforcementState> {
@@ -96,7 +96,7 @@ impl EnforcingSigner {
 	}
 }
 
-impl ChannelSigner for EnforcingSigner {
+impl ChannelSigner for TestChannelSigner {
 	fn get_per_commitment_point(&self, idx: u64, secp_ctx: &Secp256k1<secp256k1::All>) -> PublicKey {
 		self.inner.get_per_commitment_point(idx, secp_ctx)
 	}
@@ -128,7 +128,7 @@ impl ChannelSigner for EnforcingSigner {
 	}
 }
 
-impl EcdsaChannelSigner for EnforcingSigner {
+impl EcdsaChannelSigner for TestChannelSigner {
 	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
 		self.verify_counterparty_commitment_tx(commitment_tx, secp_ctx);
 
@@ -155,11 +155,8 @@ impl EcdsaChannelSigner for EnforcingSigner {
 		Ok(())
 	}
 
-	fn sign_holder_commitment_and_htlcs(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
+	fn sign_holder_commitment(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
 		let trusted_tx = self.verify_holder_commitment_tx(commitment_tx, secp_ctx);
-		let commitment_txid = trusted_tx.txid();
-		let holder_csv = self.inner.counterparty_selected_contest_delay();
-
 		let state = self.state.lock().unwrap();
 		let commitment_number = trusted_tx.commitment_number();
 		if state.last_holder_revoked_commitment - 1 != commitment_number && state.last_holder_revoked_commitment - 2 != commitment_number {
@@ -168,33 +165,12 @@ impl EcdsaChannelSigner for EnforcingSigner {
 				       state.last_holder_revoked_commitment, commitment_number, self.inner.commitment_seed[0])
 			}
 		}
-
-		for (this_htlc, sig) in trusted_tx.htlcs().iter().zip(&commitment_tx.counterparty_htlc_sigs) {
-			assert!(this_htlc.transaction_output_index.is_some());
-			let keys = trusted_tx.keys();
-			let htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, trusted_tx.feerate_per_kw(), holder_csv, &this_htlc, self.opt_anchors(), false, &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
-
-			let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&this_htlc, self.opt_anchors(), &keys);
-
-			let sighash_type = if self.opt_anchors() {
-				EcdsaSighashType::SinglePlusAnyoneCanPay
-			} else {
-				EcdsaSighashType::All
-			};
-			let sighash = hash_to_message!(
-				&sighash::SighashCache::new(&htlc_tx).segwit_signature_hash(
-					0, &htlc_redeemscript, this_htlc.amount_msat / 1000, sighash_type,
-				).unwrap()[..]
-			);
-			secp_ctx.verify_ecdsa(&sighash, sig, &keys.countersignatory_htlc_key).unwrap();
-		}
-
-		Ok(self.inner.sign_holder_commitment_and_htlcs(commitment_tx, secp_ctx).unwrap())
+		Ok(self.inner.sign_holder_commitment(commitment_tx, secp_ctx).unwrap())
 	}
 
 	#[cfg(any(test,feature = "unsafe_revoked_tx_signing"))]
-	fn unsafe_sign_holder_commitment_and_htlcs(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
-		Ok(self.inner.unsafe_sign_holder_commitment_and_htlcs(commitment_tx, secp_ctx).unwrap())
+	fn unsafe_sign_holder_commitment(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
+		Ok(self.inner.unsafe_sign_holder_commitment(commitment_tx, secp_ctx).unwrap())
 	}
 
 	fn sign_justice_revoked_output(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
@@ -205,14 +181,38 @@ impl EcdsaChannelSigner for EnforcingSigner {
 		Ok(self.inner.sign_justice_revoked_htlc(justice_tx, input, amount, per_commitment_key, htlc, secp_ctx).unwrap())
 	}
 
-	#[cfg(anchors)]
 	fn sign_holder_htlc_transaction(
 		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
 		secp_ctx: &Secp256k1<secp256k1::All>
 	) -> Result<Signature, ()> {
-		let per_commitment_point = self.get_per_commitment_point(htlc_descriptor.per_commitment_number, secp_ctx);
+		let state = self.state.lock().unwrap();
+		if state.last_holder_revoked_commitment - 1 != htlc_descriptor.per_commitment_number &&
+			state.last_holder_revoked_commitment - 2 != htlc_descriptor.per_commitment_number
+		{
+			if !self.disable_revocation_policy_check {
+				panic!("can only sign the next two unrevoked commitment numbers, revoked={} vs requested={} for {}",
+				       state.last_holder_revoked_commitment, htlc_descriptor.per_commitment_number, self.inner.commitment_seed[0])
+			}
+		}
 		assert_eq!(htlc_tx.input[input], htlc_descriptor.unsigned_tx_input());
-		assert_eq!(htlc_tx.output[input], htlc_descriptor.tx_output(&per_commitment_point, secp_ctx));
+		assert_eq!(htlc_tx.output[input], htlc_descriptor.tx_output(secp_ctx));
+		{
+			let witness_script = htlc_descriptor.witness_script(secp_ctx);
+			let sighash_type = if self.channel_type_features().supports_anchors_zero_fee_htlc_tx() {
+				EcdsaSighashType::SinglePlusAnyoneCanPay
+			} else {
+				EcdsaSighashType::All
+			};
+			let sighash = &sighash::SighashCache::new(&*htlc_tx).segwit_signature_hash(
+				input, &witness_script, htlc_descriptor.htlc.amount_msat / 1000, sighash_type
+			).unwrap();
+			let countersignatory_htlc_key = chan_utils::derive_public_key(
+				&secp_ctx, &htlc_descriptor.per_commitment_point, &self.inner.counterparty_pubkeys().unwrap().htlc_basepoint
+			);
+			secp_ctx.verify_ecdsa(
+				&hash_to_message!(&sighash), &htlc_descriptor.counterparty_sig, &countersignatory_htlc_key
+			).unwrap();
+		}
 		Ok(self.inner.sign_holder_htlc_transaction(htlc_tx, input, htlc_descriptor, secp_ctx).unwrap())
 	}
 
@@ -221,7 +221,7 @@ impl EcdsaChannelSigner for EnforcingSigner {
 	}
 
 	fn sign_closing_transaction(&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
-		closing_tx.verify(self.inner.funding_outpoint().into_bitcoin_outpoint())
+		closing_tx.verify(self.inner.funding_outpoint().unwrap().into_bitcoin_outpoint())
 			.expect("derived different closing transaction");
 		Ok(self.inner.sign_closing_transaction(closing_tx, secp_ctx).unwrap())
 	}
@@ -243,11 +243,11 @@ impl EcdsaChannelSigner for EnforcingSigner {
 	}
 }
 
-impl WriteableEcdsaChannelSigner for EnforcingSigner {}
+impl WriteableEcdsaChannelSigner for TestChannelSigner {}
 
-impl Writeable for EnforcingSigner {
+impl Writeable for TestChannelSigner {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
-		// EnforcingSigner has two fields - `inner` ([`InMemorySigner`]) and `state`
+		// TestChannelSigner has two fields - `inner` ([`InMemorySigner`]) and `state`
 		// ([`EnforcementState`]). `inner` is serialized here and deserialized by
 		// [`SignerProvider::read_chan_signer`]. `state` is managed by [`SignerProvider`]
 		// and will be serialized as needed by the implementation of that trait.
@@ -256,21 +256,23 @@ impl Writeable for EnforcingSigner {
 	}
 }
 
-impl EnforcingSigner {
+impl TestChannelSigner {
 	fn verify_counterparty_commitment_tx<'a, T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &'a CommitmentTransaction, secp_ctx: &Secp256k1<T>) -> TrustedCommitmentTransaction<'a> {
-		commitment_tx.verify(&self.inner.get_channel_parameters().as_counterparty_broadcastable(),
-		                     self.inner.counterparty_pubkeys(), self.inner.pubkeys(), secp_ctx)
-			.expect("derived different per-tx keys or built transaction")
+		commitment_tx.verify(
+			&self.inner.get_channel_parameters().unwrap().as_counterparty_broadcastable(),
+			self.inner.counterparty_pubkeys().unwrap(), self.inner.pubkeys(), secp_ctx
+		).expect("derived different per-tx keys or built transaction")
 	}
 
 	fn verify_holder_commitment_tx<'a, T: secp256k1::Signing + secp256k1::Verification>(&self, commitment_tx: &'a CommitmentTransaction, secp_ctx: &Secp256k1<T>) -> TrustedCommitmentTransaction<'a> {
-		commitment_tx.verify(&self.inner.get_channel_parameters().as_holder_broadcastable(),
-		                     self.inner.pubkeys(), self.inner.counterparty_pubkeys(), secp_ctx)
-			.expect("derived different per-tx keys or built transaction")
+		commitment_tx.verify(
+			&self.inner.get_channel_parameters().unwrap().as_holder_broadcastable(),
+			self.inner.pubkeys(), self.inner.counterparty_pubkeys().unwrap(), secp_ctx
+		).expect("derived different per-tx keys or built transaction")
 	}
 }
 
-/// The state used by [`EnforcingSigner`] in order to enforce policy checks
+/// The state used by [`TestChannelSigner`] in order to enforce policy checks
 ///
 /// This structure is maintained by KeysInterface since we may have multiple copies of
 /// the signer and they must coordinate their state.

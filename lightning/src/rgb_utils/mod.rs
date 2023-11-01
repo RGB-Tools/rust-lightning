@@ -3,7 +3,7 @@
 pub mod proxy;
 
 use crate::chain::transaction::OutPoint;
-use crate::ln::PaymentHash;
+use crate::ln::{PaymentHash, ChannelId};
 use crate::ln::chan_utils::{BuiltCommitmentTransaction, ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment};
 use crate::ln::channelmanager::{ChannelDetails, MsgHandleErrInternal};
 use crate::ln::channel::ChannelError;
@@ -12,6 +12,7 @@ use alloc::collections::BTreeMap;
 use amplify::none;
 use bitcoin::{TxOut, Script};
 use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::hashes::hex::ToHex;
 use bitcoin::psbt::PartiallySignedTransaction;
 use bitcoin_30::psbt::PartiallySignedTransaction as RgbPsbt;
 use bitcoin_30::hashes::Hash;
@@ -128,7 +129,7 @@ pub fn write_rgb_transfer_info(path: &PathBuf, info: &TransferInfo) {
 }
 
 /// Color commitment transaction
-pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoint, commitment_tx: &mut CommitmentTransaction, ldk_data_dir: &Path, counterparty: bool) -> Result<(), ChannelError> {
+pub(crate) fn color_commitment(channel_id: &ChannelId, funding_outpoint: &OutPoint, commitment_tx: &mut CommitmentTransaction, ldk_data_dir: &Path, counterparty: bool) -> Result<(), ChannelError> {
 	let mut transaction = commitment_tx.clone().built.transaction;
 	transaction.output.push(TxOut { value: 0, script_pubkey: Script::new_op_return(&[1]) });
 	let psbt = PartiallySignedTransaction::from_unsigned_tx(transaction.clone()).expect("valid transaction");
@@ -138,7 +139,7 @@ pub(crate) fn color_commitment(channel_id: &[u8; 32], funding_outpoint: &OutPoin
 
 	let (rgb_info, _) = get_rgb_channel_info(channel_id, ldk_data_dir);
 
-	let chan_id = hex::encode(channel_id);
+	let chan_id = channel_id.to_hex();
 	let mut beneficiaries = vec![];
 	let mut rgb_offered_htlc = 0;
 	let mut rgb_received_htlc = 0;
@@ -390,7 +391,7 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 }
 
 /// Color closing transaction
-pub(crate) fn color_closing(channel_id: &[u8; 32], funding_outpoint: &OutPoint, closing_tx: &mut ClosingTransaction, ldk_data_dir: &Path) -> Result<(), ChannelError> {
+pub(crate) fn color_closing(channel_id: &ChannelId, funding_outpoint: &OutPoint, closing_tx: &mut ClosingTransaction, ldk_data_dir: &Path) -> Result<(), ChannelError> {
 	let mut transaction = closing_tx.clone().built;
 	transaction.output.push(TxOut { value: 0, script_pubkey: Script::new_op_return(&[1]) });
 	let psbt = PartiallySignedTransaction::from_unsigned_tx(transaction.clone()).expect("valid transaction");
@@ -501,16 +502,16 @@ pub fn parse_rgb_payment_info(rgb_payment_info_path: &PathBuf) -> RgbPaymentInfo
 }
 
 /// Get RgbInfo file
-pub fn get_rgb_channel_info(channel_id: &[u8; 32], ldk_data_dir: &Path) -> (RgbInfo, PathBuf) {
-	let info_file_path = ldk_data_dir.join(hex::encode(channel_id));
+pub fn get_rgb_channel_info(channel_id: &ChannelId, ldk_data_dir: &Path) -> (RgbInfo, PathBuf) {
+	let info_file_path = ldk_data_dir.join(channel_id.to_hex());
 	let serialized_info = fs::read_to_string(&info_file_path).expect("valid rgb info file");
 	let info: RgbInfo = serde_json::from_str(&serialized_info).expect("valid rgb info file");
 	(info, info_file_path)
 }
 
 /// Whether the channel data for a channel exist
-pub fn is_channel_rgb(channel_id: &[u8; 32], ldk_data_dir: &PathBuf) -> bool {
-	ldk_data_dir.join(hex::encode(channel_id)).exists()
+pub fn is_channel_rgb(channel_id: &ChannelId, ldk_data_dir: &PathBuf) -> bool {
+	ldk_data_dir.join(channel_id.to_hex()).exists()
 }
 
 /// Write RgbInfo file
@@ -534,9 +535,9 @@ pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHa
 }
 
 /// Rename RGB files from temporary to final channel ID
-pub(crate) fn rename_rgb_files(channel_id: &[u8; 32], temporary_channel_id: &[u8; 32], ldk_data_dir: &Path) {
-	let temp_chan_id = hex::encode(temporary_channel_id);
-	let chan_id = hex::encode(channel_id);
+pub(crate) fn rename_rgb_files(channel_id: &ChannelId, temporary_channel_id: &ChannelId, ldk_data_dir: &Path) {
+	let temp_chan_id = temporary_channel_id.to_hex();
+	let chan_id = channel_id.to_hex();
 
 	let temporary_channel_id_path = ldk_data_dir.join(&temp_chan_id);
 	let channel_id_path = ldk_data_dir.join(&chan_id);
@@ -550,7 +551,7 @@ pub(crate) fn rename_rgb_files(channel_id: &[u8; 32], temporary_channel_id: &[u8
 }
 
 /// Handle funding on the receiver side
-pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: String, ldk_data_dir: &Path, consignment_endpoint: RgbTransport) -> Result<(), MsgHandleErrInternal> {
+pub(crate) fn handle_funding(temporary_channel_id: &ChannelId, funding_txid: String, ldk_data_dir: &Path, consignment_endpoint: RgbTransport) -> Result<(), MsgHandleErrInternal> {
 	let consignment_endpoint_str = format!("{consignment_endpoint}");
 	let proxy_url = if consignment_endpoint_str.starts_with("rpc:") {
 		let (_, host) = consignment_endpoint_str.split_once(':').unwrap();
@@ -570,7 +571,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	let consignment_bytes = base64::decode(consignment_res.consignment).expect("valid consignment");
 	let consignment_path = ldk_data_dir.join(format!("consignment_{}", funding_txid));
 	fs::write(consignment_path, consignment_bytes.clone()).expect("unable to write file");
-	let consignment_path = ldk_data_dir.join(format!("consignment_{}", hex::encode(temporary_channel_id)));
+	let consignment_path = ldk_data_dir.join(format!("consignment_{}", temporary_channel_id.to_hex()));
 	fs::write(consignment_path.clone(), consignment_bytes).expect("unable to write file");
 	let consignment = Bindle::<RgbTransfer>::load(consignment_path).expect("successful consignment load");
 	let schema_id = consignment.schema_id().to_string();
@@ -631,7 +632,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 	};
 	let _status = runtime.runtime.accept_transfer(validated_transfer, &mut resolver, true).expect("valid transfer");
 
-	let rgb_info_path = ldk_data_dir.join(hex::encode(temporary_channel_id));
+	let rgb_info_path = ldk_data_dir.join(temporary_channel_id.to_hex());
 	let rgb_info = RgbInfo {
 		contract_id,
 		local_rgb_amount: 0,
@@ -643,7 +644,7 @@ pub(crate) fn handle_funding(temporary_channel_id: &[u8; 32], funding_txid: Stri
 }
 
 /// Update RGB channel amount
-pub(crate) fn update_rgb_channel_amount(channel_id: &[u8; 32], rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path) {
+pub(crate) fn update_rgb_channel_amount(channel_id: &ChannelId, rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path) {
 	let (mut rgb_info, info_file_path) = get_rgb_channel_info(channel_id, ldk_data_dir);
 
 	if rgb_offered_htlc > rgb_received_htlc {
@@ -671,7 +672,7 @@ pub(crate) fn filter_first_hops(ldk_data_dir: &Path, payment_hash: &PaymentHash,
 	let rgb_payment_info: RgbPaymentInfo = serde_json::from_str(&serialized_info).expect("valid rgb payment info file");
 	let contract_id = rgb_payment_info.contract_id;
 	first_hops.retain(|h| {
-		let info_file_path = ldk_data_dir.join(hex::encode(h.channel_id));
+		let info_file_path = ldk_data_dir.join(h.channel_id.to_hex());
 		if !info_file_path.exists() {
 			return false
 		}

@@ -21,10 +21,16 @@
 //! [blinded paths]: crate::blinded_path::BlindedPath
 
 mod messenger;
+mod offers;
 mod packet;
 #[cfg(test)]
 mod functional_tests;
 
 // Re-export structs so they can be imported with just the `onion_message::` module prefix.
-pub use self::messenger::{CustomOnionMessageContents, CustomOnionMessageHandler, Destination, OnionMessageContents, OnionMessenger, SendError, SimpleArcOnionMessenger, SimpleRefOnionMessenger};
-pub(crate) use self::packet::{ControlTlvs, Packet};
+pub use self::messenger::{CustomOnionMessageHandler, DefaultMessageRouter, Destination, MessageRouter, OnionMessageContents, OnionMessagePath, OnionMessenger, PeeledOnion, PendingOnionMessage, SendError};
+#[cfg(not(c_bindings))]
+pub use self::messenger::{SimpleArcOnionMessenger, SimpleRefOnionMessenger};
+pub use self::offers::{OffersMessage, OffersMessageHandler};
+pub use self::packet::{Packet, ParsedOnionMessageContents};
+pub(crate) use self::packet::ControlTlvs;
+pub(crate) use self::messenger::new_pending_onion_message;
