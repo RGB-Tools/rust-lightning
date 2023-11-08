@@ -3,10 +3,12 @@
 pub mod proxy;
 
 use crate::chain::transaction::OutPoint;
+use crate::ln::features::ChannelTypeFeatures;
 use crate::ln::{PaymentHash, ChannelId};
-use crate::ln::chan_utils::{BuiltCommitmentTransaction, ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment};
+use crate::ln::chan_utils::{BuiltCommitmentTransaction, ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment, get_counterparty_payment_script};
 use crate::ln::channelmanager::{ChannelDetails, MsgHandleErrInternal};
-use crate::ln::channel::ChannelError;
+use crate::ln::channel::{ChannelError, ChannelContext};
+use crate::sign::SignerProvider;
 
 use alloc::collections::BTreeMap;
 use amplify::none;
@@ -14,6 +16,7 @@ use bitcoin::{TxOut, Script};
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::psbt::PartiallySignedTransaction;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin_30::psbt::PartiallySignedTransaction as RgbPsbt;
 use bitcoin_30::hashes::Hash;
 use bp::Outpoint as RgbOutpoint;
@@ -38,6 +41,7 @@ use rgbwallet::psbt::{PsbtDbc, RgbExt, RgbInExt};
 use rgbwallet::psbt::opret::OutputOpret;
 use strict_encoding::{TypeName, FieldName};
 
+use core::ops::Deref;
 use std::fs;
 use std::convert::TryFrom;
 use std::path::{PathBuf, Path};
@@ -128,8 +132,19 @@ pub fn write_rgb_transfer_info(path: &PathBuf, info: &TransferInfo) {
 	fs::write(path, serialized_info).expect("able to write transfer info file")
 }
 
+fn counterparty_output_index(outputs: &Vec<TxOut>, channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey) -> Option<usize> {
+	let counterparty_payment_script = get_counterparty_payment_script(channel_type_features, payment_key);
+	outputs.iter().enumerate()
+		.find(|(_, out)| out.script_pubkey == counterparty_payment_script)
+		.map(|(idx, _)| idx)
+}
+
 /// Color commitment transaction
-pub(crate) fn color_commitment(channel_id: &ChannelId, funding_outpoint: &OutPoint, commitment_tx: &mut CommitmentTransaction, ldk_data_dir: &Path, counterparty: bool) -> Result<(), ChannelError> {
+pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, commitment_tx: &mut CommitmentTransaction, counterparty: bool) -> Result<(), ChannelError> where <SP as std::ops::Deref>::Target: SignerProvider {
+	let channel_id = &channel_context.channel_id;
+	let funding_outpoint = channel_context.channel_transaction_parameters.funding_outpoint.unwrap();
+	let ldk_data_dir = channel_context.ldk_data_dir.as_path();
+
 	let mut transaction = commitment_tx.clone().built.transaction;
 	transaction.output.push(TxOut { value: 0, script_pubkey: Script::new_op_return(&[1]) });
 	let psbt = PartiallySignedTransaction::from_unsigned_tx(transaction.clone()).expect("valid transaction");
@@ -144,14 +159,12 @@ pub(crate) fn color_commitment(channel_id: &ChannelId, funding_outpoint: &OutPoi
 	let mut rgb_offered_htlc = 0;
 	let mut rgb_received_htlc = 0;
 	let mut last_rgb_payment_info = None;
-	let mut htlc_vouts: Vec<u32> = vec![];
 	let mut asset_transition_builder = runtime.runtime.transition_builder(rgb_info.contract_id, TypeName::try_from("RGB20").unwrap(), None::<&str>).expect("ok");
 	let assignment_id = asset_transition_builder
 		.assignments_type(&FieldName::from("beneficiary")).expect("valid assignment");
 
 	for htlc in commitment_tx.htlcs() {
 		let htlc_vout = htlc.transaction_output_index.unwrap();
-		htlc_vouts.push(htlc_vout);
 
 		let htlc_payment_hash = hex::encode(htlc.payment_hash.0);
 		let htlc_proxy_id = format!("{chan_id}{htlc_payment_hash}");
@@ -209,19 +222,26 @@ pub(crate) fn color_commitment(channel_id: &ChannelId, funding_outpoint: &OutPoi
 		(remote_amt, local_amt)
 	};
 
-	let non_htlc_outputs: Vec<(u32, &TxOut)> = transaction.output.iter().enumerate().filter(|(index, _)| !htlc_vouts.contains(&(*index as u32)))
-		.map(|(index, txout)| (index as u32, txout)).collect();
-	let (vout_p2wpkh, _) = non_htlc_outputs.iter().find(|(_, txout)| txout.script_pubkey.is_v0_p2wpkh()).unwrap();
-	let (vout_p2wsh, _) = non_htlc_outputs.iter().find(|(index, _)| index != vout_p2wpkh).unwrap();
+	let payment_point = if counterparty {
+		channel_context.get_holder_pubkeys().payment_point
+	} else {
+		channel_context.get_counterparty_pubkeys().payment_point
+	};
+	let vout_p2wpkh = counterparty_output_index(
+		&transaction.output,
+		&channel_context.channel_type,
+		&payment_point
+	).unwrap() as u32;
+	let vout_p2wsh = commitment_tx.trust().revokeable_output_index().unwrap() as u32;
 
 	if vout_p2wpkh_amt > 0 {
-		let seal_p2wpkh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wpkh, STATIC_BLINDING));
+		let seal_p2wpkh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, vout_p2wpkh, STATIC_BLINDING));
 		beneficiaries.push(seal_p2wpkh);
 		asset_transition_builder = asset_transition_builder
 			.add_raw_state_static(assignment_id, seal_p2wpkh, TypedState::Amount(vout_p2wpkh_amt)).expect("ok");
 	}
 	if vout_p2wsh_amt > 0 {
-		let seal_p2wsh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, *vout_p2wsh, STATIC_BLINDING));
+		let seal_p2wsh = BuilderSeal::Revealed(GraphSeal::with_vout(CloseMethod::OpretFirst, vout_p2wsh, STATIC_BLINDING));
 		beneficiaries.push(seal_p2wsh);
 		asset_transition_builder = asset_transition_builder
 			.add_raw_state_static(assignment_id, seal_p2wsh, TypedState::Amount(vout_p2wsh_amt)).expect("ok");

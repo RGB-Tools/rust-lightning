@@ -1115,7 +1115,7 @@ impl InMemorySigner {
 	/// or if an output descriptor `script_pubkey` does not match the one we can spend.
 	///
 	/// [`descriptor.outpoint`]: StaticPaymentOutputDescriptor::outpoint
-	pub fn sign_counterparty_payment_input<C: Signing>(&self, spend_tx: &Transaction, input_idx: usize, descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<C>) -> Result<Vec<Vec<u8>>, ()> {
+	pub fn sign_counterparty_payment_input<C: Signing>(&self, spend_tx: &Transaction, input_idx: usize, descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<C>, supports_anchors_zero_fee_htlc_tx_default: bool) -> Result<Vec<Vec<u8>>, ()> {
 		// TODO: We really should be taking the SigHashCache as a parameter here instead of
 		// spend_tx, but ideally the SigHashCache would expose the transaction's inputs read-only
 		// so that we can check them. This requires upstream rust-bitcoin changes (as well as
@@ -1129,7 +1129,7 @@ impl InMemorySigner {
 		// `self.channel_parameters()` or anything that relies on it
 		let supports_anchors_zero_fee_htlc_tx = self.channel_type_features()
 			.map(|features| features.supports_anchors_zero_fee_htlc_tx())
-			.unwrap_or(false);
+			.unwrap_or(supports_anchors_zero_fee_htlc_tx_default);
 
 		let witness_script = if supports_anchors_zero_fee_htlc_tx {
 			chan_utils::get_to_countersignatory_with_anchors_redeemscript(&remotepubkey.inner)
@@ -1636,7 +1636,7 @@ impl KeysManager {
 						}
 						keys_cache = Some((signer, descriptor.channel_keys_id));
 					}
-					let witness = Witness::from_vec(keys_cache.as_ref().unwrap().0.sign_counterparty_payment_input(&psbt.unsigned_tx, input_idx, &descriptor, &secp_ctx)?);
+					let witness = Witness::from_vec(keys_cache.as_ref().unwrap().0.sign_counterparty_payment_input(&psbt.unsigned_tx, input_idx, &descriptor, &secp_ctx, false)?);
 					psbt.inputs[input_idx].final_script_witness = Some(witness);
 				},
 				SpendableOutputDescriptor::DelayedPaymentOutput(descriptor) => {

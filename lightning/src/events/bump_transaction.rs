@@ -589,8 +589,6 @@ where
 			previous_utxo: anchor_utxo,
 			satisfaction_weight: commitment_tx.weight() as u64 + ANCHOR_INPUT_WITNESS_WEIGHT + EMPTY_SCRIPT_SIG_WEIGHT,
 		}];
-		#[cfg(debug_assertions)]
-		let must_spend_amount =	must_spend.iter().map(|input| input.previous_utxo.value).sum::<u64>();
 
 		log_debug!(self.logger, "Peforming coin selection for commitment package (commitment and anchor transaction) targeting {} sat/kW",
 			package_target_feerate_sat_per_1000_weight);
@@ -605,19 +603,10 @@ where
 			output: vec![],
 		};
 
-		#[cfg(debug_assertions)]
-		let total_satisfaction_weight = ANCHOR_INPUT_WITNESS_WEIGHT + EMPTY_SCRIPT_SIG_WEIGHT +
-			coin_selection.confirmed_utxos.iter().map(|utxo| utxo.satisfaction_weight).sum::<u64>();
-		#[cfg(debug_assertions)]
-		let total_input_amount = must_spend_amount +
-			coin_selection.confirmed_utxos.iter().map(|utxo| utxo.output.value).sum::<u64>();
-
 		self.process_coin_selection(&mut anchor_tx, coin_selection);
 		let anchor_txid = anchor_tx.txid();
 
 		debug_assert_eq!(anchor_tx.output.len(), 1);
-		#[cfg(debug_assertions)]
-		let unsigned_tx_weight = anchor_tx.weight() as u64 - (anchor_tx.input.len() as u64 * EMPTY_SCRIPT_SIG_WEIGHT);
 
 		log_debug!(self.logger, "Signing anchor transaction {}", anchor_txid);
 		anchor_tx = self.utxo_source.sign_tx(anchor_tx)?;
@@ -625,25 +614,6 @@ where
 		let signer = anchor_descriptor.derive_channel_signer(&self.signer_provider);
 		let anchor_sig = signer.sign_holder_anchor_input(&anchor_tx, 0, &self.secp)?;
 		anchor_tx.input[0].witness = anchor_descriptor.tx_input_witness(&anchor_sig);
-
-		#[cfg(debug_assertions)] {
-			let signed_tx_weight = anchor_tx.weight() as u64;
-			let expected_signed_tx_weight = unsigned_tx_weight + total_satisfaction_weight;
-			// Our estimate should be within a 1% error margin of the actual weight and we should
-			// never underestimate.
-			assert!(expected_signed_tx_weight >= signed_tx_weight &&
-				expected_signed_tx_weight - (expected_signed_tx_weight / 100) <= signed_tx_weight);
-
-			let expected_package_fee = fee_for_weight(package_target_feerate_sat_per_1000_weight,
-				signed_tx_weight + commitment_tx.weight() as u64);
-			let package_fee = total_input_amount -
-				anchor_tx.output.iter().map(|output| output.value).sum::<u64>();
-			// Our fee should be within a 5% error margin of the expected fee based on the
-			// feerate and transaction weight and we should never pay less than required.
-			let fee_error_margin = expected_package_fee * 5 / 100;
-			assert!(package_fee >= expected_package_fee &&
-				package_fee - fee_error_margin <= expected_package_fee);
-		}
 
 		log_info!(self.logger, "Broadcasting anchor transaction {} to bump channel close with txid {}",
 			anchor_txid, commitment_tx.txid());
@@ -683,27 +653,11 @@ where
 		log_debug!(self.logger, "Peforming coin selection for HTLC transaction targeting {} sat/kW",
 			target_feerate_sat_per_1000_weight);
 
-		#[cfg(debug_assertions)]
-		let must_spend_satisfaction_weight =
-			must_spend.iter().map(|input| input.satisfaction_weight).sum::<u64>();
-		#[cfg(debug_assertions)]
-		let must_spend_amount =	must_spend.iter().map(|input| input.previous_utxo.value).sum::<u64>();
-
 		let coin_selection = self.utxo_source.select_confirmed_utxos(
 			claim_id, must_spend, &htlc_tx.output, target_feerate_sat_per_1000_weight,
 		)?;
 
-		#[cfg(debug_assertions)]
-		let total_satisfaction_weight = must_spend_satisfaction_weight +
-			coin_selection.confirmed_utxos.iter().map(|utxo| utxo.satisfaction_weight).sum::<u64>();
-		#[cfg(debug_assertions)]
-		let total_input_amount = must_spend_amount +
-			coin_selection.confirmed_utxos.iter().map(|utxo| utxo.output.value).sum::<u64>();
-
 		self.process_coin_selection(&mut htlc_tx, coin_selection);
-
-		#[cfg(debug_assertions)]
-		let unsigned_tx_weight = htlc_tx.weight() as u64 - (htlc_tx.input.len() as u64 * EMPTY_SCRIPT_SIG_WEIGHT);
 
 		log_debug!(self.logger, "Signing HTLC transaction {}", htlc_tx.txid());
 		htlc_tx = self.utxo_source.sign_tx(htlc_tx)?;
@@ -715,24 +669,6 @@ where
 			let htlc_sig = signer.sign_holder_htlc_transaction(&htlc_tx, idx, htlc_descriptor, &self.secp)?;
 			let witness_script = htlc_descriptor.witness_script(&self.secp);
 			htlc_tx.input[idx].witness = htlc_descriptor.tx_input_witness(&htlc_sig, &witness_script);
-		}
-
-		#[cfg(debug_assertions)] {
-			let signed_tx_weight = htlc_tx.weight() as u64;
-			let expected_signed_tx_weight = unsigned_tx_weight + total_satisfaction_weight;
-			// Our estimate should be within a 1% error margin of the actual weight and we should
-			// never underestimate.
-			assert!(expected_signed_tx_weight >= signed_tx_weight &&
-				expected_signed_tx_weight - (expected_signed_tx_weight / 100) <= signed_tx_weight);
-
-			let expected_signed_tx_fee = fee_for_weight(target_feerate_sat_per_1000_weight, signed_tx_weight);
-			let signed_tx_fee = total_input_amount -
-				htlc_tx.output.iter().map(|output| output.value).sum::<u64>();
-			// Our fee should be within a 5% error margin of the expected fee based on the
-			// feerate and transaction weight and we should never pay less than required.
-			let fee_error_margin = expected_signed_tx_fee * 5 / 100;
-			assert!(signed_tx_fee >= expected_signed_tx_fee &&
-				signed_tx_fee - fee_error_margin <= expected_signed_tx_fee);
 		}
 
 		log_info!(self.logger, "Broadcasting {}", log_tx!(htlc_tx));

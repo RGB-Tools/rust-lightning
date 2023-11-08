@@ -687,7 +687,7 @@ impl UnfundedChannelContext {
 }
 
 /// Contains everything about the channel including state, and various flags.
-pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
+pub(crate) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	config: LegacyChannelConfig,
 
 	// Track the previous `ChannelConfig` so that we can continue forwarding HTLCs that were
@@ -700,7 +700,7 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	user_id: u128,
 
 	/// The current channel ID.
-	channel_id: ChannelId,
+	pub(crate) channel_id: ChannelId,
 	/// The temporary channel ID used during channel setup. Value kept even after transitioning to a final channel ID.
 	/// Will be `None` for channels created prior to 0.0.115.
 	temporary_channel_id: Option<ChannelId>,
@@ -915,7 +915,7 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	historical_inbound_htlc_fulfills: HashSet<u64>,
 
 	/// This channel's type, as negotiated during channel open
-	channel_type: ChannelTypeFeatures,
+	pub(crate) channel_type: ChannelTypeFeatures,
 
 	// Our counterparty can offer us SCID aliases which they will map to this channel when routing
 	// outbound payments. These can be used in invoice route hints to avoid explicitly revealing
@@ -952,7 +952,7 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	/// The consignment endpoint used to exchange the RGB consignment
 	pub(super) consignment_endpoint: Option<RgbTransport>,
 
-	ldk_data_dir: PathBuf,
+	pub(crate) ldk_data_dir: PathBuf,
 }
 
 impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
@@ -1108,7 +1108,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		self.channel_transaction_parameters.holder_selected_contest_delay
 	}
 
-	fn get_holder_pubkeys(&self) -> &ChannelPublicKeys {
+	pub(crate) fn get_holder_pubkeys(&self) -> &ChannelPublicKeys {
 		&self.channel_transaction_parameters.holder_pubkeys
 	}
 
@@ -1117,7 +1117,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			.as_ref().map(|params| params.selected_contest_delay)
 	}
 
-	fn get_counterparty_pubkeys(&self) -> &ChannelPublicKeys {
+	pub(crate) fn get_counterparty_pubkeys(&self) -> &ChannelPublicKeys {
 		&self.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap().pubkeys
 	}
 
@@ -2606,7 +2606,7 @@ impl<SP: Deref> Channel<SP> where
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.context.ldk_data_dir, true)?;
+			color_commitment(&self.context, &mut counterparty_initial_commitment_tx, true)?;
 		}
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
@@ -2617,7 +2617,7 @@ impl<SP: Deref> Channel<SP> where
 		let holder_signer = self.context.build_holder_transaction_keys(self.context.cur_holder_commitment_transaction_number);
 		let mut initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_holder_commitment_transaction_number, &holder_signer, true, false, logger).tx;
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.context.ldk_data_dir, false)?;
+			color_commitment(&self.context, &mut initial_commitment_tx, false)?;
 		}
 		{
 			let trusted_tx = initial_commitment_tx.trust();
@@ -3023,7 +3023,7 @@ impl<SP: Deref> Channel<SP> where
 
 		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_holder_commitment_transaction_number, &keys, true, false, logger);
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.context.ldk_data_dir, false)?;
+			color_commitment(&self.context, &mut commitment_stats.tx, false)?;
 		}
 		let commitment_txid = {
 			let trusted_tx = commitment_stats.tx.trust();
@@ -3682,7 +3682,7 @@ impl<SP: Deref> Channel<SP> where
 		let keys = self.context.build_holder_transaction_keys(self.context.cur_holder_commitment_transaction_number);
 		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_holder_commitment_transaction_number, &keys, true, true, logger);
 		if self.context.is_colored() {
-			if let Err(e) = color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.context.ldk_data_dir, false) {
+			if let Err(e) = color_commitment(&self.context, &mut commitment_stats.tx, false) {
 				log_error!(logger, "Cannot color commitment: {e:?}");
 				return None;
 			}
@@ -5541,7 +5541,7 @@ impl<SP: Deref> Channel<SP> where
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.context.ldk_data_dir, true).expect("successful commitment coloring");
+			color_commitment(&self.context, &mut commitment_stats.tx, true).expect("successful commitment coloring");
 		}
 		let counterparty_commitment_tx = commitment_stats.tx;
 
@@ -5576,7 +5576,7 @@ impl<SP: Deref> Channel<SP> where
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let mut commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut commitment_stats.tx, &self.context.ldk_data_dir, true)?;
+			color_commitment(&self.context, &mut commitment_stats.tx, true)?;
 		}
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
 
@@ -5995,7 +5995,7 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.context.ldk_data_dir, true)?;
+			color_commitment(&self.context, &mut counterparty_initial_commitment_tx, true)?;
 		}
 		match &self.context.holder_signer {
 			// TODO (taproot|arik): move match into calling method for Taproot
@@ -6727,7 +6727,7 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		let keys = self.context.build_holder_transaction_keys(self.context.cur_holder_commitment_transaction_number);
 		let mut initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_holder_commitment_transaction_number, &keys, true, false, logger).tx;
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut initial_commitment_tx, &self.context.ldk_data_dir, false)?;
+			color_commitment(&self.context, &mut initial_commitment_tx, false)?;
 		}
 		{
 			let trusted_tx = initial_commitment_tx.trust();
@@ -6744,7 +6744,7 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let mut counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
 		if self.context.is_colored() {
-			color_commitment(&self.context.channel_id, &self.context.channel_transaction_parameters.funding_outpoint.unwrap(), &mut counterparty_initial_commitment_tx, &self.context.ldk_data_dir, true)?;
+			color_commitment(&self.context, &mut counterparty_initial_commitment_tx, true)?;
 		}
 
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
