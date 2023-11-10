@@ -1256,7 +1256,7 @@ impl EcdsaChannelSigner for InMemorySigner {
 			let chan_type = &channel_parameters.channel_type_features;
 			let mut htlc_tx = chan_utils::build_htlc_transaction(&commitment_txid, commitment_tx.feerate_per_kw(), holder_selected_contest_delay, htlc, chan_type, &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
 			if commitment_tx.is_colored() {
-				if let Err(_e) = color_htlc(&mut htlc_tx, &htlc, &self.ldk_data_dir) {
+				if let Err(_e) = color_htlc(&mut htlc_tx, htlc, &self.ldk_data_dir) {
 					return Err(())
 				}
 			}

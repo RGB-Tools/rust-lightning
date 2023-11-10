@@ -132,7 +132,7 @@ pub fn write_rgb_transfer_info(path: &PathBuf, info: &TransferInfo) {
 	fs::write(path, serialized_info).expect("able to write transfer info file")
 }
 
-fn counterparty_output_index(outputs: &Vec<TxOut>, channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey) -> Option<usize> {
+fn counterparty_output_index(outputs: &[TxOut], channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey) -> Option<usize> {
 	let counterparty_payment_script = get_counterparty_payment_script(channel_type_features, payment_key);
 	outputs.iter().enumerate()
 		.find(|(_, out)| out.script_pubkey == counterparty_payment_script)
@@ -530,7 +530,7 @@ pub fn get_rgb_channel_info(channel_id: &ChannelId, ldk_data_dir: &Path) -> (Rgb
 }
 
 /// Whether the channel data for a channel exist
-pub fn is_channel_rgb(channel_id: &ChannelId, ldk_data_dir: &PathBuf) -> bool {
+pub fn is_channel_rgb(channel_id: &ChannelId, ldk_data_dir: &Path) -> bool {
 	ldk_data_dir.join(channel_id.to_hex()).exists()
 }
 
@@ -681,7 +681,7 @@ pub(crate) fn update_rgb_channel_amount(channel_id: &ChannelId, rgb_offered_htlc
 }
 
 /// Whether the payment is colored
-pub(crate) fn is_payment_rgb(ldk_data_dir: &PathBuf, payment_hash: &PaymentHash) -> bool {
+pub(crate) fn is_payment_rgb(ldk_data_dir: &Path, payment_hash: &PaymentHash) -> bool {
 	ldk_data_dir.join(hex::encode(payment_hash.0)).exists()
 }
 

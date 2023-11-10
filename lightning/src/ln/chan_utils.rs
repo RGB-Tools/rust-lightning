@@ -1733,7 +1733,7 @@ impl<'a> TrustedCommitmentTransaction<'a> {
 			assert!(this_htlc.transaction_output_index.is_some());
 			let mut htlc_tx = build_htlc_transaction(&txid, inner.feerate_per_kw, channel_parameters.contest_delay(), &this_htlc, &self.channel_type_features, &keys.broadcaster_delayed_payment_key, &keys.revocation_key);
 			if inner.is_colored() {
-				if let Err(_e) = color_htlc(&mut htlc_tx, &this_htlc, &ldk_data_dir) {
+				if let Err(_e) = color_htlc(&mut htlc_tx, this_htlc, ldk_data_dir) {
 					return Err(());
 				}
 			}
@@ -1764,7 +1764,7 @@ impl<'a> TrustedCommitmentTransaction<'a> {
 			&self.channel_type_features, &keys.broadcaster_delayed_payment_key, &keys.revocation_key
 		);
 		if self.inner.is_colored() {
-			color_htlc(&mut htlc_tx, &this_htlc, &ldk_data_dir).expect("successful htlc tx coloring");
+			color_htlc(&mut htlc_tx, this_htlc, ldk_data_dir).expect("successful htlc tx coloring");
 		}
 		htlc_tx
 	}
