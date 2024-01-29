@@ -50,21 +50,30 @@ backtrace = { version = "0.3", optional = true }
 core2 = { version = "0.3.0", optional = true, default-features = false }
 
 # RGB and related
-amplify = "=4.5.0"
+amplify = { version = "=4.6.0", default-features = false }
 base64 = "0.13.0"
-bp-core = "=0.10.11"
-commit_verify = "=0.10.6"
+bp-core = { version = "=0.11.0-beta.5", default-features = false }
+commit_verify = { version = "=0.11.0-beta.5", default-features = false }
 futures = "0.3"
 hex = "0.4"
 reqwest = { version = "0.11", default-features = false, features = ["json", "blocking"] }
-rgb-contracts = { version = "=0.10.2", features = ["electrum"] }
-rgb_core = { package = "rgb-core", version = "=0.10.8" }
-rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib", branch = "rln_v0.10" }
-rgb-std = "=0.10.9"
-rgb-wallet = "=0.10.9"
+rgb-core = { version = "=0.11.0-beta.5", default-features = false, features = [
+    "stl",
+] }
+rgb-invoice = { version = "=0.11.0-beta.5", default-features = false }
+rgb-lib = { version = "0.3.0-alpha.2", features = [
+    "electrum",
+    "esplora",
+] }
+rgb-psbt = { version = "=0.11.0-beta.5", default-features = false }
+rgb-std = { version = "=0.11.0-beta.5", default-features = false }
+rgb-runtime = { version = "=0.11.0-beta.5", default-features = false, features = [
+    "electrum",
+    "serde",
+] }
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = "^1.0"
-strict_encoding = "=2.6.1"
+strict_encoding = { version = "=2.7.0-beta.1", default-features = false }
 tokio = { version = "1.14.1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]

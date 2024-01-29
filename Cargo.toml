@@ -37,8 +37,3 @@ lto = "off"
 opt-level = 3
 lto = true
 panic = "abort"
-
-[patch.crates-io]
-commit_verify = { path = "../client_side_validation/commit_verify" }
-rgb-std = { path = "../rgb-wallet/std" }
-rgb-wallet = { path = "../rgb-wallet" }

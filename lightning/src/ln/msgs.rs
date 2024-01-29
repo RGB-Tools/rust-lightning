@@ -31,7 +31,7 @@ use bitcoin::{secp256k1, Witness};
 use bitcoin::blockdata::script::Script;
 use bitcoin::hash_types::Txid;
 
-use rgbwallet::RgbTransport;
+use invoice::RgbTransport;
 
 use rgbstd::contract::ContractId;
 
@@ -2415,7 +2415,7 @@ impl Writeable for UnsignedChannelAnnouncement {
 impl Readable for ContractId {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; 32] = Readable::read(r)?;
-		let contract_id = ContractId::from_slice(buf).unwrap();
+		let contract_id = ContractId::copy_from_slice(buf).unwrap();
 		Ok(contract_id)
 	}
 }
