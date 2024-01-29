@@ -22,7 +22,7 @@ use bitcoin::hashes::hex::FromHex;
 
 use bitcoin::network::constants::Network;
 
-use rgbstd::contract::ContractId;
+use rgb_lib::ContractId;
 
 use crate::events::{MessageSendEvent, MessageSendEventsProvider};
 use crate::ln::ChannelId;

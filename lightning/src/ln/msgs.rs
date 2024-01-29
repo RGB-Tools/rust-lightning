@@ -31,9 +31,7 @@ use bitcoin::{secp256k1, Witness};
 use bitcoin::blockdata::script::Script;
 use bitcoin::hash_types::Txid;
 
-use invoice::RgbTransport;
-
-use rgbstd::contract::ContractId;
+use rgb_lib::{ContractId, RgbTransport};
 
 use crate::blinded_path::payment::ReceiveTlvs;
 use crate::ln::{ChannelId, PaymentPreimage, PaymentHash, PaymentSecret};

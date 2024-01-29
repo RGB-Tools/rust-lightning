@@ -29,7 +29,10 @@ hashbrown = { version = "0.8", optional = true }
 bitcoin = { version = "0.29.0", default-features = false }
 
 # RGB and related
-rgb-std = { version = "=0.11.0-beta.5", default-features = false }
+rgb-lib = { version = "0.3.0-alpha.3", features = [
+    "electrum",
+    "esplora",
+] }
 
 [dev-dependencies]
 lightning = { version = "0.0.118", path = "../lightning", default-features = false, features = ["_test_utils"] }

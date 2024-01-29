@@ -51,7 +51,7 @@ use bitcoin_hashes::{Hash, sha256};
 use lightning::ln::features::Bolt11InvoiceFeatures;
 use lightning::util::invoice::construct_invoice_preimage;
 
-use rgbstd::contract::ContractId;
+use rgb_lib::ContractId;
 use secp256k1::PublicKey;
 use secp256k1::{Message, Secp256k1};
 use secp256k1::ecdsa::RecoverableSignature;

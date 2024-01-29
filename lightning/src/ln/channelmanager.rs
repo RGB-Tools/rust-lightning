@@ -30,7 +30,7 @@ use bitcoin::secp256k1::{SecretKey,PublicKey};
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{LockTime, secp256k1, Sequence};
 
-use invoice::RgbTransport;
+use rgb_lib::RgbTransport;
 
 use crate::blinded_path::BlindedPath;
 use crate::blinded_path::payment::{PaymentConstraints, ReceiveTlvs};
