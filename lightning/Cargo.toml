@@ -59,7 +59,7 @@ hex = "0.4"
 reqwest = { version = "0.11", default-features = false, features = ["json", "blocking"] }
 rgb-contracts = { version = "=0.10.2", features = ["electrum"] }
 rgb_core = { package = "rgb-core", version = "=0.10.8" }
-rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib", branch = "master" }
+rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib", branch = "rln_v0.10" }
 rgb-std = "=0.10.9"
 rgb-wallet = "=0.10.9"
 serde = { version = "^1.0", features = ["derive"] }
