@@ -152,7 +152,7 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 
 	let mut runtime = get_rgb_runtime(ldk_data_dir);
 
-	let (rgb_info, _) = get_rgb_channel_info(channel_id, ldk_data_dir);
+	let (rgb_info, _) = get_rgb_channel_info_pending(channel_id, ldk_data_dir);
 
 	let chan_id = channel_id.to_hex();
 	let mut beneficiaries = vec![];
@@ -419,7 +419,7 @@ pub(crate) fn color_closing(channel_id: &ChannelId, funding_outpoint: &OutPoint,
 
 	let mut runtime = get_rgb_runtime(ldk_data_dir);
 
-	let (rgb_info, _) = get_rgb_channel_info(channel_id, ldk_data_dir);
+	let (rgb_info, _) = get_rgb_channel_info_pending(channel_id, ldk_data_dir);
 
 	let holder_vout = transaction.output.iter().position(|o| o.script_pubkey == closing_tx.to_holder_script).unwrap();
 	let counterparty_vout = holder_vout ^ 1;
@@ -509,29 +509,42 @@ pub fn get_rgb_payment_info_path(payment_hash: &PaymentHash, ldk_data_dir: &Path
 	ldk_data_dir.join(hex::encode(payment_hash.0))
 }
 
-/// Get RgbPaymentInfo file
-pub fn get_rgb_payment_info(payment_hash: &PaymentHash, ldk_data_dir: &Path) -> RgbPaymentInfo {
-	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir);
-	parse_rgb_payment_info(&rgb_payment_info_path)
-}
-
 /// Parse RgbPaymentInfo
 pub fn parse_rgb_payment_info(rgb_payment_info_path: &PathBuf) -> RgbPaymentInfo {
 	let serialized_info = fs::read_to_string(rgb_payment_info_path).expect("valid rgb payment info");
 	serde_json::from_str(&serialized_info).expect("valid rgb info file")
 }
 
+/// Get RgbInfo file path
+pub fn get_rgb_channel_info_path(channel_id: &str, ldk_data_dir: &Path, pending: bool) -> PathBuf {
+	let mut info_file_path = ldk_data_dir.join(channel_id);
+	if pending {
+		info_file_path.set_extension("pending");
+	}
+	info_file_path
+}
+
 /// Get RgbInfo file
-pub fn get_rgb_channel_info(channel_id: &ChannelId, ldk_data_dir: &Path) -> (RgbInfo, PathBuf) {
-	let info_file_path = ldk_data_dir.join(channel_id.to_hex());
-	let serialized_info = fs::read_to_string(&info_file_path).expect("valid rgb info file");
-	let info: RgbInfo = serde_json::from_str(&serialized_info).expect("valid rgb info file");
+pub(crate) fn get_rgb_channel_info(channel_id: &str, ldk_data_dir: &Path, pending: bool) -> (RgbInfo, PathBuf) {
+	let info_file_path = get_rgb_channel_info_path(channel_id, ldk_data_dir, pending);
+	let info = parse_rgb_channel_info(&info_file_path);
 	(info, info_file_path)
+}
+
+/// Get pending RgbInfo file
+pub fn get_rgb_channel_info_pending(channel_id: &ChannelId, ldk_data_dir: &Path) -> (RgbInfo, PathBuf) {
+	get_rgb_channel_info(&channel_id.to_hex(), ldk_data_dir, true)
+}
+
+/// Parse RgbInfo
+pub fn parse_rgb_channel_info(rgb_channel_info_path: &PathBuf) -> RgbInfo {
+	let serialized_info = fs::read_to_string(&rgb_channel_info_path).expect("valid rgb info file");
+	serde_json::from_str(&serialized_info).expect("valid rgb info file")
 }
 
 /// Whether the channel data for a channel exist
 pub fn is_channel_rgb(channel_id: &ChannelId, ldk_data_dir: &Path) -> bool {
-	ldk_data_dir.join(channel_id.to_hex()).exists()
+	get_rgb_channel_info_path(&channel_id.to_hex(), ldk_data_dir, false).exists()
 }
 
 /// Write RgbInfo file
@@ -559,9 +572,14 @@ pub(crate) fn rename_rgb_files(channel_id: &ChannelId, temporary_channel_id: &Ch
 	let temp_chan_id = temporary_channel_id.to_hex();
 	let chan_id = channel_id.to_hex();
 
-	let temporary_channel_id_path = ldk_data_dir.join(&temp_chan_id);
-	let channel_id_path = ldk_data_dir.join(&chan_id);
-	fs::rename(temporary_channel_id_path, channel_id_path).expect("rename ok");
+	fs::rename(
+		get_rgb_channel_info_path(&temp_chan_id, ldk_data_dir, false),
+		get_rgb_channel_info_path(&chan_id, ldk_data_dir, false),
+	).expect("rename ok");
+	fs::rename(
+		get_rgb_channel_info_path(&temp_chan_id, ldk_data_dir, true),
+		get_rgb_channel_info_path(&chan_id, ldk_data_dir, true),
+	).expect("rename ok");
 
 	let funding_consignment_tmp = ldk_data_dir.join(format!("consignment_{}", temp_chan_id));
 	if funding_consignment_tmp.exists() {
@@ -652,20 +670,21 @@ pub(crate) fn handle_funding(temporary_channel_id: &ChannelId, funding_txid: Str
 	};
 	let _status = runtime.runtime.accept_transfer(validated_transfer, &mut resolver, true).expect("valid transfer");
 
-	let rgb_info_path = ldk_data_dir.join(temporary_channel_id.to_hex());
 	let rgb_info = RgbInfo {
 		contract_id,
 		local_rgb_amount: 0,
 		remote_rgb_amount,
 	};
-	write_rgb_channel_info(&rgb_info_path, &rgb_info);
+	let temporary_channel_id_str = temporary_channel_id.to_hex();
+	write_rgb_channel_info(&get_rgb_channel_info_path(&temporary_channel_id_str, &ldk_data_dir, true), &rgb_info);
+	write_rgb_channel_info(&get_rgb_channel_info_path(&temporary_channel_id_str, &ldk_data_dir, false), &rgb_info);
 
 	Ok(())
 }
 
 /// Update RGB channel amount
-pub(crate) fn update_rgb_channel_amount(channel_id: &ChannelId, rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path) {
-	let (mut rgb_info, info_file_path) = get_rgb_channel_info(channel_id, ldk_data_dir);
+pub fn update_rgb_channel_amount(channel_id: &str, rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path, pending: bool) {
+	let (mut rgb_info, info_file_path) = get_rgb_channel_info(channel_id, ldk_data_dir, pending);
 
 	if rgb_offered_htlc > rgb_received_htlc {
 		let spent = rgb_offered_htlc - rgb_received_htlc;
@@ -678,6 +697,11 @@ pub(crate) fn update_rgb_channel_amount(channel_id: &ChannelId, rgb_offered_htlc
 	}
 
 	write_rgb_channel_info(&info_file_path, &rgb_info)
+}
+
+/// Update pending RGB channel amount
+pub(crate) fn update_rgb_channel_amount_pending(channel_id: &ChannelId, rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path) {
+	update_rgb_channel_amount(&channel_id.to_hex(), rgb_offered_htlc, rgb_received_htlc, ldk_data_dir, true)
 }
 
 /// Whether the payment is colored

@@ -38,7 +38,7 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_pending, rename_rgb_files, update_rgb_channel_amount_pending};
 use crate::sign::{EcdsaChannelSigner, WriteableEcdsaChannelSigner, EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::ClosureReason;
 use crate::routing::gossip::NodeId;
@@ -3543,7 +3543,7 @@ impl<SP: Deref> Channel<SP> where
 		}
 		self.context.value_to_self_msat = (self.context.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
 		if self.context.is_colored() {
-			update_rgb_channel_amount(&self.context.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.context.ldk_data_dir);
+			update_rgb_channel_amount_pending(&self.context.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.context.ldk_data_dir);
 		}
 
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
@@ -5117,7 +5117,7 @@ impl<SP: Deref> Channel<SP> where
 		let were_node_one = node_id.as_slice() < counterparty_node_id.as_slice();
 
 		let contract_id = if self.context.is_colored() {
-			let (rgb_info, _) = get_rgb_channel_info(&self.context.channel_id, &self.context.ldk_data_dir);
+			let (rgb_info, _) = get_rgb_channel_info_pending(&self.context.channel_id, &self.context.ldk_data_dir);
 			Some(rgb_info.contract_id)
 		} else {
 			None
@@ -5495,7 +5495,7 @@ impl<SP: Deref> Channel<SP> where
 			}
 		}
 		if self.context.is_colored() {
-			update_rgb_channel_amount(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
+			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
 		}
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {
