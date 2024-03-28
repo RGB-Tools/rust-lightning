@@ -5688,7 +5688,7 @@ where
 	}
 
 	fn claim_funds_internal(&self, source: HTLCSource, payment_preimage: PaymentPreimage,
-		forwarded_htlc_value_msat: Option<u64>, from_onchain: bool, startup_replay: bool,
+		forwarded_htlc_value_msat: Option<u64>, forwarded_htlc_rgb: Option<u64>, from_onchain: bool, startup_replay: bool,
 		next_channel_counterparty_node_id: Option<PublicKey>, next_channel_outpoint: OutPoint
 	) {
 		match source {
@@ -5794,6 +5794,7 @@ where
 									prev_channel_id: Some(prev_outpoint.to_channel_id()),
 									next_channel_id: Some(next_channel_outpoint.to_channel_id()),
 									outbound_amount_forwarded_msat: forwarded_htlc_value_msat,
+									outbound_amount_forwarded_rgb: forwarded_htlc_rgb,
 								},
 								downstream_counterparty_and_funding_outpoint: chan_to_release,
 							})
@@ -6646,7 +6647,7 @@ where
 
 	fn internal_update_fulfill_htlc(&self, counterparty_node_id: &PublicKey, msg: &msgs::UpdateFulfillHTLC) -> Result<(), MsgHandleErrInternal> {
 		let funding_txo;
-		let (htlc_source, forwarded_htlc_value) = {
+		let (htlc_source, forwarded_htlc_value, forwarded_htlc_rgb) = {
 			let per_peer_state = self.per_peer_state.read().unwrap();
 			let peer_state_mutex = per_peer_state.get(counterparty_node_id)
 				.ok_or_else(|| {
@@ -6683,7 +6684,7 @@ where
 				hash_map::Entry::Vacant(_) => return Err(MsgHandleErrInternal::send_err_msg_no_close(format!("Got a message for a channel from the wrong node! No such channel for the passed counterparty_node_id {}", counterparty_node_id), msg.channel_id))
 			}
 		};
-		self.claim_funds_internal(htlc_source, msg.payment_preimage.clone(), Some(forwarded_htlc_value), false, false, Some(*counterparty_node_id), funding_txo);
+		self.claim_funds_internal(htlc_source, msg.payment_preimage.clone(), Some(forwarded_htlc_value), forwarded_htlc_rgb, false, false, Some(*counterparty_node_id), funding_txo);
 		Ok(())
 	}
 
@@ -7177,7 +7178,7 @@ where
 					MonitorEvent::HTLCEvent(htlc_update) => {
 						if let Some(preimage) = htlc_update.payment_preimage {
 							log_trace!(self.logger, "Claiming HTLC with preimage {} from our monitor", preimage);
-							self.claim_funds_internal(htlc_update.source, preimage, htlc_update.htlc_value_satoshis.map(|v| v * 1000), true, false, counterparty_node_id, funding_outpoint);
+							self.claim_funds_internal(htlc_update.source, preimage, htlc_update.htlc_value_satoshis.map(|v| v * 1000), htlc_update.htlc_value_rgb, true, false, counterparty_node_id, funding_outpoint);
 						} else {
 							log_trace!(self.logger, "Failing HTLC with hash {} from our monitor", &htlc_update.payment_hash);
 							let receiver = HTLCDestination::NextHopChannel { node_id: counterparty_node_id, channel_id: funding_outpoint.to_channel_id() };
@@ -10531,7 +10532,7 @@ where
 					.filter_map(|(htlc_source, (htlc, preimage_opt))| {
 						if let HTLCSource::PreviousHopData(_) = htlc_source {
 							if let Some(payment_preimage) = preimage_opt {
-								Some((htlc_source, payment_preimage, htlc.amount_msat,
+								Some((htlc_source, payment_preimage, htlc.amount_msat, htlc.amount_rgb,
 									// Check if `counterparty_opt.is_none()` to see if the
 									// downstream chan is closed (because we don't have a
 									// channel_id -> peer map entry).
@@ -10828,11 +10829,11 @@ where
 			channel_manager.fail_htlc_backwards_internal(&source, &payment_hash, &reason, receiver);
 		}
 
-		for (source, preimage, downstream_value, downstream_closed, downstream_node_id, downstream_funding) in pending_claims_to_replay {
+		for (source, preimage, downstream_value, downstream_rgb, downstream_closed, downstream_node_id, downstream_funding) in pending_claims_to_replay {
 			// We use `downstream_closed` in place of `from_onchain` here just as a guess - we
 			// don't remember in the `ChannelMonitor` where we got a preimage from, but if the
 			// channel is closed we just assume that it probably came from an on-chain claim.
-			channel_manager.claim_funds_internal(source, preimage, Some(downstream_value),
+			channel_manager.claim_funds_internal(source, preimage, Some(downstream_value), downstream_rgb,
 				downstream_closed, true, downstream_node_id, downstream_funding);
 		}
 
