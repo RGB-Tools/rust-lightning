@@ -475,6 +475,7 @@ struct HTLCStats {
 	on_holder_tx_holding_cell_htlcs_count: u32, // dust HTLCs *non*-included
 }
 
+#[derive(Debug)]
 /// An enum gathering stats on commitment transaction, either local or remote.
 struct CommitmentStats<'a> {
 	tx: CommitmentTransaction, // the transaction info
@@ -2969,7 +2970,7 @@ impl<SP: Deref> Channel<SP> where
 		Err(ChannelError::Close("Remote tried to fulfill/fail an HTLC we couldn't find".to_owned()))
 	}
 
-	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64), ChannelError> {
+	pub fn update_fulfill_htlc(&mut self, msg: &msgs::UpdateFulfillHTLC) -> Result<(HTLCSource, u64, Option<u64>), ChannelError> {
 		if (self.context.channel_state & (ChannelState::ChannelReady as u32)) != (ChannelState::ChannelReady as u32) {
 			return Err(ChannelError::Close("Got fulfill HTLC message when channel was not in an operational state".to_owned()));
 		}
@@ -2977,7 +2978,7 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::Close("Peer sent update_fulfill_htlc when we needed a channel_reestablish".to_owned()));
 		}
 
-		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat))
+		self.mark_outbound_htlc_removed(msg.htlc_id, Some(msg.payment_preimage), None).map(|htlc| (htlc.source.clone(), htlc.amount_msat, htlc.amount_rgb))
 	}
 
 	pub fn update_fail_htlc(&mut self, msg: &msgs::UpdateFailHTLC, fail_reason: HTLCFailReason) -> Result<(), ChannelError> {
