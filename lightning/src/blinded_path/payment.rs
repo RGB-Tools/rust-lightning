@@ -57,6 +57,7 @@ pub struct ReceiveTlvs {
 /// Data to construct a [`BlindedHop`] for sending a payment over.
 ///
 /// [`BlindedHop`]: crate::blinded_path::BlindedHop
+#[allow(dead_code)]
 pub(crate) enum BlindedPaymentTlvs {
 	/// This blinded payment data is for a forwarding node.
 	Forward(ForwardTlvs),
