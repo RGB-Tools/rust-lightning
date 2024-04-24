@@ -151,7 +151,7 @@ pub(super) struct PendingHTLCInfo {
 	/// The fee being skimmed off the top of this HTLC. If this is a forward, it'll be the fee we are
 	/// skimming. If we're receiving this HTLC, it's the fee that our counterparty skimmed.
 	pub(super) skimmed_fee_msat: Option<u64>,
-	pub(super) amount_rgb: Option<u64>,
+	pub(super) ingoing_amount_rgb: Option<u64>,
 	pub(super) outgoing_amount_rgb: Option<u64>,
 }
 
@@ -179,6 +179,7 @@ pub(super) struct PendingAddHTLCInfo {
 	// Note that this may be an outbound SCID alias for the associated channel.
 	prev_short_channel_id: u64,
 	prev_htlc_id: u64,
+	prev_htlc_value_rgb: Option<u64>,
 	prev_funding_outpoint: OutPoint,
 	prev_user_channel_id: u128,
 }
@@ -198,6 +199,7 @@ pub(crate) struct HTLCPreviousHopData {
 	short_channel_id: u64,
 	user_channel_id: Option<u128>,
 	htlc_id: u64,
+	htlc_value_rgb: Option<u64>,
 	incoming_packet_shared_secret: [u8; 32],
 	phantom_shared_secret: Option<[u8; 32]>,
 
@@ -2957,7 +2959,7 @@ where
 			outgoing_amt_msat: amt_to_forward,
 			outgoing_cltv_value,
 			skimmed_fee_msat: None,
-			amount_rgb: msg.amount_rgb,
+			ingoing_amount_rgb: msg.amount_rgb,
 			outgoing_amount_rgb,
 		})
 	}
@@ -2965,7 +2967,7 @@ where
 	fn construct_recv_pending_htlc_info(
 		&self, hop_data: msgs::InboundOnionPayload, shared_secret: [u8; 32], payment_hash: PaymentHash,
 		amt_msat: u64, cltv_expiry: u32, phantom_shared_secret: Option<[u8; 32]>, allow_underpay: bool,
-		counterparty_skimmed_fee_msat: Option<u64>, amount_rgb: Option<u64>
+		counterparty_skimmed_fee_msat: Option<u64>, ingoing_amount_rgb: Option<u64>
 	) -> Result<PendingHTLCInfo, InboundOnionErr> {
 		let (payment_data, keysend_preimage, custom_tlvs, onion_amt_msat, outgoing_cltv_value, payment_metadata, rgb_amount_to_forward) = match hop_data {
 			msgs::InboundOnionPayload::Receive {
@@ -3021,7 +3023,7 @@ where
 				msg: "Upstream node sent less than we were supposed to receive in payment",
 			});
 		}
-		match (rgb_amount_to_forward, amount_rgb) {
+		match (rgb_amount_to_forward, ingoing_amount_rgb) {
 			(Some(_), None) | (None, Some(_)) => {
 				return Err(InboundOnionErr {
 					err_code: 19,
@@ -3092,8 +3094,8 @@ where
 			outgoing_amt_msat: onion_amt_msat,
 			outgoing_cltv_value,
 			skimmed_fee_msat: counterparty_skimmed_fee_msat,
-			amount_rgb,
-			outgoing_amount_rgb: amount_rgb,
+			ingoing_amount_rgb,
+			outgoing_amount_rgb: rgb_amount_to_forward,
 		})
 	}
 
@@ -4311,6 +4313,7 @@ where
 				user_channel_id: Some(payment.prev_user_channel_id),
 				outpoint: payment.prev_funding_outpoint,
 				htlc_id: payment.prev_htlc_id,
+				htlc_value_rgb: payment.prev_htlc_value_rgb,
 				incoming_packet_shared_secret: payment.forward_info.incoming_shared_secret,
 				phantom_shared_secret: None,
 			});
@@ -4344,10 +4347,10 @@ where
 							for forward_info in pending_forwards.drain(..) {
 								match forward_info {
 									HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
-										prev_short_channel_id, prev_htlc_id, prev_funding_outpoint, prev_user_channel_id,
+										prev_short_channel_id, prev_htlc_id, prev_htlc_value_rgb, prev_funding_outpoint, prev_user_channel_id,
 										forward_info: PendingHTLCInfo {
 											routing, incoming_shared_secret, payment_hash, outgoing_amt_msat,
-											outgoing_cltv_value, amount_rgb, ..
+											outgoing_cltv_value, ingoing_amount_rgb, ..
 										}
 									}) => {
 										macro_rules! failure_handler {
@@ -4359,6 +4362,7 @@ where
 													user_channel_id: Some(prev_user_channel_id),
 													outpoint: prev_funding_outpoint,
 													htlc_id: prev_htlc_id,
+													htlc_value_rgb: prev_htlc_value_rgb,
 													incoming_packet_shared_secret: incoming_shared_secret,
 													phantom_shared_secret: $phantom_ss,
 												});
@@ -4415,7 +4419,7 @@ where
 													onion_utils::Hop::Receive(hop_data) => {
 														match self.construct_recv_pending_htlc_info(hop_data,
 															incoming_shared_secret, payment_hash, outgoing_amt_msat,
-															outgoing_cltv_value, Some(phantom_shared_secret), false, None, amount_rgb)
+															outgoing_cltv_value, Some(phantom_shared_secret), false, None, ingoing_amount_rgb)
 														{
 															Ok(info) => phantom_receives.push((prev_short_channel_id, prev_funding_outpoint, prev_user_channel_id, vec![(info, prev_htlc_id)])),
 															Err(InboundOnionErr { err_code, err_data, msg }) => failed_payment!(msg, err_code, err_data, Some(phantom_shared_secret))
@@ -4460,7 +4464,7 @@ where
 						for forward_info in pending_forwards.drain(..) {
 							match forward_info {
 								HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
-									prev_short_channel_id, prev_htlc_id, prev_funding_outpoint, prev_user_channel_id,
+									prev_short_channel_id, prev_htlc_id, prev_htlc_value_rgb, prev_funding_outpoint, prev_user_channel_id,
 									forward_info: PendingHTLCInfo {
 										incoming_shared_secret, payment_hash, outgoing_amt_msat, outgoing_cltv_value,
 										routing: PendingHTLCRouting::Forward { onion_packet, .. }, skimmed_fee_msat, outgoing_amount_rgb, ..
@@ -4472,6 +4476,7 @@ where
 										user_channel_id: Some(prev_user_channel_id),
 										outpoint: prev_funding_outpoint,
 										htlc_id: prev_htlc_id,
+										htlc_value_rgb: prev_htlc_value_rgb,
 										incoming_packet_shared_secret: incoming_shared_secret,
 										// Phantom payments are only PendingHTLCRouting::Receive.
 										phantom_shared_secret: None,
@@ -4523,7 +4528,7 @@ where
 					'next_forwardable_htlc: for forward_info in pending_forwards.drain(..) {
 						match forward_info {
 							HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
-								prev_short_channel_id, prev_htlc_id, prev_funding_outpoint, prev_user_channel_id,
+								prev_short_channel_id, prev_htlc_id, prev_htlc_value_rgb, prev_funding_outpoint, prev_user_channel_id,
 								forward_info: PendingHTLCInfo {
 									routing, incoming_shared_secret, payment_hash, incoming_amt_msat, outgoing_amt_msat,
 									skimmed_fee_msat, ..
@@ -4556,6 +4561,7 @@ where
 										user_channel_id: Some(prev_user_channel_id),
 										outpoint: prev_funding_outpoint,
 										htlc_id: prev_htlc_id,
+										htlc_value_rgb: prev_htlc_value_rgb,
 										incoming_packet_shared_secret: incoming_shared_secret,
 										phantom_shared_secret,
 									},
@@ -4586,6 +4592,7 @@ where
 												user_channel_id: $htlc.prev_hop.user_channel_id,
 												outpoint: prev_funding_outpoint,
 												htlc_id: $htlc.prev_hop.htlc_id,
+												htlc_value_rgb: $htlc.prev_hop.htlc_value_rgb,
 												incoming_packet_shared_secret: $htlc.prev_hop.incoming_packet_shared_secret,
 												phantom_shared_secret,
 											}), payment_hash,
@@ -5703,7 +5710,7 @@ where
 	}
 
 	fn claim_funds_internal(&self, source: HTLCSource, payment_preimage: PaymentPreimage,
-		forwarded_htlc_value_msat: Option<u64>, forwarded_htlc_rgb: Option<u64>, from_onchain: bool, startup_replay: bool,
+		forwarded_htlc_value_msat: Option<u64>, outbound_amount_forwarded_rgb: Option<u64>, from_onchain: bool, startup_replay: bool,
 		next_channel_counterparty_node_id: Option<PublicKey>, next_channel_outpoint: OutPoint
 	) {
 		match source {
@@ -5723,6 +5730,7 @@ where
 			},
 			HTLCSource::PreviousHopData(hop_data) => {
 				let prev_outpoint = hop_data.outpoint;
+				let inbound_amount_forwarded_rgb = hop_data.htlc_value_rgb;
 				let completed_blocker = RAAMonitorUpdateBlockingAction::from_prev_hop_data(&hop_data);
 				#[cfg(debug_assertions)]
 				let claiming_chan_funding_outpoint = hop_data.outpoint;
@@ -5809,7 +5817,8 @@ where
 									prev_channel_id: Some(prev_outpoint.to_channel_id()),
 									next_channel_id: Some(next_channel_outpoint.to_channel_id()),
 									outbound_amount_forwarded_msat: forwarded_htlc_value_msat,
-									outbound_amount_forwarded_rgb: forwarded_htlc_rgb,
+									outbound_amount_forwarded_rgb,
+									inbound_amount_forwarded_rgb,
 								},
 								downstream_counterparty_and_funding_outpoint: chan_to_release,
 							})
@@ -6803,10 +6812,11 @@ where
 
 					let mut forward_htlcs = self.forward_htlcs.lock().unwrap();
 					let forward_htlcs_empty = forward_htlcs.is_empty();
+					let prev_htlc_value_rgb = forward_info.ingoing_amount_rgb;
 					match forward_htlcs.entry(scid) {
 						hash_map::Entry::Occupied(mut entry) => {
 							entry.get_mut().push(HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
-								prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_user_channel_id, forward_info }));
+								prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_htlc_value_rgb, prev_user_channel_id, forward_info }));
 						},
 						hash_map::Entry::Vacant(entry) => {
 							if !is_our_scid && forward_info.incoming_amt_msat.is_some() &&
@@ -6824,13 +6834,13 @@ where
 											inbound_amount_msat: forward_info.incoming_amt_msat.unwrap(),
 											expected_outbound_amount_msat: forward_info.outgoing_amt_msat,
 											intercept_id,
-											inbound_rgb_amount: forward_info.amount_rgb,
+											inbound_rgb_amount: forward_info.ingoing_amount_rgb,
 											expected_outbound_rgb_amount: forward_info.outgoing_amount_rgb,
 											is_swap,
 											prev_short_channel_id,
 										}, None));
 										entry.insert(PendingAddHTLCInfo {
-											prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_user_channel_id, forward_info });
+											prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_htlc_value_rgb, prev_user_channel_id, forward_info });
 									},
 									hash_map::Entry::Occupied(_) => {
 										log_info!(self.logger, "Failed to forward incoming HTLC: detected duplicate intercepted payment over short channel id {}", scid);
@@ -6839,6 +6849,7 @@ where
 											user_channel_id: Some(prev_user_channel_id),
 											outpoint: prev_funding_outpoint,
 											htlc_id: prev_htlc_id,
+											htlc_value_rgb: prev_htlc_value_rgb,
 											incoming_packet_shared_secret: forward_info.incoming_shared_secret,
 											phantom_shared_secret: None,
 										});
@@ -6856,7 +6867,7 @@ where
 									push_forward_event = true;
 								}
 								entry.insert(vec!(HTLCForwardInfo::AddHTLC(PendingAddHTLCInfo {
-									prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_user_channel_id, forward_info })));
+									prev_short_channel_id, prev_funding_outpoint, prev_htlc_id, prev_htlc_value_rgb, prev_user_channel_id, forward_info })));
 							}
 						}
 					}
@@ -8369,6 +8380,7 @@ where
 						short_channel_id: htlc.prev_short_channel_id,
 						user_channel_id: Some(htlc.prev_user_channel_id),
 						htlc_id: htlc.prev_htlc_id,
+						htlc_value_rgb: htlc.prev_htlc_value_rgb,
 						incoming_packet_shared_secret: htlc.forward_info.incoming_shared_secret,
 						phantom_shared_secret: None,
 						outpoint: htlc.prev_funding_outpoint,
@@ -9334,7 +9346,7 @@ impl_writeable_tlv_based!(PendingHTLCInfo, {
 	(8, outgoing_cltv_value, required),
 	(9, incoming_amt_msat, option),
 	(10, skimmed_fee_msat, option),
-	(12, amount_rgb, required),
+	(12, ingoing_amount_rgb, required),
 	(14, outgoing_amount_rgb, required),
 });
 
@@ -9418,6 +9430,7 @@ impl_writeable_tlv_based!(HTLCPreviousHopData, {
 	(4, htlc_id, required),
 	(6, incoming_packet_shared_secret, required),
 	(7, user_channel_id, option),
+	(8, htlc_value_rgb, option),
 });
 
 impl Writeable for ClaimableHTLC {
@@ -9569,6 +9582,7 @@ impl_writeable_tlv_based!(PendingAddHTLCInfo, {
 	(2, prev_short_channel_id, required),
 	(4, prev_htlc_id, required),
 	(6, prev_funding_outpoint, required),
+	(8, prev_htlc_value_rgb, option),
 });
 
 impl_writeable_tlv_based_enum!(HTLCForwardInfo,

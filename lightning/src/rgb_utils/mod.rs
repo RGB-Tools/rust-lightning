@@ -83,6 +83,8 @@ pub struct RgbPaymentInfo {
 	pub remote_rgb_amount: u64,
 	/// Whether the RGB amount in route should be overridden
 	pub override_route_amount: bool,
+	/// Whether the payment is inbound
+	pub inbound: bool,
 }
 
 /// RGB transfer info
@@ -189,6 +191,7 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 				local_rgb_amount: rgb_info.local_rgb_amount,
 				remote_rgb_amount: rgb_info.remote_rgb_amount,
 				override_route_amount: false,
+				inbound: htlc.offered == counterparty,
 			};
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 			fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
@@ -554,7 +557,7 @@ pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 }
 
 /// Write RGB payment info to file
-pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, override_route_amount: bool) {
+pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, override_route_amount: bool, inbound: bool) {
 	let rgb_payment_info_path = ldk_data_dir.join(hex::encode(payment_hash.0));
 	let rgb_payment_info = RgbPaymentInfo {
 		contract_id,
@@ -562,6 +565,7 @@ pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHa
 		local_rgb_amount: 0,
 		remote_rgb_amount: 0,
 		override_route_amount,
+		inbound,
 	};
 	let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 	std::fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
