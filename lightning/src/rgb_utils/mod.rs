@@ -170,20 +170,22 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 
 		let htlc_payment_hash = hex::encode(htlc.payment_hash.0);
 		let htlc_proxy_id = format!("{chan_id}{htlc_payment_hash}");
-		let rgb_payment_info_path = ldk_data_dir.join(htlc_proxy_id);
+		let rgb_payment_info_proxy_id_path = ldk_data_dir.join(htlc_proxy_id);
 
-		let rgb_payment_info_hash_path = ldk_data_dir.join(htlc_payment_hash);
-		if rgb_payment_info_hash_path.exists() {
-			let mut rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path);
+		let rgb_payment_info_path = ldk_data_dir.join(htlc_payment_hash);
+		let mut rgb_payment_info_tmp_path = rgb_payment_info_path.clone();
+		rgb_payment_info_tmp_path.set_extension("pending");
+		if rgb_payment_info_tmp_path.exists() {
+			let mut rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_tmp_path);
 			rgb_payment_info.local_rgb_amount = rgb_info.local_rgb_amount;
 			rgb_payment_info.remote_rgb_amount = rgb_info.remote_rgb_amount;
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
-			fs::write(&rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
-			fs::remove_file(rgb_payment_info_hash_path).expect("able to remove file");
+			fs::write(&rgb_payment_info_proxy_id_path, serialized_info).expect("able to write rgb payment info file");
+			fs::remove_file(rgb_payment_info_tmp_path).expect("able to remove file");
 		}
 
-		let rgb_payment_info = if rgb_payment_info_path.exists() {
-			parse_rgb_payment_info(&rgb_payment_info_path)
+		let rgb_payment_info = if rgb_payment_info_proxy_id_path.exists() {
+			parse_rgb_payment_info(&rgb_payment_info_proxy_id_path)
 		} else {
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id: rgb_info.contract_id,
@@ -194,6 +196,7 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 				inbound: htlc.offered == counterparty,
 			};
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
+			fs::write(rgb_payment_info_proxy_id_path, serialized_info.clone()).expect("able to write rgb payment info file");
 			fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
 			rgb_payment_info
 		};
@@ -558,7 +561,9 @@ pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 
 /// Write RGB payment info to file
 pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, override_route_amount: bool, inbound: bool) {
-	let rgb_payment_info_path = ldk_data_dir.join(hex::encode(payment_hash.0));
+	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir);
+	let mut rgb_payment_info_tmp_path = rgb_payment_info_path.clone();
+	rgb_payment_info_tmp_path.set_extension("pending");
 	let rgb_payment_info = RgbPaymentInfo {
 		contract_id,
 		amount: amount_rgb,
@@ -568,7 +573,8 @@ pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHa
 		inbound,
 	};
 	let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
-	std::fs::write(rgb_payment_info_path, serialized_info).expect("able to write rgb payment info file");
+	std::fs::write(rgb_payment_info_path, serialized_info.clone()).expect("able to write rgb payment info file");
+	std::fs::write(rgb_payment_info_tmp_path, serialized_info).expect("able to write rgb payment info tmp file");
 }
 
 /// Rename RGB files from temporary to final channel ID
