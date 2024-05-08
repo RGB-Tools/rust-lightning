@@ -3528,6 +3528,9 @@ impl<SP: Deref> Channel<SP> where
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 					log_trace!(logger, " ...promoting outbound LocalAnnounced {} to Committed", &htlc.payment_hash);
 					htlc.state = OutboundHTLCState::Committed;
+					if let Some(amount_rgb) = htlc.amount_rgb {
+						rgb_offered_htlc += amount_rgb;
+					}
 				}
 				if let &mut OutboundHTLCState::AwaitingRemoteRevokeToRemove(ref mut outcome) = &mut htlc.state {
 					log_trace!(logger, " ...promoting outbound AwaitingRemoteRevokeToRemove {} to AwaitingRemovedRemoteRevoke", &htlc.payment_hash);
@@ -3537,14 +3540,13 @@ impl<SP: Deref> Channel<SP> where
 					htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 					require_commitment = true;
 				}
-				if let Some(amount_rgb) = htlc.amount_rgb {
-					rgb_offered_htlc += amount_rgb;
-				}
 			}
 		}
 		self.context.value_to_self_msat = (self.context.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
 		if self.context.is_colored() {
-			update_rgb_channel_amount_pending(&self.context.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.context.ldk_data_dir);
+			if rgb_offered_htlc > 0 || rgb_received_htlc > 0 {
+				update_rgb_channel_amount_pending(&self.context.channel_id, rgb_offered_htlc, rgb_received_htlc, &self.context.ldk_data_dir);
+			}
 		}
 
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
@@ -5496,7 +5498,9 @@ impl<SP: Deref> Channel<SP> where
 			}
 		}
 		if self.context.is_colored() {
-			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
+			if rgb_received_htlc > 0 {
+				update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
+			}
 		}
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {

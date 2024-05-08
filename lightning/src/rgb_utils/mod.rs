@@ -58,6 +58,8 @@ pub const BITCOIN_NETWORK_FNAME: &str = "bitcoin_network";
 pub const ELECTRUM_URL_FNAME: &str = "electrum_url";
 /// Name of the file containing the wallet fingerprint
 pub const WALLET_FINGERPRINT_FNAME: &str = "wallet_fingerprint";
+const INBOUND_EXT: &str = "inbound";
+const OUTBOUND_EXT: &str = "outbound";
 
 /// RGB channel info
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,7 +84,7 @@ pub struct RgbPaymentInfo {
 	/// RGB remote amount
 	pub remote_rgb_amount: u64,
 	/// Whether the RGB amount in route should be overridden
-	pub override_route_amount: bool,
+	pub swap_payment: bool,
 	/// Whether the payment is inbound
 	pub inbound: bool,
 }
@@ -166,15 +168,29 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 		.assignments_type(&FieldName::from("beneficiary")).expect("valid assignment");
 
 	for htlc in commitment_tx.htlcs() {
+		if htlc.amount_rgb.unwrap_or(0) == 0 {
+            continue;
+        }
+		let htlc_amount_rgb = htlc.amount_rgb.expect("this HTLC has RGB assets");
+
 		let htlc_vout = htlc.transaction_output_index.unwrap();
+
+		let inbound = htlc.offered == counterparty;
 
 		let htlc_payment_hash = hex::encode(htlc.payment_hash.0);
 		let htlc_proxy_id = format!("{chan_id}{htlc_payment_hash}");
-		let rgb_payment_info_proxy_id_path = ldk_data_dir.join(htlc_proxy_id);
-
+		let mut rgb_payment_info_proxy_id_path = ldk_data_dir.join(htlc_proxy_id);
 		let rgb_payment_info_path = ldk_data_dir.join(htlc_payment_hash);
-		let mut rgb_payment_info_tmp_path = rgb_payment_info_path.clone();
-		rgb_payment_info_tmp_path.set_extension("pending");
+		let mut rgb_payment_info_path = rgb_payment_info_path.clone();
+		if inbound {
+			rgb_payment_info_proxy_id_path.set_extension(INBOUND_EXT);
+			rgb_payment_info_path.set_extension(INBOUND_EXT);
+		} else {
+			rgb_payment_info_proxy_id_path.set_extension(OUTBOUND_EXT);
+			rgb_payment_info_path.set_extension(OUTBOUND_EXT);
+		}
+		let rgb_payment_info_tmp_path = append_pending_extension(&rgb_payment_info_path);
+
 		if rgb_payment_info_tmp_path.exists() {
 			let mut rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_tmp_path);
 			rgb_payment_info.local_rgb_amount = rgb_info.local_rgb_amount;
@@ -189,11 +205,11 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 		} else {
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id: rgb_info.contract_id,
-				amount: htlc.amount_rgb.unwrap(),
+				amount: htlc_amount_rgb,
 				local_rgb_amount: rgb_info.local_rgb_amount,
 				remote_rgb_amount: rgb_info.remote_rgb_amount,
-				override_route_amount: false,
-				inbound: htlc.offered == counterparty,
+				swap_payment: false,
+				inbound,
 			};
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 			fs::write(rgb_payment_info_proxy_id_path, serialized_info.clone()).expect("able to write rgb payment info file");
@@ -201,7 +217,7 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 			rgb_payment_info
 		};
 
-		if htlc.offered == counterparty {
+		if inbound {
 			rgb_received_htlc += rgb_payment_info.amount
 		} else {
 			rgb_offered_htlc += rgb_payment_info.amount
@@ -328,10 +344,10 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 
 /// Color HTLC transaction
 pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitment, ldk_data_dir: &Path) -> Result<(), ChannelError> {
-	let htlc_amount_rgb = htlc.amount_rgb.expect("this is a rgb channel");
-	if htlc_amount_rgb == 0 {
+	if htlc.amount_rgb.unwrap_or(0) == 0 {
 		return Ok(())
 	}
+	let htlc_amount_rgb = htlc.amount_rgb.expect("this HTLC has RGB assets");
 
 	htlc_tx.output.push(TxOut { value: 0, script_pubkey: Script::new_op_return(&[1]) });
 	let psbt = PartiallySignedTransaction::from_unsigned_tx(htlc_tx.clone()).expect("valid transaction");
@@ -511,8 +527,10 @@ pub(crate) fn color_closing(channel_id: &ChannelId, funding_outpoint: &OutPoint,
 }
 
 /// Get RgbPaymentInfo file path
-pub fn get_rgb_payment_info_path(payment_hash: &PaymentHash, ldk_data_dir: &Path) -> PathBuf {
-	ldk_data_dir.join(hex::encode(payment_hash.0))
+pub fn get_rgb_payment_info_path(payment_hash: &PaymentHash, ldk_data_dir: &Path, inbound: bool) -> PathBuf {
+	let mut path = ldk_data_dir.join(hex::encode(payment_hash.0));
+	path.set_extension(if inbound { INBOUND_EXT } else { OUTBOUND_EXT });
+	path
 }
 
 /// Parse RgbPaymentInfo
@@ -559,17 +577,22 @@ pub fn write_rgb_channel_info(path: &PathBuf, rgb_info: &RgbInfo) {
 	fs::write(path, serialized_info).expect("able to write")
 }
 
+fn append_pending_extension(path: &PathBuf) -> PathBuf {
+	let mut new_path = path.clone();
+	new_path.set_extension(format!("{}_pending", new_path.extension().unwrap().to_string_lossy()));
+	new_path
+}
+
 /// Write RGB payment info to file
-pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, override_route_amount: bool, inbound: bool) {
-	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir);
-	let mut rgb_payment_info_tmp_path = rgb_payment_info_path.clone();
-	rgb_payment_info_tmp_path.set_extension("pending");
+pub fn write_rgb_payment_info_file(ldk_data_dir: &Path, payment_hash: &PaymentHash, contract_id: ContractId, amount_rgb: u64, swap_payment: bool, inbound: bool) {
+	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir, inbound);
+	let rgb_payment_info_tmp_path = append_pending_extension(&rgb_payment_info_path);
 	let rgb_payment_info = RgbPaymentInfo {
 		contract_id,
 		amount: amount_rgb,
 		local_rgb_amount: 0,
 		remote_rgb_amount: 0,
-		override_route_amount,
+		swap_payment,
 		inbound,
 	};
 	let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
@@ -716,12 +739,13 @@ pub(crate) fn update_rgb_channel_amount_pending(channel_id: &ChannelId, rgb_offe
 
 /// Whether the payment is colored
 pub(crate) fn is_payment_rgb(ldk_data_dir: &Path, payment_hash: &PaymentHash) -> bool {
-	ldk_data_dir.join(hex::encode(payment_hash.0)).exists()
+	get_rgb_payment_info_path(payment_hash, ldk_data_dir, false).exists() ||
+		get_rgb_payment_info_path(payment_hash, ldk_data_dir, true).exists()
 }
 
 /// Filter first_hops for contract_id
 pub(crate) fn filter_first_hops(ldk_data_dir: &Path, payment_hash: &PaymentHash, first_hops: &mut Vec<&ChannelDetails>) -> ContractId {
-	let rgb_payment_info_path = ldk_data_dir.join(hex::encode(payment_hash.0));
+	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir, false);
 	let serialized_info = fs::read_to_string(rgb_payment_info_path).expect("valid rgb payment info file");
 	let rgb_payment_info: RgbPaymentInfo = serde_json::from_str(&serialized_info).expect("valid rgb payment info file");
 	let contract_id = rgb_payment_info.contract_id;

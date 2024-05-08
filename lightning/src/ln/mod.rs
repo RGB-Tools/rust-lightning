@@ -88,6 +88,13 @@ impl core::fmt::Display for PaymentHash {
 	}
 }
 
+impl PaymentHash {
+	/// Create a payment hash consisting of all-zeros data (e.g. when uninitialized or a placeholder).
+	pub fn new_zero() -> Self {
+		Self([0; 32])
+	}
+}
+
 /// payment_preimage type, use to route payment between hop
 ///
 /// This is not exported to bindings users as we just use [u8; 32] directly

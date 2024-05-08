@@ -48,7 +48,7 @@ use crate::ln::channel::{Channel, ChannelPhase, ChannelContext, ChannelError, Ch
 use crate::ln::features::{Bolt12InvoiceFeatures, ChannelFeatures, ChannelTypeFeatures, InitFeatures, NodeFeatures};
 #[cfg(any(feature = "_test_utils", test))]
 use crate::ln::features::Bolt11InvoiceFeatures;
-use crate::rgb_utils::{handle_funding, parse_rgb_payment_info};
+use crate::rgb_utils::{get_rgb_payment_info_path, handle_funding, parse_rgb_payment_info};
 use crate::routing::gossip::NetworkGraph;
 use crate::routing::router::{BlindedTail, DefaultRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route, RouteParameters, Router};
 use crate::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
@@ -3472,11 +3472,10 @@ where
 		// The top-level caller should hold the total_consistency_lock read lock.
 		debug_assert!(self.total_consistency_lock.try_write().is_err());
 
-		let htlc_payment_hash = hex::encode(payment_hash.0);
-		let rgb_payment_info_hash_path = self.ldk_data_dir.join(htlc_payment_hash);
-		let path = if rgb_payment_info_hash_path.exists() {
-			let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path);
-			if rgb_payment_info.override_route_amount {
+		let rgb_payment_info_hash_path_outbound = get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
+		let path = if rgb_payment_info_hash_path_outbound.exists() {
+			let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path_outbound);
+			if rgb_payment_info.swap_payment {
 				let mut path = path.clone();
 				for hop in &mut path.hops {
 					hop.rgb_amount = Some(rgb_payment_info.amount);
@@ -5810,6 +5809,7 @@ where
 									claimed_htlc_value.checked_sub(forwarded_htlc_value)
 								} else { None }
 							} else { None };
+							let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0[..]).into_inner());
 							Some(MonitorUpdateCompletionAction::EmitEventAndFreeOtherChannel {
 								event: events::Event::PaymentForwarded {
 									fee_earned_msat,
@@ -5819,6 +5819,7 @@ where
 									outbound_amount_forwarded_msat: forwarded_htlc_value_msat,
 									outbound_amount_forwarded_rgb,
 									inbound_amount_forwarded_rgb,
+									payment_hash,
 								},
 								downstream_counterparty_and_funding_outpoint: chan_to_release,
 							})

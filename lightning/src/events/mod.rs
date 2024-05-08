@@ -780,6 +780,8 @@ pub enum Event {
 		outbound_amount_forwarded_rgb: Option<u64>,
 		/// The rgb amount forwarded inbound.
 		inbound_amount_forwarded_rgb: Option<u64>,
+		/// The payment hash used for this payment.
+		payment_hash: PaymentHash,
 	},
 	/// Used to indicate that a channel with the given `channel_id` is being opened and pending
 	/// confirmation on-chain.
@@ -1061,6 +1063,7 @@ impl Writeable for Event {
 			&Event::PaymentForwarded {
 				fee_earned_msat, prev_channel_id, claim_from_onchain_tx,
 				next_channel_id, outbound_amount_forwarded_msat, outbound_amount_forwarded_rgb, inbound_amount_forwarded_rgb,
+				payment_hash,
 			} => {
 				7u8.write(writer)?;
 				write_tlv_fields!(writer, {
@@ -1071,6 +1074,7 @@ impl Writeable for Event {
 					(5, outbound_amount_forwarded_msat, option),
 					(6, outbound_amount_forwarded_rgb, option),
 					(7, inbound_amount_forwarded_rgb, option),
+					(8, payment_hash, required),
 				});
 			},
 			&Event::ChannelClosed { ref channel_id, ref user_channel_id, ref reason,
@@ -1377,6 +1381,7 @@ impl MaybeReadable for Event {
 					let mut outbound_amount_forwarded_msat = None;
 					let mut outbound_amount_forwarded_rgb = None;
 					let mut inbound_amount_forwarded_rgb = None;
+					let mut payment_hash = PaymentHash::new_zero();
 					read_tlv_fields!(reader, {
 						(0, fee_earned_msat, option),
 						(1, prev_channel_id, option),
@@ -1385,10 +1390,12 @@ impl MaybeReadable for Event {
 						(5, outbound_amount_forwarded_msat, option),
 						(6, outbound_amount_forwarded_rgb, option),
 						(7, inbound_amount_forwarded_rgb, option),
+						(8, payment_hash, required),
 					});
 					Ok(Some(Event::PaymentForwarded {
 						fee_earned_msat, prev_channel_id, claim_from_onchain_tx, next_channel_id,
 						outbound_amount_forwarded_msat, outbound_amount_forwarded_rgb, inbound_amount_forwarded_rgb,
+						payment_hash,
 					}))
 				};
 				f()
