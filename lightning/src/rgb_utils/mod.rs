@@ -120,7 +120,7 @@ pub fn get_rgb_runtime(ldk_data_dir: &Path) -> RgbRuntime {
 }
 
 /// Read TransferInfo file
-pub fn read_rgb_transfer_info(path: &str) -> TransferInfo {
+pub fn read_rgb_transfer_info(path: &Path) -> TransferInfo {
 	let serialized_info = fs::read_to_string(path).expect("able to read transfer info file");
 	serde_json::from_str(&serialized_info).expect("valid transfer info")
 }
@@ -359,7 +359,7 @@ pub(crate) fn color_htlc(htlc_tx: &mut Transaction, htlc: &HTLCOutputInCommitmen
 	let commitment_txid = consignment_htlc_outpoint.txid;
 
 	let transfer_info_path = ldk_data_dir.join(format!("{}_transfer_info", commitment_txid));
-	let transfer_info = read_rgb_transfer_info(transfer_info_path.to_str().expect("valid transfer into file path"));
+	let transfer_info = read_rgb_transfer_info(&transfer_info_path);
 	let contract_id = transfer_info.contract_id;
 
 	let mut beneficiaries = vec![];
