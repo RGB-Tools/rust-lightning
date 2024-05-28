@@ -208,7 +208,7 @@ pub(crate) fn color_commitment<SP: Deref>(channel_context: &ChannelContext<SP>, 
 				amount: htlc_amount_rgb,
 				local_rgb_amount: rgb_info.local_rgb_amount,
 				remote_rgb_amount: rgb_info.remote_rgb_amount,
-				swap_payment: false,
+				swap_payment: true,
 				inbound,
 			};
 			let serialized_info = serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");

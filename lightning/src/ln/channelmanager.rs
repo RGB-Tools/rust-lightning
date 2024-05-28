@@ -3476,13 +3476,13 @@ where
 		let path = if rgb_payment_info_hash_path_outbound.exists() {
 			let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_hash_path_outbound);
 			if rgb_payment_info.swap_payment {
+				path.clone()
+			} else {
 				let mut path = path.clone();
 				for hop in &mut path.hops {
 					hop.rgb_amount = Some(rgb_payment_info.amount);
 				}
 				path
-			} else {
-				path.clone()
 			}
 		} else {
 			path.clone()
