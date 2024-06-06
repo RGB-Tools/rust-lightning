@@ -14,15 +14,16 @@
 use crate::chain::channelmonitor::{CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::sign::{EntropySource, NodeSigner, Recipient};
 use crate::events::{Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider, PathFailure, PaymentFailureReason};
-use crate::ln::{PaymentHash, PaymentSecret};
+use crate::ln::types::{PaymentHash, PaymentSecret};
 use crate::ln::channel::EXPIRE_PREV_CONFIG_TICKS;
 use crate::ln::channelmanager::{HTLCForwardInfo, FailureCode, CLTV_FAR_FAR_AWAY, DISABLE_GOSSIP_TICKS, MIN_CLTV_EXPIRY_DELTA, PendingAddHTLCInfo, PendingHTLCInfo, PendingHTLCRouting, PaymentId, RecipientOnionFields};
 use crate::ln::onion_utils;
 use crate::routing::gossip::{NetworkUpdate, RoutingFees};
 use crate::routing::router::{get_route, PaymentParameters, Route, RouteParameters, RouteHint, RouteHintHop};
 use crate::ln::features::{InitFeatures, Bolt11InvoiceFeatures};
+use crate::ln::functional_test_utils::test_default_channel_config;
 use crate::ln::msgs;
-use crate::ln::msgs::{ChannelMessageHandler, ChannelUpdate};
+use crate::ln::msgs::{ChannelMessageHandler, ChannelUpdate, OutboundTrampolinePayload};
 use crate::ln::wire::Encode;
 use crate::util::ser::{Writeable, Writer, BigSize};
 use crate::util::test_utils;
@@ -35,11 +36,11 @@ use bitcoin::hashes::hmac::{Hmac, HmacEngine};
 use bitcoin::hashes::sha256::Hash as Sha256;
 
 use bitcoin::secp256k1;
-use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 use crate::io;
 use crate::prelude::*;
-use core::default::Default;
+use bitcoin::hashes::hex::FromHex;
 
 use crate::ln::functional_test_utils::*;
 
@@ -328,7 +329,7 @@ fn test_onion_failure() {
 	// to 2000, which is above the default value of 1000 set in create_node_chanmgrs.
 	// This exposed a previous bug because we were using the wrong value all the way down in
 	// Channel::get_counterparty_htlc_minimum_msat().
-	let mut node_2_cfg: UserConfig = Default::default();
+	let mut node_2_cfg: UserConfig = test_default_channel_config();
 	node_2_cfg.channel_handshake_config.our_htlc_minimum_msat = 2000;
 	node_2_cfg.channel_handshake_config.announced_channel = true;
 	node_2_cfg.channel_handshake_limits.force_announced_channel_preference = false;
@@ -639,7 +640,7 @@ fn test_onion_failure() {
 			let um = onion_utils::gen_um_from_shared_secret(&onion_keys[1].shared_secret.as_ref());
 			let mut hmac = HmacEngine::<Sha256>::new(&um);
 			hmac.input(&decoded_err_packet.encode()[32..]);
-			decoded_err_packet.hmac = Hmac::from_engine(hmac).into_inner();
+			decoded_err_packet.hmac = Hmac::from_engine(hmac).to_byte_array();
 			msg.reason = onion_utils::encrypt_failure_packet(
 				&onion_keys[1].shared_secret.as_ref(), &decoded_err_packet.encode()[..])
 		}, || nodes[2].node.fail_htlc_backwards(&payment_hash), false, None,
@@ -662,7 +663,7 @@ fn test_onion_failure() {
 			let um = onion_utils::gen_um_from_shared_secret(&onion_keys[0].shared_secret.as_ref());
 			let mut hmac = HmacEngine::<Sha256>::new(&um);
 			hmac.input(&decoded_err_packet.encode()[32..]);
-			decoded_err_packet.hmac = Hmac::from_engine(hmac).into_inner();
+			decoded_err_packet.hmac = Hmac::from_engine(hmac).to_byte_array();
 			msg.reason = onion_utils::encrypt_failure_packet(
 				&onion_keys[0].shared_secret.as_ref(), &decoded_err_packet.encode()[..])
 		}, || {}, true, Some(0x1000|7),
@@ -686,7 +687,7 @@ fn test_onion_failure() {
 			let um = onion_utils::gen_um_from_shared_secret(&onion_keys[1].shared_secret.as_ref());
 			let mut hmac = HmacEngine::<Sha256>::new(&um);
 			hmac.input(&decoded_err_packet.encode()[32..]);
-			decoded_err_packet.hmac = Hmac::from_engine(hmac).into_inner();
+			decoded_err_packet.hmac = Hmac::from_engine(hmac).to_byte_array();
 			msg.reason = onion_utils::encrypt_failure_packet(
 				&onion_keys[1].shared_secret.as_ref(), &decoded_err_packet.encode()[..])
 		}, || nodes[2].node.fail_htlc_backwards(&payment_hash), true, Some(0x1000|7),
@@ -966,6 +967,25 @@ fn test_always_create_tlv_format_onion_payloads() {
 	}
 }
 
+#[test]
+fn test_trampoline_onion_payload_serialization() {
+	// As per https://github.com/lightning/bolts/blob/c01d2e6267d4a8d1095f0f1188970055a9a22d29/bolt04/trampoline-payment-onion-test.json#L3
+	let trampoline_payload = OutboundTrampolinePayload::Forward {
+		amt_to_forward: 100000000,
+		outgoing_cltv_value: 800000,
+		outgoing_node_id: PublicKey::from_slice(&<Vec<u8>>::from_hex("02edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145").unwrap()).unwrap(),
+	};
+
+	let slice_to_hex = |slice: &[u8]| {
+		slice.iter()
+			.map(|b| format!("{:02x}", b).to_string())
+			.collect::<String>()
+	};
+
+	let carol_payload_hex = slice_to_hex(&trampoline_payload.encode());
+	assert_eq!(carol_payload_hex, "2e020405f5e10004030c35000e2102edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145");
+}
+
 fn do_test_fail_htlc_backwards_with_reason(failure_code: FailureCode) {
 
 	let chanmon_cfgs = create_chanmon_cfgs(2);
@@ -1119,7 +1139,7 @@ fn test_phantom_onion_hmac_failure() {
 				}, ..
 			}) => {
 				onion_packet.hmac[onion_packet.hmac.len() - 1] ^= 1;
-				Sha256::hash(&onion_packet.hop_data).into_inner().to_vec()
+				Sha256::hash(&onion_packet.hop_data).to_byte_array().to_vec()
 			},
 			_ => panic!("Unexpected forward"),
 		}
@@ -1317,7 +1337,7 @@ fn test_phantom_failure_too_low_cltv() {
 	// Ensure the payment fails with the expected error.
 	let mut error_data = recv_value_msat.to_be_bytes().to_vec();
 	error_data.extend_from_slice(
-		&nodes[0].node.best_block.read().unwrap().height().to_be_bytes(),
+		&nodes[0].node.best_block.read().unwrap().height.to_be_bytes(),
 	);
 	let mut fail_conditions = PaymentFailedConditions::new()
 		.blamed_scid(phantom_scid)
@@ -1447,7 +1467,7 @@ fn test_phantom_failure_too_low_recv_amt() {
 
 	// Ensure the payment fails with the expected error.
 	let mut error_data = bad_recv_amt_msat.to_be_bytes().to_vec();
-	error_data.extend_from_slice(&nodes[1].node.best_block.read().unwrap().height().to_be_bytes());
+	error_data.extend_from_slice(&nodes[1].node.best_block.read().unwrap().height.to_be_bytes());
 	let mut fail_conditions = PaymentFailedConditions::new()
 		.blamed_scid(phantom_scid)
 		.expected_htlc_error_data(0x4000 | 15, &error_data);
@@ -1554,7 +1574,7 @@ fn test_phantom_failure_reject_payment() {
 
 	// Ensure the payment fails with the expected error.
 	let mut error_data = recv_amt_msat.to_be_bytes().to_vec();
-	error_data.extend_from_slice(&nodes[1].node.best_block.read().unwrap().height().to_be_bytes());
+	error_data.extend_from_slice(&nodes[1].node.best_block.read().unwrap().height.to_be_bytes());
 	let mut fail_conditions = PaymentFailedConditions::new()
 		.blamed_scid(phantom_scid)
 		.expected_htlc_error_data(0x4000 | 15, &error_data);

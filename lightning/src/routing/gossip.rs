@@ -18,14 +18,12 @@ use bitcoin::secp256k1;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash;
-use bitcoin::hashes::hex::FromHex;
-
 use bitcoin::network::constants::Network;
 
 use rgb_lib::ContractId;
 
 use crate::events::{MessageSendEvent, MessageSendEventsProvider};
-use crate::ln::ChannelId;
+use crate::ln::types::ChannelId;
 use crate::ln::features::{ChannelFeatures, NodeFeatures, InitFeatures};
 use crate::ln::msgs::{DecodeError, ErrorAction, Init, LightningError, RoutingMessageHandler, SocketAddress, MAX_VALUE_MSAT};
 use crate::ln::msgs::{ChannelAnnouncement, ChannelUpdate, NodeAnnouncement, GossipTimestampFilter};
@@ -42,7 +40,6 @@ use crate::io;
 use crate::io_extras::{copy, sink};
 use crate::prelude::*;
 use core::{cmp, fmt};
-use core::convert::TryFrom;
 use crate::sync::{RwLock, RwLockReadGuard, LockTestExt};
 #[cfg(feature = "std")]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -78,8 +75,23 @@ impl NodeId {
 		NodeId(pubkey.serialize())
 	}
 
+	/// Create a new NodeId from a slice of bytes
+	pub fn from_slice(bytes: &[u8]) -> Result<Self, DecodeError> {
+		if bytes.len() != PUBLIC_KEY_SIZE {
+			return Err(DecodeError::InvalidValue);
+		}
+		let mut data = [0; PUBLIC_KEY_SIZE];
+		data.copy_from_slice(bytes);
+		Ok(NodeId(data))
+	}
+
 	/// Get the public key slice from this NodeId
 	pub fn as_slice(&self) -> &[u8] {
+		&self.0
+	}
+
+	/// Get the public key as an array from this NodeId
+	pub fn as_array(&self) -> &[u8; PUBLIC_KEY_SIZE] {
 		&self.0
 	}
 
@@ -156,10 +168,10 @@ impl TryFrom<NodeId> for PublicKey {
 }
 
 impl FromStr for NodeId {
-	type Err = bitcoin::hashes::hex::Error;
+	type Err = hex::parse::HexToArrayError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let data: [u8; PUBLIC_KEY_SIZE] = FromHex::from_hex(s)?;
+		let data: [u8; PUBLIC_KEY_SIZE] = hex::FromHex::from_hex(s)?;
 		Ok(NodeId(data))
 	}
 }
@@ -414,11 +426,17 @@ macro_rules! get_pubkey_from_node_id {
 	}
 }
 
+fn message_sha256d_hash<M: Writeable>(msg: &M) -> Sha256dHash {
+	let mut engine = Sha256dHash::engine();
+	msg.write(&mut engine).expect("In-memory structs should not fail to serialize");
+	Sha256dHash::from_engine(engine)
+}
+
 /// Verifies the signature of a [`NodeAnnouncement`].
 ///
 /// Returns an error if it is invalid.
 pub fn verify_node_announcement<C: Verification>(msg: &NodeAnnouncement, secp_ctx: &Secp256k1<C>) -> Result<(), LightningError> {
-	let msg_hash = hash_to_message!(&Sha256dHash::hash(&msg.contents.encode()[..])[..]);
+	let msg_hash = hash_to_message!(&message_sha256d_hash(&msg.contents)[..]);
 	secp_verify_sig!(secp_ctx, &msg_hash, &msg.signature, &get_pubkey_from_node_id!(msg.contents.node_id, "node_announcement"), "node_announcement");
 
 	Ok(())
@@ -428,7 +446,7 @@ pub fn verify_node_announcement<C: Verification>(msg: &NodeAnnouncement, secp_ct
 ///
 /// Returns an error if one of the signatures is invalid.
 pub fn verify_channel_announcement<C: Verification>(msg: &ChannelAnnouncement, secp_ctx: &Secp256k1<C>) -> Result<(), LightningError> {
-	let msg_hash = hash_to_message!(&Sha256dHash::hash(&msg.contents.encode()[..])[..]);
+	let msg_hash = hash_to_message!(&message_sha256d_hash(&msg.contents)[..]);
 	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_1, &get_pubkey_from_node_id!(msg.contents.node_id_1, "channel_announcement"), "channel_announcement");
 	secp_verify_sig!(secp_ctx, &msg_hash, &msg.node_signature_2, &get_pubkey_from_node_id!(msg.contents.node_id_2, "channel_announcement"), "channel_announcement");
 	secp_verify_sig!(secp_ctx, &msg_hash, &msg.bitcoin_signature_1, &get_pubkey_from_node_id!(msg.contents.bitcoin_key_1, "channel_announcement"), "channel_announcement");
@@ -691,7 +709,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 			// Prior replies should use the number of blocks that fit into the reply. Overflow
 			// safe since first_blocknum is always <= last SCID's block.
 			else {
-				(false, block_from_scid(batch.last().unwrap()) - first_blocknum)
+				(false, block_from_scid(*batch.last().unwrap()) - first_blocknum)
 			};
 
 			prev_batch_endblock = first_blocknum + number_of_blocks;
@@ -865,31 +883,31 @@ impl ChannelInfo {
 	/// Returns a [`DirectedChannelInfo`] for the channel directed to the given `target` from a
 	/// returned `source`, or `None` if `target` is not one of the channel's counterparties.
 	pub fn as_directed_to(&self, target: &NodeId) -> Option<(DirectedChannelInfo, &NodeId)> {
-		let (direction, source) = {
+		let (direction, source, outbound) = {
 			if target == &self.node_one {
-				(self.two_to_one.as_ref(), &self.node_two)
+				(self.two_to_one.as_ref(), &self.node_two, false)
 			} else if target == &self.node_two {
-				(self.one_to_two.as_ref(), &self.node_one)
+				(self.one_to_two.as_ref(), &self.node_one, true)
 			} else {
 				return None;
 			}
 		};
-		direction.map(|dir| (DirectedChannelInfo::new(self, dir), source))
+		direction.map(|dir| (DirectedChannelInfo::new(self, dir, outbound), source))
 	}
 
 	/// Returns a [`DirectedChannelInfo`] for the channel directed from the given `source` to a
 	/// returned `target`, or `None` if `source` is not one of the channel's counterparties.
 	pub fn as_directed_from(&self, source: &NodeId) -> Option<(DirectedChannelInfo, &NodeId)> {
-		let (direction, target) = {
+		let (direction, target, outbound) = {
 			if source == &self.node_one {
-				(self.one_to_two.as_ref(), &self.node_two)
+				(self.one_to_two.as_ref(), &self.node_two, true)
 			} else if source == &self.node_two {
-				(self.two_to_one.as_ref(), &self.node_one)
+				(self.two_to_one.as_ref(), &self.node_one, false)
 			} else {
 				return None;
 			}
 		};
-		direction.map(|dir| (DirectedChannelInfo::new(self, dir), target))
+		direction.map(|dir| (DirectedChannelInfo::new(self, dir, outbound), target))
 	}
 
 	/// Returns a [`ChannelUpdateInfo`] based on the direction implied by the channel_flag.
@@ -989,51 +1007,55 @@ impl Readable for ChannelInfo {
 pub struct DirectedChannelInfo<'a> {
 	channel: &'a ChannelInfo,
 	direction: &'a ChannelUpdateInfo,
-	htlc_maximum_msat: u64,
-	effective_capacity: EffectiveCapacity,
+	/// The direction this channel is in - if set, it indicates that we're traversing the channel
+	/// from [`ChannelInfo::node_one`] to [`ChannelInfo::node_two`].
+	from_node_one: bool,
 }
 
 impl<'a> DirectedChannelInfo<'a> {
 	#[inline]
-	fn new(channel: &'a ChannelInfo, direction: &'a ChannelUpdateInfo) -> Self {
-		let mut htlc_maximum_msat = direction.htlc_maximum_msat;
-		let capacity_msat = channel.capacity_sats.map(|capacity_sats| capacity_sats * 1000);
-
-		let effective_capacity = match capacity_msat {
-			Some(capacity_msat) => {
-				htlc_maximum_msat = cmp::min(htlc_maximum_msat, capacity_msat);
-				EffectiveCapacity::Total { capacity_msat, htlc_maximum_msat: htlc_maximum_msat }
-			},
-			None => EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: htlc_maximum_msat },
-		};
-
-		Self {
-			channel, direction, htlc_maximum_msat, effective_capacity
-		}
+	fn new(channel: &'a ChannelInfo, direction: &'a ChannelUpdateInfo, from_node_one: bool) -> Self {
+		Self { channel, direction, from_node_one }
 	}
 
 	/// Returns information for the channel.
 	#[inline]
 	pub fn channel(&self) -> &'a ChannelInfo { self.channel }
 
-	/// Returns the maximum HTLC amount allowed over the channel in the direction.
-	#[inline]
-	pub fn htlc_maximum_msat(&self) -> u64 {
-		self.htlc_maximum_msat
-	}
-
 	/// Returns the [`EffectiveCapacity`] of the channel in the direction.
 	///
 	/// This is either the total capacity from the funding transaction, if known, or the
 	/// `htlc_maximum_msat` for the direction as advertised by the gossip network, if known,
 	/// otherwise.
+	#[inline]
 	pub fn effective_capacity(&self) -> EffectiveCapacity {
-		self.effective_capacity
+		let mut htlc_maximum_msat = self.direction().htlc_maximum_msat;
+		let capacity_msat = self.channel.capacity_sats.map(|capacity_sats| capacity_sats * 1000);
+
+		match capacity_msat {
+			Some(capacity_msat) => {
+				htlc_maximum_msat = cmp::min(htlc_maximum_msat, capacity_msat);
+				EffectiveCapacity::Total { capacity_msat, htlc_maximum_msat }
+			},
+			None => EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: htlc_maximum_msat },
+		}
 	}
 
 	/// Returns information for the direction.
 	#[inline]
 	pub(super) fn direction(&self) -> &'a ChannelUpdateInfo { self.direction }
+
+	/// Returns the `node_id` of the source hop.
+	///
+	/// Refers to the `node_id` forwarding the payment to the next hop.
+	#[inline]
+	pub fn source(&self) -> &'a NodeId { if self.from_node_one { &self.channel.node_one } else { &self.channel.node_two } }
+
+	/// Returns the `node_id` of the target hop.
+	///
+	/// Refers to the `node_id` receiving the payment from the previous hop.
+	#[inline]
+	pub fn target(&self) -> &'a NodeId { if self.from_node_one { &self.channel.node_two } else { &self.channel.node_one } }
 }
 
 impl<'a> fmt::Debug for DirectedChannelInfo<'a> {
@@ -1180,7 +1202,7 @@ impl Readable for NodeAnnouncementInfo {
 ///
 /// Since node aliases are provided by third parties, they are a potential avenue for injection
 /// attacks. Care must be taken when processing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct NodeAlias(pub [u8; 32]);
 
 impl fmt::Display for NodeAlias {
@@ -1224,6 +1246,18 @@ pub struct NodeInfo {
 	/// Optional because we store a Node entry after learning about it from
 	/// a channel announcement, but before receiving a node announcement.
 	pub announcement_info: Option<NodeAnnouncementInfo>
+}
+
+impl NodeInfo {
+	/// Returns whether the node has only announced Tor addresses.
+	pub fn is_tor_only(&self) -> bool {
+		self.announcement_info
+			.as_ref()
+			.map(|info| info.addresses())
+			.and_then(|addresses| (!addresses.is_empty()).then(|| addresses))
+			.map(|addresses| addresses.iter().all(|address| address.is_tor()))
+			.unwrap_or(false)
+	}
 }
 
 impl fmt::Display for NodeInfo {
@@ -1320,14 +1354,16 @@ impl<L: Deref> ReadableArgs<L> for NetworkGraph<L> where L::Target: Logger {
 
 		let chain_hash: ChainHash = Readable::read(reader)?;
 		let channels_count: u64 = Readable::read(reader)?;
-		let mut channels = IndexedMap::new();
+		// In Nov, 2023 there were about 15,000 nodes; we cap allocations to 1.5x that.
+		let mut channels = IndexedMap::with_capacity(cmp::min(channels_count as usize, 22500));
 		for _ in 0..channels_count {
 			let chan_id: u64 = Readable::read(reader)?;
 			let chan_info = Readable::read(reader)?;
 			channels.insert(chan_id, chan_info);
 		}
 		let nodes_count: u64 = Readable::read(reader)?;
-		let mut nodes = IndexedMap::new();
+		// In Nov, 2023 there were about 69K channels; we cap allocations to 1.5x that.
+		let mut nodes = IndexedMap::with_capacity(cmp::min(nodes_count as usize, 103500));
 		for _ in 0..nodes_count {
 			let node_id = Readable::read(reader)?;
 			let node_info = Readable::read(reader)?;
@@ -1346,8 +1382,8 @@ impl<L: Deref> ReadableArgs<L> for NetworkGraph<L> where L::Target: Logger {
 			channels: RwLock::new(channels),
 			nodes: RwLock::new(nodes),
 			last_rapid_gossip_sync_timestamp: Mutex::new(last_rapid_gossip_sync_timestamp),
-			removed_nodes: Mutex::new(HashMap::new()),
-			removed_channels: Mutex::new(HashMap::new()),
+			removed_nodes: Mutex::new(new_hash_map()),
+			removed_channels: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
 		})
 	}
@@ -1391,8 +1427,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			channels: RwLock::new(IndexedMap::new()),
 			nodes: RwLock::new(IndexedMap::new()),
 			last_rapid_gossip_sync_timestamp: Mutex::new(None),
-			removed_channels: Mutex::new(HashMap::new()),
-			removed_nodes: Mutex::new(HashMap::new()),
+			removed_channels: Mutex::new(new_hash_map()),
+			removed_nodes: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
 		}
 	}
@@ -1840,7 +1876,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				// NOTE: In the case of no-std, we won't have access to the current UNIX time at the time of removal,
 				// so we'll just set the removal time here to the current UNIX time on the very next invocation
 				// of this function.
-				#[cfg(feature = "no-std")]
+				#[cfg(not(feature = "std"))]
 				{
 					let mut tracked_time = Some(current_time_unix);
 					core::mem::swap(time, &mut tracked_time);
@@ -1920,7 +1956,10 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 			None => {
 				core::mem::drop(channels);
 				self.pending_checks.check_hold_pending_channel_update(msg, full_msg)?;
-				return Err(LightningError{err: "Couldn't find channel for update".to_owned(), action: ErrorAction::IgnoreError});
+				return Err(LightningError {
+					err: "Couldn't find channel for update".to_owned(),
+					action: ErrorAction::IgnoreAndLog(Level::Gossip),
+				});
 			},
 			Some(channel) => {
 				if msg.htlc_maximum_msat > MAX_VALUE_MSAT {
@@ -1977,7 +2016,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 					} }
 				}
 
-				let msg_hash = hash_to_message!(&Sha256dHash::hash(&msg.encode()[..])[..]);
+				let msg_hash = hash_to_message!(&message_sha256d_hash(&msg)[..]);
 				if msg.flags & 1 == 1 {
 					check_update_latest!(channel.two_to_one);
 					if let Some(sig) = sig {
@@ -2082,6 +2121,7 @@ pub(crate) mod tests {
 	use crate::ln::chan_utils::make_funding_redeemscript;
 	#[cfg(feature = "std")]
 	use crate::ln::features::InitFeatures;
+	use crate::ln::msgs::SocketAddress;
 	use crate::routing::gossip::{P2PGossipSync, NetworkGraph, NetworkUpdate, NodeAlias, MAX_EXCESS_BYTES_FOR_RELAY, NodeId, RoutingFees, ChannelUpdateInfo, ChannelInfo, NodeAnnouncementInfo, NodeInfo};
 	use crate::routing::utxo::{UtxoLookupError, UtxoResult};
 	use crate::ln::msgs::{RoutingMessageHandler, UnsignedNodeAnnouncement, NodeAnnouncement,
@@ -2089,7 +2129,7 @@ pub(crate) mod tests {
 		ReplyChannelRange, QueryChannelRange, QueryShortChannelIds, MAX_VALUE_MSAT};
 	use crate::util::config::UserConfig;
 	use crate::util::test_utils;
-	use crate::util::ser::{ReadableArgs, Readable, Writeable};
+	use crate::util::ser::{Hostname, ReadableArgs, Readable, Writeable};
 	use crate::util::scid_utils::scid_from_parts;
 
 	use crate::routing::gossip::REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS;
@@ -2097,13 +2137,11 @@ pub(crate) mod tests {
 
 	use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 	use bitcoin::hashes::Hash;
+	use bitcoin::hashes::hex::FromHex;
 	use bitcoin::network::constants::Network;
 	use bitcoin::blockdata::constants::ChainHash;
-	use bitcoin::blockdata::script::Script;
+	use bitcoin::blockdata::script::ScriptBuf;
 	use bitcoin::blockdata::transaction::TxOut;
-
-	use hex;
-
 	use bitcoin::secp256k1::{PublicKey, SecretKey};
 	use bitcoin::secp256k1::{All, Secp256k1};
 
@@ -2132,7 +2170,7 @@ pub(crate) mod tests {
 	fn request_full_sync_finite_times() {
 		let network_graph = create_network_graph();
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
-		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&hex::decode("0202020202020202020202020202020202020202020202020202020202020202").unwrap()[..]).unwrap());
+		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&<Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202").unwrap()[..]).unwrap());
 
 		assert!(gossip_sync.should_request_full_sync(&node_id));
 		assert!(gossip_sync.should_request_full_sync(&node_id));
@@ -2189,7 +2227,7 @@ pub(crate) mod tests {
 		}
 	}
 
-	pub(crate) fn get_channel_script(secp_ctx: &Secp256k1<secp256k1::All>) -> Script {
+	pub(crate) fn get_channel_script(secp_ctx: &Secp256k1<secp256k1::All>) -> ScriptBuf {
 		let node_1_btckey = SecretKey::from_slice(&[40; 32]).unwrap();
 		let node_2_btckey = SecretKey::from_slice(&[39; 32]).unwrap();
 		make_funding_redeemscript(&PublicKey::from_secret_key(secp_ctx, &node_1_btckey),
@@ -2246,7 +2284,7 @@ pub(crate) mod tests {
 			Err(_) => panic!()
 		};
 
-		let fake_msghash = hash_to_message!(&zero_hash);
+		let fake_msghash = hash_to_message!(zero_hash.as_byte_array());
 		match gossip_sync.handle_node_announcement(
 			&NodeAnnouncement {
 				signature: secp_ctx.sign_ecdsa(&fake_msghash, node_1_privkey),
@@ -2508,7 +2546,7 @@ pub(crate) mod tests {
 			unsigned_channel_update.timestamp += 500;
 		}, node_1_privkey, &secp_ctx);
 		let zero_hash = Sha256dHash::hash(&[0; 32]);
-		let fake_msghash = hash_to_message!(&zero_hash);
+		let fake_msghash = hash_to_message!(zero_hash.as_byte_array());
 		invalid_sig_channel_update.signature = secp_ctx.sign_ecdsa(&fake_msghash, node_1_privkey);
 		match gossip_sync.handle_channel_update(&invalid_sig_channel_update) {
 			Ok(_) => panic!(),
@@ -3347,16 +3385,16 @@ pub(crate) mod tests {
 		assert_eq!(chan_update_info, read_chan_update_info);
 
 		// Check the serialization hasn't changed.
-		let legacy_chan_update_info_with_some: Vec<u8> = hex::decode("340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c0100").unwrap();
+		let legacy_chan_update_info_with_some: Vec<u8> = <Vec<u8>>::from_hex("340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c0100").unwrap();
 		assert_eq!(encoded_chan_update_info, legacy_chan_update_info_with_some);
 
 		// Check we fail if htlc_maximum_msat is not present in either the ChannelUpdateInfo itself
 		// or the ChannelUpdate enclosed with `last_update_message`.
-		let legacy_chan_update_info_with_some_and_fail_update: Vec<u8> = hex::decode("b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f42400000271000000014").unwrap();
+		let legacy_chan_update_info_with_some_and_fail_update: Vec<u8> = <Vec<u8>>::from_hex("b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f42400000271000000014").unwrap();
 		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> = crate::util::ser::Readable::read(&mut legacy_chan_update_info_with_some_and_fail_update.as_slice());
 		assert!(read_chan_update_info_res.is_err());
 
-		let legacy_chan_update_info_with_none: Vec<u8> = hex::decode("2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c0100").unwrap();
+		let legacy_chan_update_info_with_none: Vec<u8> = <Vec<u8>>::from_hex("2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c0100").unwrap();
 		let read_chan_update_info_res: Result<ChannelUpdateInfo, crate::ln::msgs::DecodeError> = crate::util::ser::Readable::read(&mut legacy_chan_update_info_with_none.as_slice());
 		assert!(read_chan_update_info_res.is_err());
 
@@ -3398,18 +3436,18 @@ pub(crate) mod tests {
 		assert_eq!(chan_info_some_updates, read_chan_info);
 
 		// Check the serialization hasn't changed.
-		let legacy_chan_info_with_some: Vec<u8> = hex::decode("ca00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce88043636340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c010006210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23083636340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c01000a01000c0100").unwrap();
+		let legacy_chan_info_with_some: Vec<u8> = <Vec<u8>>::from_hex("ca00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce88043636340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c010006210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23083636340004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c01000a01000c0100").unwrap();
 		assert_eq!(encoded_chan_info, legacy_chan_info_with_some);
 
 		// Check we can decode legacy ChannelInfo, even if the `two_to_one` / `one_to_two` /
 		// `last_update_message` fields fail to decode due to missing htlc_maximum_msat.
-		let legacy_chan_info_with_some_and_fail_update = hex::decode("fd01ca00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce8804b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f4240000027100000001406210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c2308b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f424000002710000000140a01000c0100").unwrap();
+		let legacy_chan_info_with_some_and_fail_update = <Vec<u8>>::from_hex("fd01ca00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce8804b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f4240000027100000001406210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c2308b6b6b40004000000170201010402002a060800000000000004d2080909000000000000162e0a0d0c00040000000902040000000a0c8181d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f00083a840000034d013413a70000009000000000000f424000002710000000140a01000c0100").unwrap();
 		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut legacy_chan_info_with_some_and_fail_update.as_slice()).unwrap();
 		assert_eq!(read_chan_info.announcement_received_time, 87654);
 		assert_eq!(read_chan_info.one_to_two, None);
 		assert_eq!(read_chan_info.two_to_one, None);
 
-		let legacy_chan_info_with_none: Vec<u8> = hex::decode("ba00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce88042e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c010006210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23082e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c01000a01000c0100").unwrap();
+		let legacy_chan_info_with_none: Vec<u8> = <Vec<u8>>::from_hex("ba00020000010800000000000156660221027f921585f2ac0c7c70e36110adecfd8fd14b8a99bfb3d000a283fcac358fce88042e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c010006210355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23082e2e2c0004000000170201010402002a060800000000000004d20801000a0d0c00040000000902040000000a0c01000a01000c0100").unwrap();
 		let read_chan_info: ChannelInfo = crate::util::ser::Readable::read(&mut legacy_chan_info_with_none.as_slice()).unwrap();
 		assert_eq!(read_chan_info.announcement_received_time, 87654);
 		assert_eq!(read_chan_info.one_to_two, None);
@@ -3419,7 +3457,7 @@ pub(crate) mod tests {
 	#[test]
 	fn node_info_is_readable() {
 		// 1. Check we can read a valid NodeAnnouncementInfo and fail on an invalid one
-		let announcement_message = hex::decode("d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000122013413a7031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2020201010101010101010101010101010101010101010101010101010101010101010000701fffefdfc2607").unwrap();
+		let announcement_message = <Vec<u8>>::from_hex("d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000122013413a7031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2020201010101010101010101010101010101010101010101010101010101010101010000701fffefdfc2607").unwrap();
 		let announcement_message = NodeAnnouncement::read(&mut announcement_message.as_slice()).unwrap();
 		let valid_node_ann_info = NodeAnnouncementInfo {
 			features: channelmanager::provided_node_features(&UserConfig::default()),
@@ -3435,7 +3473,7 @@ pub(crate) mod tests {
 		assert_eq!(read_valid_node_ann_info, valid_node_ann_info);
 		assert_eq!(read_valid_node_ann_info.addresses().len(), 1);
 
-		let encoded_invalid_node_ann_info = hex::decode("3f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d2").unwrap();
+		let encoded_invalid_node_ann_info = <Vec<u8>>::from_hex("3f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d2").unwrap();
 		let read_invalid_node_ann_info_res = NodeAnnouncementInfo::read(&mut encoded_invalid_node_ann_info.as_slice());
 		assert!(read_invalid_node_ann_info_res.is_err());
 
@@ -3450,14 +3488,14 @@ pub(crate) mod tests {
 		let read_valid_node_info = NodeInfo::read(&mut encoded_valid_node_info.as_slice()).unwrap();
 		assert_eq!(read_valid_node_info, valid_node_info);
 
-		let encoded_invalid_node_info_hex = hex::decode("4402403f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d20400").unwrap();
+		let encoded_invalid_node_info_hex = <Vec<u8>>::from_hex("4402403f0009000788a000080a51a20204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014004d20400").unwrap();
 		let read_invalid_node_info = NodeInfo::read(&mut encoded_invalid_node_info_hex.as_slice()).unwrap();
 		assert_eq!(read_invalid_node_info.announcement_info, None);
 	}
 
 	#[test]
 	fn test_node_info_keeps_compatibility() {
-		let old_ann_info_with_addresses = hex::decode("3f0009000708a000080a51220204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014104d2").unwrap();
+		let old_ann_info_with_addresses = <Vec<u8>>::from_hex("3f0009000708a000080a51220204000000000403000000062000000000000000000000000000000000000000000000000000000000000000000a0505014104d2").unwrap();
 		let ann_info_with_addresses = NodeAnnouncementInfo::read(&mut old_ann_info_with_addresses.as_slice())
 				.expect("to be able to read an old NodeAnnouncementInfo with addresses");
 		// This serialized info has an address field but no announcement_message, therefore the addresses returned by our function will still be empty
@@ -3468,6 +3506,112 @@ pub(crate) mod tests {
 	fn test_node_id_display() {
 		let node_id = NodeId([42; 33]);
 		assert_eq!(format!("{}", &node_id), "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a");
+	}
+
+	#[test]
+	fn is_tor_only_node() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+
+		let node_1_privkey = &SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_2_privkey = &SecretKey::from_slice(&[41; 32]).unwrap();
+		let node_1_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, node_1_privkey));
+
+		let announcement = get_signed_channel_announcement(|_| {}, node_1_privkey, node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(&announcement).unwrap();
+
+		let tcp_ip_v4 = SocketAddress::TcpIpV4 {
+			addr: [255, 254, 253, 252],
+			port: 9735
+		};
+		let tcp_ip_v6 = SocketAddress::TcpIpV6 {
+			addr: [255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240],
+			port: 9735
+		};
+		let onion_v2 = SocketAddress::OnionV2([255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 38, 7]);
+		let onion_v3 = SocketAddress::OnionV3 {
+			ed25519_pubkey:	[255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240, 239, 238, 237, 236, 235, 234, 233, 232, 231, 230, 229, 228, 227, 226, 225, 224],
+			checksum: 32,
+			version: 16,
+			port: 9735
+		};
+		let hostname = SocketAddress::Hostname {
+			hostname: Hostname::try_from(String::from("host")).unwrap(),
+			port: 9735,
+		};
+
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(|_| {}, node_1_privkey, &secp_ctx);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![
+					tcp_ip_v4.clone(), tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone(),
+					hostname.clone()
+				];
+				announcement.timestamp += 1000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![
+					tcp_ip_v4.clone(), tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()
+				];
+				announcement.timestamp += 2000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![
+					tcp_ip_v6.clone(), onion_v2.clone(), onion_v3.clone()
+				];
+				announcement.timestamp += 3000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![onion_v2.clone(), onion_v3.clone()];
+				announcement.timestamp += 4000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![onion_v2.clone()];
+				announcement.timestamp += 5000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
+
+		let announcement = get_signed_node_announcement(
+			|announcement| {
+				announcement.addresses = vec![tcp_ip_v4.clone()];
+				announcement.timestamp += 6000;
+			},
+			node_1_privkey, &secp_ctx
+		);
+		gossip_sync.handle_node_announcement(&announcement).unwrap();
+		assert!(!network_graph.read_only().node(&node_1_id).unwrap().is_tor_only());
 	}
 }
 

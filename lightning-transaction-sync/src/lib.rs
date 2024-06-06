@@ -58,9 +58,8 @@
 //! [`ChainMonitor`]: lightning::chain::chainmonitor::ChainMonitor
 //! [`ChannelManager`]: lightning::ln::channelmanager::ChannelManager
 
-// Prefix these with `rustdoc::` when we update our MSRV to be >= 1.52 to remove warnings.
-#![deny(broken_intra_doc_links)]
-#![deny(private_intra_doc_links)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -74,11 +73,17 @@ extern crate bdk_macros;
 #[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
 mod esplora;
 
-#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
-mod common;
+#[cfg(any(feature = "electrum"))]
+mod electrum;
 
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
+mod common;
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
 mod error;
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async", feature = "electrum"))]
 pub use error::TxSyncError;
 
 #[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
 pub use esplora::EsploraSyncClient;
+#[cfg(feature = "electrum")]
+pub use electrum::ElectrumSyncClient;

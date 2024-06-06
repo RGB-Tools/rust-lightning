@@ -4,21 +4,23 @@ use crate::{Bolt11Invoice, CreationError, Currency, InvoiceBuilder, SignOrCreati
 
 use crate::{prelude::*, Description, Bolt11InvoiceDescription, Sha256};
 use bech32::ToBase32;
-use bitcoin_hashes::Hash;
+use bitcoin::hashes::Hash;
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::sign::{Recipient, NodeSigner, SignerProvider, EntropySource};
-use lightning::ln::{PaymentHash, PaymentSecret};
+use lightning::ln::types::{PaymentHash, PaymentSecret};
 use lightning::ln::channelmanager::{ChannelDetails, ChannelManager, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::channelmanager::{PhantomRouteHints, MIN_CLTV_EXPIRY_DELTA};
 use lightning::ln::inbound_payment::{create, create_from_hash, ExpandedKey};
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{RouteHint, RouteHintHop, Router};
-use lightning::util::logger::Logger;
+use lightning::util::logger::{Logger, Record};
 use rgb_lib::ContractId;
 use secp256k1::PublicKey;
+use alloc::collections::{btree_map, BTreeMap};
 use core::ops::Deref;
 use core::time::Duration;
+#[cfg(not(feature = "std"))]
 use core::iter::Iterator;
 
 /// Utility to create an invoice that can be paid to one of multiple nodes, or a "phantom invoice."
@@ -159,7 +161,7 @@ where
 
 	let invoice = match description {
 		Bolt11InvoiceDescription::Direct(description) => {
-			InvoiceBuilder::new(network).description(description.0.clone())
+			InvoiceBuilder::new(network).description(description.0.0.clone())
 		}
 		Bolt11InvoiceDescription::Hash(hash) => InvoiceBuilder::new(network).description_hash(hash.0),
 	};
@@ -336,7 +338,7 @@ pub fn create_invoice_from_channelmanager<M: Deref, T: Deref, ES: Deref, NS: Der
 	min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 where
-	M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -377,7 +379,7 @@ pub fn create_invoice_from_channelmanager_with_description_hash<M: Deref, T: Der
 	invoice_expiry_delta_secs: u32, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 where
-	M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -407,7 +409,7 @@ pub fn create_invoice_from_channelmanager_with_description_hash_and_duration_sin
 	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 		where
-			M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+			M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 			T::Target: BroadcasterInterface,
 			ES::Target: EntropySource,
 			NS::Target: NodeSigner,
@@ -432,7 +434,7 @@ pub fn create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: 
 	invoice_expiry_delta_secs: u32, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 		where
-			M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+			M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 			T::Target: BroadcasterInterface,
 			ES::Target: EntropySource,
 			NS::Target: NodeSigner,
@@ -456,7 +458,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch<M: Deref, T: Der
 	duration_since_epoch: Duration, invoice_expiry_delta_secs: u32, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 		where
-			M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+			M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 			T::Target: BroadcasterInterface,
 			ES::Target: EntropySource,
 			NS::Target: NodeSigner,
@@ -489,7 +491,7 @@ pub fn create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_
 	invoice_expiry_delta_secs: u32, payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 	where
-		M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+		M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 		T::Target: BroadcasterInterface,
 		ES::Target: EntropySource,
 		NS::Target: NodeSigner,
@@ -519,7 +521,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 	payment_secret: PaymentSecret, min_final_cltv_expiry_delta: Option<u16>, contract_id: Option<ContractId>, amt_rgb: Option<u64>,
 ) -> Result<Bolt11Invoice, SignOrCreationError<()>>
 	where
-		M::Target: chain::Watch<<SP::Target as SignerProvider>::Signer>,
+		M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 		T::Target: BroadcasterInterface,
 		ES::Target: EntropySource,
 		NS::Target: NodeSigner,
@@ -539,7 +541,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 
 	let invoice = match description {
 		Bolt11InvoiceDescription::Direct(description) => {
-			InvoiceBuilder::new(network).description(description.0.clone())
+			InvoiceBuilder::new(network).description(description.0.0.clone())
 		}
 		Bolt11InvoiceDescription::Hash(hash) => InvoiceBuilder::new(network).description_hash(hash.0),
 	};
@@ -610,7 +612,7 @@ fn sort_and_filter_channels<L: Deref>(
 where
 	L::Target: Logger,
 {
-	let mut filtered_channels: HashMap<PublicKey, ChannelDetails> = HashMap::new();
+	let mut filtered_channels: BTreeMap<PublicKey, ChannelDetails> = BTreeMap::new();
 	let min_inbound_capacity = min_inbound_capacity_msat.unwrap_or(0);
 	let mut min_capacity_channel_exists = false;
 	let mut online_channel_exists = false;
@@ -633,6 +635,7 @@ where
 
 	log_trace!(logger, "Considering {} channels for invoice route hints", channels.len());
 	for channel in channels.into_iter().filter(|chan| chan.is_channel_ready) {
+		let logger = WithChannelDetails::from(logger, &channel);
 		if channel.get_inbound_payment_scid().is_none() || channel.counterparty.forwarding_info.is_none() {
 			log_trace!(logger, "Ignoring channel {} for invoice route hints", &channel.channel_id);
 			continue;
@@ -670,7 +673,7 @@ where
 		}
 
 		match filtered_channels.entry(channel.counterparty.node_id) {
-			hash_map::Entry::Occupied(mut entry) => {
+			btree_map::Entry::Occupied(mut entry) => {
 				let current_max_capacity = entry.get().inbound_capacity_msat;
 				// If this channel is public and the previous channel is not, ensure we replace the
 				// previous channel to avoid announcing non-public channels.
@@ -703,7 +706,7 @@ where
 						channel.inbound_capacity_msat);
 				}
 			}
-			hash_map::Entry::Vacant(entry) => {
+			btree_map::Entry::Vacant(entry) => {
 				entry.insert(channel);
 			}
 		}
@@ -717,6 +720,7 @@ where
 		.into_iter()
 		.map(|(_, channel)| channel)
 		.filter(|channel| {
+			let logger = WithChannelDetails::from(logger, &channel);
 			let has_enough_capacity = channel.inbound_capacity_msat >= min_inbound_capacity;
 			let include_channel = if has_pub_unconf_chan {
 				// If we have a public channel, but it doesn't have enough confirmations to (yet)
@@ -797,16 +801,39 @@ fn prefer_current_channel(min_inbound_capacity_msat: Option<u64>, current_channe
 	current_channel > candidate_channel
 }
 
+/// Adds relevant context to a [`Record`] before passing it to the wrapped [`Logger`].
+struct WithChannelDetails<'a, 'b, L: Deref> where L::Target: Logger {
+	/// The logger to delegate to after adding context to the record.
+	logger: &'a L,
+	/// The [`ChannelDetails`] for adding relevant context to the logged record.
+	details: &'b ChannelDetails
+}
+
+impl<'a, 'b, L: Deref> Logger for WithChannelDetails<'a, 'b, L> where L::Target: Logger {
+	fn log(&self, mut record: Record) {
+		record.peer_id = Some(self.details.counterparty.node_id);
+		record.channel_id = Some(self.details.channel_id);
+		self.logger.log(record)
+	}
+}
+
+impl<'a, 'b, L: Deref> WithChannelDetails<'a, 'b, L> where L::Target: Logger {
+	fn from(logger: &'a L, details: &'b ChannelDetails) -> Self {
+		Self { logger, details }
+	}
+}
+
 #[cfg(test)]
 mod test {
-	use core::cell::RefCell;
 	use core::time::Duration;
 	use crate::{Currency, Description, Bolt11InvoiceDescription, SignOrCreationError, CreationError};
-	use bitcoin_hashes::{Hash, sha256};
-	use bitcoin_hashes::sha256::Hash as Sha256;
+	use bitcoin::hashes::{Hash, sha256};
+	use bitcoin::hashes::sha256::Hash as Sha256;
 	use lightning::sign::PhantomKeysManager;
-	use lightning::events::{MessageSendEvent, MessageSendEventsProvider, Event, EventsProvider};
-	use lightning::ln::{PaymentPreimage, PaymentHash};
+	use lightning::events::{MessageSendEvent, MessageSendEventsProvider};
+	use lightning::ln::types::PaymentHash;
+	#[cfg(feature = "std")]
+	use lightning::ln::types::PaymentPreimage;
 	use lightning::ln::channelmanager::{PhantomRouteHints, MIN_FINAL_CLTV_EXPIRY_DELTA, PaymentId, RecipientOnionFields, Retry};
 	use lightning::ln::functional_test_utils::*;
 	use lightning::ln::msgs::ChannelMessageHandler;
@@ -815,6 +842,7 @@ mod test {
 	use lightning::util::config::UserConfig;
 	use crate::utils::{create_invoice_from_channelmanager_and_duration_since_epoch, rotate_through_iterators};
 	use std::collections::HashSet;
+	use lightning::util::string::UntrustedString;
 
 	#[test]
 	fn test_prefer_current_channel() {
@@ -859,7 +887,7 @@ mod test {
 		assert_eq!(invoice.amount_pico_btc(), Some(100_000));
 		// If no `min_final_cltv_expiry_delta` is specified, then it should be `MIN_FINAL_CLTV_EXPIRY_DELTA`.
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), MIN_FINAL_CLTV_EXPIRY_DELTA as u64);
-		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description("test".to_string())));
+		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description(UntrustedString("test".to_string()))));
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(non_default_invoice_expiry_secs.into()));
 
 		// Invoice SCIDs should always use inbound SCID aliases over the real channel ID, if one is
@@ -879,8 +907,7 @@ mod test {
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, invoice.amount_milli_satoshis().unwrap());
 		let payment_event = {
-			let mut payment_hash = PaymentHash([0; 32]);
-			payment_hash.0.copy_from_slice(&invoice.payment_hash().as_ref()[0..32]);
+			let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
 			nodes[0].node.send_payment(payment_hash,
 				RecipientOnionFields::secret_only(*invoice.payment_secret()),
 				PaymentId(payment_hash.0), route_params, Retry::Attempts(0)).unwrap();
@@ -970,7 +997,7 @@ mod test {
 		).unwrap();
 		assert_eq!(invoice.amount_pico_btc(), Some(100_000));
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), MIN_FINAL_CLTV_EXPIRY_DELTA as u64);
-		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description("test".to_string())));
+		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description(UntrustedString("test".to_string()))));
 		assert_eq!(invoice.payment_hash(), &sha256::Hash::from_slice(&payment_hash.0[..]).unwrap());
 	}
 
@@ -1148,7 +1175,7 @@ mod test {
 		// is never handled, the `channel.counterparty.forwarding_info` is never assigned.
 		let mut private_chan_cfg = UserConfig::default();
 		private_chan_cfg.channel_handshake_config.announced_channel = false;
-		let temporary_channel_id = nodes[2].node.create_channel(nodes[0].node.get_our_node_id(), 1_000_000, 500_000_000, 42, Some(private_chan_cfg)).unwrap();
+		let temporary_channel_id = nodes[2].node.create_channel(nodes[0].node.get_our_node_id(), 1_000_000, 500_000_000, 42, None, Some(private_chan_cfg)).unwrap();
 		let open_channel = get_event_msg!(nodes[2], MessageSendEvent::SendOpenChannel, nodes[0].node.get_our_node_id());
 		nodes[0].node.handle_open_channel(&nodes[2].node.get_our_node_id(), &open_channel);
 		let accept_channel = get_event_msg!(nodes[0], MessageSendEvent::SendAcceptChannel, nodes[2].node.get_our_node_id());
@@ -1277,6 +1304,9 @@ mod test {
 
 	#[cfg(feature = "std")]
 	fn do_test_multi_node_receive(user_generated_pmt_hash: bool) {
+		use lightning::events::{Event, EventsProvider};
+		use core::cell::RefCell;
+
 		let mut chanmon_cfgs = create_chanmon_cfgs(3);
 		let seed_1 = [42u8; 32];
 		let seed_2 = [43u8; 32];
@@ -1301,7 +1331,7 @@ mod test {
 
 		let user_payment_preimage = PaymentPreimage([1; 32]);
 		let payment_hash = if user_generated_pmt_hash {
-			Some(PaymentHash(Sha256::hash(&user_payment_preimage.0[..]).into_inner()))
+			Some(PaymentHash(Sha256::hash(&user_payment_preimage.0[..]).to_byte_array()))
 		} else {
 			None
 		};
@@ -1314,7 +1344,7 @@ mod test {
 				route_hints, nodes[1].keys_manager, nodes[1].keys_manager, nodes[1].logger,
 				Currency::BitcoinTestnet, None, Duration::from_secs(genesis_timestamp)
 			).unwrap();
-		let (payment_hash, payment_secret) = (PaymentHash(invoice.payment_hash().into_inner()), *invoice.payment_secret());
+		let (payment_hash, payment_secret) = (PaymentHash(invoice.payment_hash().to_byte_array()), *invoice.payment_secret());
 		let payment_preimage = if user_generated_pmt_hash {
 			user_payment_preimage
 		} else {
@@ -1322,7 +1352,7 @@ mod test {
 		};
 
 		assert_eq!(invoice.min_final_cltv_expiry_delta(), MIN_FINAL_CLTV_EXPIRY_DELTA as u64);
-		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description("test".to_string())));
+		assert_eq!(invoice.description(), Bolt11InvoiceDescription::Direct(&Description(UntrustedString("test".to_string()))));
 		assert_eq!(invoice.route_hints().len(), 2);
 		assert_eq!(invoice.expiry_time(), Duration::from_secs(non_default_invoice_expiry_secs.into()));
 		assert!(!invoice.features().unwrap().supports_basic_mpp());
@@ -1334,8 +1364,7 @@ mod test {
 		let params = RouteParameters::from_payment_params_and_value(
 			payment_params, invoice.amount_milli_satoshis().unwrap());
 		let (payment_event, fwd_idx) = {
-			let mut payment_hash = PaymentHash([0; 32]);
-			payment_hash.0.copy_from_slice(&invoice.payment_hash().as_ref()[0..32]);
+			let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
 			nodes[0].node.send_payment(payment_hash,
 				RecipientOnionFields::secret_only(*invoice.payment_secret()),
 				PaymentId(payment_hash.0), params, Retry::Attempts(0)).unwrap();
@@ -1460,7 +1489,7 @@ mod test {
 			nodes[2].node.get_phantom_route_hints(),
 		];
 		let user_payment_preimage = PaymentPreimage([1; 32]);
-		let payment_hash = Some(PaymentHash(Sha256::hash(&user_payment_preimage.0[..]).into_inner()));
+		let payment_hash = Some(PaymentHash(Sha256::hash(&user_payment_preimage.0[..]).to_byte_array()));
 		let non_default_invoice_expiry_secs = 4200;
 		let min_final_cltv_expiry_delta = Some(100);
 		let duration_since_epoch = Duration::from_secs(1234567);
@@ -1554,7 +1583,7 @@ mod test {
 		// is never handled, the `channel.counterparty.forwarding_info` is never assigned.
 		let mut private_chan_cfg = UserConfig::default();
 		private_chan_cfg.channel_handshake_config.announced_channel = false;
-		let temporary_channel_id = nodes[1].node.create_channel(nodes[3].node.get_our_node_id(), 1_000_000, 500_000_000, 42, Some(private_chan_cfg)).unwrap();
+		let temporary_channel_id = nodes[1].node.create_channel(nodes[3].node.get_our_node_id(), 1_000_000, 500_000_000, 42, None, Some(private_chan_cfg)).unwrap();
 		let open_channel = get_event_msg!(nodes[1], MessageSendEvent::SendOpenChannel, nodes[3].node.get_our_node_id());
 		nodes[3].node.handle_open_channel(&nodes[1].node.get_our_node_id(), &open_channel);
 		let accept_channel = get_event_msg!(nodes[3], MessageSendEvent::SendAcceptChannel, nodes[1].node.get_our_node_id());

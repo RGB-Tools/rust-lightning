@@ -20,9 +20,9 @@
 
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::transaction::{Transaction, TxOut};
-use bitcoin::blockdata::script::{Builder, Script};
+use bitcoin::blockdata::script::{Builder, ScriptBuf};
 use bitcoin::blockdata::opcodes;
-use bitcoin::blockdata::locktime::PackedLockTime;
+use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::network::constants::Network;
 
 use bitcoin::hashes::Hash as TraitImport;
@@ -30,6 +30,8 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hash_types::{BlockHash, WPubkeyHash};
 
+use lightning::blinded_path::BlindedPath;
+use lightning::blinded_path::payment::ReceiveTlvs;
 use lightning::chain;
 use lightning::chain::{BestBlock, ChannelMonitorUpdateStatus, chainmonitor, channelmonitor, Confirm, Watch};
 use lightning::chain::channelmonitor::{ChannelMonitor, MonitorEvent};
@@ -38,16 +40,18 @@ use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget,
 use lightning::sign::{KeyMaterial, InMemorySigner, Recipient, EntropySource, NodeSigner, SignerProvider};
 use lightning::events;
 use lightning::events::MessageSendEventsProvider;
-use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentSendFailure, ChannelManagerReadArgs, PaymentId, RecipientOnionFields};
 use lightning::ln::channel::FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE;
 use lightning::ln::msgs::{self, CommitmentUpdate, ChannelMessageHandler, DecodeError, UpdateAddHTLC, Init};
 use lightning::ln::script::ShutdownScript;
 use lightning::ln::functional_test_utils::*;
-use lightning::offers::invoice::UnsignedBolt12Invoice;
+use lightning::offers::invoice::{BlindedPayInfo, UnsignedBolt12Invoice};
 use lightning::offers::invoice_request::UnsignedInvoiceRequest;
+use lightning::onion_message::messenger::{Destination, MessageRouter, OnionMessagePath};
 use lightning::util::test_channel_signer::{TestChannelSigner, EnforcementState};
 use lightning::util::errors::APIError;
+use lightning::util::hash_tables::*;
 use lightning::util::logger::Logger;
 use lightning::util::config::UserConfig;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
@@ -56,14 +60,13 @@ use lightning::routing::router::{InFlightHtlcs, Path, Route, RouteHop, RoutePara
 use crate::utils::test_logger::{self, Output};
 use crate::utils::test_persister::TestPersister;
 
-use bitcoin::secp256k1::{Message, PublicKey, SecretKey, Scalar, Secp256k1};
+use bitcoin::secp256k1::{Message, PublicKey, SecretKey, Scalar, Secp256k1, self};
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::schnorr;
 
 use std::mem;
 use std::cmp::{self, Ordering};
-use hashbrown::{HashSet, hash_map, HashMap};
 use std::sync::{Arc,Mutex};
 use std::sync::atomic;
 use std::io::Cursor;
@@ -80,9 +83,8 @@ impl FeeEstimator for FuzzEstimator {
 		// always return a HighPriority feerate here which is >= the maximum Normal feerate and a
 		// Background feerate which is <= the minimum Normal feerate.
 		match conf_target {
-			ConfirmationTarget::MaxAllowedNonAnchorChannelRemoteFee => MAX_FEE * 10,
 			ConfirmationTarget::OnChainSweep => MAX_FEE,
-			ConfirmationTarget::ChannelCloseMinimum|ConfirmationTarget::AnchorChannelFee|ConfirmationTarget::MinAllowedAnchorChannelRemoteFee|ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee => 253,
+			ConfirmationTarget::ChannelCloseMinimum|ConfirmationTarget::AnchorChannelFee|ConfirmationTarget::MinAllowedAnchorChannelRemoteFee|ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee|ConfirmationTarget::OutputSpendingFee => 253,
 			ConfirmationTarget::NonAnchorChannelFee => cmp::min(self.ret_val.load(atomic::Ordering::Acquire), MAX_FEE),
 		}
 	}
@@ -99,6 +101,27 @@ impl Router for FuzzRouter {
 			err: String::from("Not implemented"),
 			action: msgs::ErrorAction::IgnoreError
 		})
+	}
+
+	fn create_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, _recipient: PublicKey, _first_hops: Vec<ChannelDetails>, _tlvs: ReceiveTlvs,
+		_amount_msats: u64, _secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<(BlindedPayInfo, BlindedPath)>, ()> {
+		unreachable!()
+	}
+}
+
+impl MessageRouter for FuzzRouter {
+	fn find_path(
+		&self, _sender: PublicKey, _peers: Vec<PublicKey>, _destination: Destination
+	) -> Result<OnionMessagePath, ()> {
+		unreachable!()
+	}
+
+	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, _recipient: PublicKey, _peers: Vec<PublicKey>, _secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPath>, ()> {
+		unreachable!()
 	}
 }
 
@@ -134,7 +157,7 @@ impl TestChainMonitor {
 			logger,
 			keys,
 			persister,
-			latest_monitors: Mutex::new(HashMap::new()),
+			latest_monitors: Mutex::new(new_hash_map()),
 		}
 	}
 }
@@ -150,20 +173,17 @@ impl chain::Watch<TestChannelSigner> for TestChainMonitor {
 
 	fn update_channel(&self, funding_txo: OutPoint, update: &channelmonitor::ChannelMonitorUpdate) -> chain::ChannelMonitorUpdateStatus {
 		let mut map_lock = self.latest_monitors.lock().unwrap();
-		let mut map_entry = match map_lock.entry(funding_txo) {
-			hash_map::Entry::Occupied(entry) => entry,
-			hash_map::Entry::Vacant(_) => panic!("Didn't have monitor on update call"),
-		};
+		let map_entry = map_lock.get_mut(&funding_txo).expect("Didn't have monitor on update call");
 		let deserialized_monitor = <(BlockHash, channelmonitor::ChannelMonitor<TestChannelSigner>)>::
-			read(&mut Cursor::new(&map_entry.get().1), (&*self.keys, &*self.keys)).unwrap().1;
+			read(&mut Cursor::new(&map_entry.1), (&*self.keys, &*self.keys)).unwrap().1;
 		deserialized_monitor.update_monitor(update, &&TestBroadcaster{}, &&FuzzEstimator { ret_val: atomic::AtomicU32::new(253) }, &self.logger).unwrap();
 		let mut ser = VecWriter(Vec::new());
 		deserialized_monitor.write(&mut ser).unwrap();
-		map_entry.insert((update.update_id, ser.0));
+		*map_entry = (update.update_id, ser.0);
 		self.chain_monitor.update_channel(funding_txo, update)
 	}
 
-	fn release_pending_monitor_events(&self) -> Vec<(OutPoint, Vec<MonitorEvent>, Option<PublicKey>)> {
+	fn release_pending_monitor_events(&self) -> Vec<(OutPoint, ChannelId, Vec<MonitorEvent>, Option<PublicKey>)> {
 		return self.chain_monitor.release_pending_monitor_events();
 	}
 }
@@ -231,14 +251,16 @@ impl NodeSigner for KeyProvider {
 }
 
 impl SignerProvider for KeyProvider {
-	type Signer = TestChannelSigner;
+	type EcdsaSigner = TestChannelSigner;
+	#[cfg(taproot)]
+	type TaprootSigner = TestChannelSigner;
 
 	fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
 		let id = self.rand_bytes_id.fetch_add(1, atomic::Ordering::Relaxed) as u8;
 		[id; 32]
 	}
 
-	fn derive_channel_signer(&self, channel_value_satoshis: u64, channel_keys_id: [u8; 32]) -> Self::Signer {
+	fn derive_channel_signer(&self, channel_value_satoshis: u64, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
 		let secp_ctx = Secp256k1::signing_only();
 		let id = channel_keys_id[0];
 		let keys = InMemorySigner::new(
@@ -257,7 +279,7 @@ impl SignerProvider for KeyProvider {
 		TestChannelSigner::new_with_revoked(keys, revoked_commitment, false)
 	}
 
-	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::Signer, DecodeError> {
+	fn read_chan_signer(&self, buffer: &[u8]) -> Result<Self::EcdsaSigner, DecodeError> {
 		let mut reader = std::io::Cursor::new(buffer);
 
 		let inner: InMemorySigner = ReadableArgs::read(&mut reader, self)?;
@@ -267,14 +289,15 @@ impl SignerProvider for KeyProvider {
 			inner,
 			state,
 			disable_revocation_policy_check: false,
+			available: Arc::new(Mutex::new(true)),
 		})
 	}
 
-	fn get_destination_script(&self) -> Result<Script, ()> {
+	fn get_destination_script(&self, _channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
 		let secp_ctx = Secp256k1::signing_only();
 		let channel_monitor_claim_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, self.node_secret[31]]).unwrap();
 		let our_channel_monitor_claim_key_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &channel_monitor_claim_key).serialize());
-		Ok(Builder::new().push_opcode(opcodes::all::OP_PUSHBYTES_0).push_slice(&our_channel_monitor_claim_key_hash[..]).into_script())
+		Ok(Builder::new().push_opcode(opcodes::all::OP_PUSHBYTES_0).push_slice(our_channel_monitor_claim_key_hash).into_script())
 	}
 
 	fn get_shutdown_scriptpubkey(&self) -> Result<ShutdownScript, ()> {
@@ -343,7 +366,7 @@ type ChanMan<'a> = ChannelManager<Arc<TestChainMonitor>, Arc<TestBroadcaster>, A
 fn get_payment_secret_hash(dest: &ChanMan, payment_id: &mut u8) -> Option<(PaymentSecret, PaymentHash)> {
 	let mut payment_hash;
 	for _ in 0..256 {
-		payment_hash = PaymentHash(Sha256::hash(&[*payment_id; 1]).into_inner());
+		payment_hash = PaymentHash(Sha256::hash(&[*payment_id; 1]).to_byte_array());
 		if let Ok(payment_secret) = dest.create_inbound_payment_for_hash(payment_hash, None, 3600, None) {
 			return Some((payment_secret, payment_hash));
 		}
@@ -441,7 +464,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 		($node_id: expr, $fee_estimator: expr) => { {
 			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
 			let node_secret = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, $node_id]).unwrap();
-			let keys_manager = Arc::new(KeyProvider { node_secret, rand_bytes_id: atomic::AtomicU32::new(0), enforcement_states: Mutex::new(HashMap::new()) });
+			let keys_manager = Arc::new(KeyProvider { node_secret, rand_bytes_id: atomic::AtomicU32::new(0), enforcement_states: Mutex::new(new_hash_map()) });
 			let monitor = Arc::new(TestChainMonitor::new(broadcast.clone(), logger.clone(), $fee_estimator.clone(),
 				Arc::new(TestPersister {
 					update_ret: Mutex::new(ChannelMonitorUpdateStatus::Completed)
@@ -482,13 +505,13 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				config.manually_accept_inbound_channels = true;
 			}
 
-			let mut monitors = HashMap::new();
+			let mut monitors = new_hash_map();
 			let mut old_monitors = $old_monitors.latest_monitors.lock().unwrap();
 			for (outpoint, (update_id, monitor_ser)) in old_monitors.drain() {
 				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<TestChannelSigner>)>::read(&mut Cursor::new(&monitor_ser), (&*$keys_manager, &*$keys_manager)).expect("Failed to read monitor").1);
 				chain_monitor.latest_monitors.lock().unwrap().insert(outpoint, (update_id, monitor_ser));
 			}
-			let mut monitor_refs = HashMap::new();
+			let mut monitor_refs = new_hash_map();
 			for (outpoint, monitor) in monitors.iter_mut() {
 				monitor_refs.insert(*outpoint, monitor);
 			}
@@ -525,7 +548,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				features: $source.init_features(), networks: None, remote_network_address: None
 			}, false).unwrap();
 
-			$source.create_channel($dest.get_our_node_id(), 100_000, 42, 0, None).unwrap();
+			$source.create_channel($dest.get_our_node_id(), 100_000, 42, 0, None, None).unwrap();
 			let open_channel = {
 				let events = $source.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
@@ -565,7 +588,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				let events = $source.get_and_clear_pending_events();
 				assert_eq!(events.len(), 1);
 				if let events::Event::FundingGenerationReady { ref temporary_channel_id, ref channel_value_satoshis, ref output_script, .. } = events[0] {
-					let tx = Transaction { version: $chan_id, lock_time: PackedLockTime::ZERO, input: Vec::new(), output: vec![TxOut {
+					let tx = Transaction { version: $chan_id, lock_time: LockTime::ZERO, input: Vec::new(), output: vec![TxOut {
 						value: *channel_value_satoshis, script_pubkey: output_script.clone(),
 					}]};
 					funding_output = OutPoint { txid: tx.txid(), index: 0 };
@@ -955,7 +978,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				// In case we get 256 payments we may have a hash collision, resulting in the
 				// second claim/fail call not finding the duplicate-hash HTLC, so we have to
 				// deduplicate the calls here.
-				let mut claim_set = HashSet::new();
+				let mut claim_set = new_hash_map();
 				let mut events = nodes[$node].get_and_clear_pending_events();
 				// Sort events so that PendingHTLCsForwardable get processed last. This avoids a
 				// case where we first process a PendingHTLCsForwardable, then claim/fail on a
@@ -977,7 +1000,7 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				for event in events.drain(..) {
 					match event {
 						events::Event::PaymentClaimable { payment_hash, .. } => {
-							if claim_set.insert(payment_hash.0) {
+							if claim_set.insert(payment_hash.0, ()).is_none() {
 								if $fail {
 									nodes[$node].fail_htlc_backwards(&payment_hash);
 								} else {
@@ -1257,6 +1280,94 @@ pub fn do_test<Out: Output>(data: &[u8], underlying_out: Out, anchors: bool) {
 				nodes[2].maybe_update_chan_fees();
 			},
 			0x89 => { fee_est_c.ret_val.store(253, atomic::Ordering::Release); nodes[2].maybe_update_chan_fees(); },
+
+			0xf0 => {
+				let pending_updates = monitor_a.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.get(0) {
+					monitor_a.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[0].process_monitor_events();
+			}
+			0xf1 => {
+				let pending_updates = monitor_a.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.get(1) {
+					monitor_a.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[0].process_monitor_events();
+			}
+			0xf2 => {
+				let pending_updates = monitor_a.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.last() {
+					monitor_a.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[0].process_monitor_events();
+			}
+
+			0xf4 => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.get(0) {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+			0xf5 => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.get(1) {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+			0xf6 => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_1_funding).unwrap();
+				if let Some(id) = pending_updates.last() {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_1_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+
+			0xf8 => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.get(0) {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+			0xf9 => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.get(1) {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+			0xfa => {
+				let pending_updates = monitor_b.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.last() {
+					monitor_b.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[1].process_monitor_events();
+			}
+
+			0xfc => {
+				let pending_updates = monitor_c.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.get(0) {
+					monitor_c.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[2].process_monitor_events();
+			}
+			0xfd => {
+				let pending_updates = monitor_c.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.get(1) {
+					monitor_c.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[2].process_monitor_events();
+			}
+			0xfe => {
+				let pending_updates = monitor_c.chain_monitor.list_pending_monitor_updates().remove(&chan_2_funding).unwrap();
+				if let Some(id) = pending_updates.last() {
+					monitor_c.chain_monitor.channel_monitor_updated(chan_2_funding, *id).unwrap();
+				}
+				nodes[2].process_monitor_events();
+			}
 
 			0xff => {
 				// Test that no channel is in a stuck state where neither party can send funds even

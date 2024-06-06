@@ -7,14 +7,17 @@ use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 use crate::blinded_path::BlindedHop;
 use crate::blinded_path::utils;
 use crate::io;
-use crate::ln::PaymentSecret;
+use crate::ln::types::PaymentSecret;
+use crate::ln::channelmanager::CounterpartyForwardingInfo;
 use crate::ln::features::BlindedHopFeatures;
 use crate::ln::msgs::DecodeError;
 use crate::offers::invoice::BlindedPayInfo;
-use crate::prelude::*;
-use crate::util::ser::{Readable, Writeable, Writer};
+use crate::offers::invoice_request::InvoiceRequestFields;
+use crate::offers::offer::OfferId;
+use crate::util::ser::{HighZeroBytesDroppedBigSize, Readable, Writeable, Writer};
 
-use core::convert::TryFrom;
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// An intermediate node, its outbound channel, and relay parameters.
 #[derive(Clone, Debug)]
@@ -52,12 +55,13 @@ pub struct ReceiveTlvs {
 	pub payment_secret: PaymentSecret,
 	/// Constraints for the receiver of this payment.
 	pub payment_constraints: PaymentConstraints,
+	/// Context for the receiver of this payment.
+	pub payment_context: PaymentContext,
 }
 
 /// Data to construct a [`BlindedHop`] for sending a payment over.
 ///
 /// [`BlindedHop`]: crate::blinded_path::BlindedHop
-#[allow(dead_code)]
 pub(crate) enum BlindedPaymentTlvs {
 	/// This blinded payment data is for a forwarding node.
 	Forward(ForwardTlvs),
@@ -97,13 +101,97 @@ pub struct PaymentConstraints {
 	pub htlc_minimum_msat: u64,
 }
 
+/// The context of an inbound payment, which is included in a [`BlindedPath`] via [`ReceiveTlvs`]
+/// and surfaced in [`PaymentPurpose`].
+///
+/// [`BlindedPath`]: crate::blinded_path::BlindedPath
+/// [`PaymentPurpose`]: crate::events::PaymentPurpose
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaymentContext {
+	/// The payment context was unknown.
+	Unknown(UnknownPaymentContext),
+
+	/// The payment was made for an invoice requested from a BOLT 12 [`Offer`].
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	Bolt12Offer(Bolt12OfferContext),
+
+	/// The payment was made for an invoice sent for a BOLT 12 [`Refund`].
+	///
+	/// [`Refund`]: crate::offers::refund::Refund
+	Bolt12Refund(Bolt12RefundContext),
+}
+
+// Used when writing PaymentContext in Event::PaymentClaimable to avoid cloning.
+pub(crate) enum PaymentContextRef<'a> {
+	Bolt12Offer(&'a Bolt12OfferContext),
+	Bolt12Refund(&'a Bolt12RefundContext),
+}
+
+/// An unknown payment context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownPaymentContext(());
+
+/// The context of a payment made for an invoice requested from a BOLT 12 [`Offer`].
+///
+/// [`Offer`]: crate::offers::offer::Offer
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Bolt12OfferContext {
+	/// The identifier of the [`Offer`].
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	pub offer_id: OfferId,
+
+	/// Fields from an [`InvoiceRequest`] sent for a [`Bolt12Invoice`].
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
+	pub invoice_request: InvoiceRequestFields,
+}
+
+/// The context of a payment made for an invoice sent for a BOLT 12 [`Refund`].
+///
+/// [`Refund`]: crate::offers::refund::Refund
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Bolt12RefundContext {}
+
+impl PaymentContext {
+	pub(crate) fn unknown() -> Self {
+		PaymentContext::Unknown(UnknownPaymentContext(()))
+	}
+}
+
+impl TryFrom<CounterpartyForwardingInfo> for PaymentRelay {
+	type Error = ();
+
+	fn try_from(info: CounterpartyForwardingInfo) -> Result<Self, ()> {
+		let CounterpartyForwardingInfo {
+			fee_base_msat, fee_proportional_millionths, cltv_expiry_delta
+		} = info;
+
+		// Avoid exposing esoteric CLTV expiry deltas
+		let cltv_expiry_delta = match cltv_expiry_delta {
+			0..=40 => 40,
+			41..=80 => 80,
+			81..=144 => 144,
+			145..=216 => 216,
+			_ => return Err(()),
+		};
+
+		Ok(Self { cltv_expiry_delta, fee_proportional_millionths, fee_base_msat })
+	}
+}
+
 impl Writeable for ForwardTlvs {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		let features_opt =
+			if self.features == BlindedHopFeatures::empty() { None }
+			else { Some(&self.features) };
 		encode_tlv_stream!(w, {
 			(2, self.short_channel_id, required),
 			(10, self.payment_relay, required),
 			(12, self.payment_constraints, required),
-			(14, self.features, required)
+			(14, features_opt, option)
 		});
 		Ok(())
 	}
@@ -113,24 +201,10 @@ impl Writeable for ReceiveTlvs {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		encode_tlv_stream!(w, {
 			(12, self.payment_constraints, required),
-			(65536, self.payment_secret, required)
+			(65536, self.payment_secret, required),
+			(65537, self.payment_context, required)
 		});
 		Ok(())
-	}
-}
-
-// This will be removed once we support forwarding blinded HTLCs, because we'll always read a
-// `BlindedPaymentTlvs` instead.
-impl Readable for ReceiveTlvs {
-	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-		_init_and_read_tlv_stream!(r, {
-			(12, payment_constraints, required),
-			(65536, payment_secret, required),
-		});
-		Ok(Self {
-			payment_secret: payment_secret.0.unwrap(),
-			payment_constraints: payment_constraints.0.unwrap()
-		})
 	}
 }
 
@@ -154,22 +228,26 @@ impl Readable for BlindedPaymentTlvs {
 			(12, payment_constraints, required),
 			(14, features, option),
 			(65536, payment_secret, option),
+			(65537, payment_context, (default_value, PaymentContext::unknown())),
 		});
 		let _padding: Option<utils::Padding> = _padding;
 
 		if let Some(short_channel_id) = scid {
-			if payment_secret.is_some() { return Err(DecodeError::InvalidValue) }
+			if payment_secret.is_some() {
+				return Err(DecodeError::InvalidValue)
+			}
 			Ok(BlindedPaymentTlvs::Forward(ForwardTlvs {
 				short_channel_id,
 				payment_relay: payment_relay.ok_or(DecodeError::InvalidValue)?,
 				payment_constraints: payment_constraints.0.unwrap(),
-				features: features.ok_or(DecodeError::InvalidValue)?,
+				features: features.unwrap_or_else(BlindedHopFeatures::empty),
 			}))
 		} else {
 			if payment_relay.is_some() || features.is_some() { return Err(DecodeError::InvalidValue) }
 			Ok(BlindedPaymentTlvs::Receive(ReceiveTlvs {
 				payment_secret: payment_secret.ok_or(DecodeError::InvalidValue)?,
 				payment_constraints: payment_constraints.0.unwrap(),
+				payment_context: payment_context.0.unwrap(),
 			}))
 		}
 	}
@@ -188,7 +266,7 @@ pub(super) fn blinded_hops<T: secp256k1::Signing + secp256k1::Verification>(
 }
 
 /// `None` if underflow occurs.
-fn amt_to_forward_msat(inbound_amt_msat: u64, payment_relay: &PaymentRelay) -> Option<u64> {
+pub(crate) fn amt_to_forward_msat(inbound_amt_msat: u64, payment_relay: &PaymentRelay) -> Option<u64> {
 	let inbound_amt = inbound_amt_msat as u128;
 	let base = payment_relay.fee_base_msat as u128;
 	let prop = payment_relay.fee_proportional_millionths as u128;
@@ -209,11 +287,12 @@ fn amt_to_forward_msat(inbound_amt_msat: u64, payment_relay: &PaymentRelay) -> O
 }
 
 pub(super) fn compute_payinfo(
-	intermediate_nodes: &[ForwardNode], payee_tlvs: &ReceiveTlvs, payee_htlc_maximum_msat: u64
+	intermediate_nodes: &[ForwardNode], payee_tlvs: &ReceiveTlvs, payee_htlc_maximum_msat: u64,
+	min_final_cltv_expiry_delta: u16
 ) -> Result<BlindedPayInfo, ()> {
 	let mut curr_base_fee: u64 = 0;
 	let mut curr_prop_mil: u64 = 0;
-	let mut cltv_expiry_delta: u16 = 0;
+	let mut cltv_expiry_delta: u16 = min_final_cltv_expiry_delta;
 	for tlvs in intermediate_nodes.iter().rev().map(|n| &n.tlvs) {
 		// In the future, we'll want to take the intersection of all supported features for the
 		// `BlindedPayInfo`, but there are no features in that context right now.
@@ -269,23 +348,86 @@ pub(super) fn compute_payinfo(
 	})
 }
 
-impl_writeable_msg!(PaymentRelay, {
-	cltv_expiry_delta,
-	fee_proportional_millionths,
-	fee_base_msat
-}, {});
+impl Writeable for PaymentRelay {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.cltv_expiry_delta.write(w)?;
+		self.fee_proportional_millionths.write(w)?;
+		HighZeroBytesDroppedBigSize(self.fee_base_msat).write(w)
+	}
+}
+impl Readable for PaymentRelay {
+	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let cltv_expiry_delta: u16 = Readable::read(r)?;
+		let fee_proportional_millionths: u32 = Readable::read(r)?;
+		let fee_base_msat: HighZeroBytesDroppedBigSize<u32> = Readable::read(r)?;
+		Ok(Self { cltv_expiry_delta, fee_proportional_millionths, fee_base_msat: fee_base_msat.0 })
+	}
+}
 
-impl_writeable_msg!(PaymentConstraints, {
-	max_cltv_expiry,
-	htlc_minimum_msat
-}, {});
+impl Writeable for PaymentConstraints {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.max_cltv_expiry.write(w)?;
+		HighZeroBytesDroppedBigSize(self.htlc_minimum_msat).write(w)
+	}
+}
+impl Readable for PaymentConstraints {
+	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let max_cltv_expiry: u32 = Readable::read(r)?;
+		let htlc_minimum_msat: HighZeroBytesDroppedBigSize<u64> = Readable::read(r)?;
+		Ok(Self { max_cltv_expiry, htlc_minimum_msat: htlc_minimum_msat.0 })
+	}
+}
+
+impl_writeable_tlv_based_enum!(PaymentContext,
+	;
+	(0, Unknown),
+	(1, Bolt12Offer),
+	(2, Bolt12Refund),
+);
+
+impl<'a> Writeable for PaymentContextRef<'a> {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		match self {
+			PaymentContextRef::Bolt12Offer(context) => {
+				1u8.write(w)?;
+				context.write(w)?;
+			},
+			PaymentContextRef::Bolt12Refund(context) => {
+				2u8.write(w)?;
+				context.write(w)?;
+			},
+		}
+
+		Ok(())
+	}
+}
+
+impl Writeable for UnknownPaymentContext {
+	fn write<W: Writer>(&self, _w: &mut W) -> Result<(), io::Error> {
+		Ok(())
+	}
+}
+
+impl Readable for UnknownPaymentContext {
+	fn read<R: io::Read>(_r: &mut R) -> Result<Self, DecodeError> {
+		Ok(UnknownPaymentContext(()))
+	}
+}
+
+impl_writeable_tlv_based!(Bolt12OfferContext, {
+	(0, offer_id, required),
+	(2, invoice_request, required),
+});
+
+impl_writeable_tlv_based!(Bolt12RefundContext, {});
 
 #[cfg(test)]
 mod tests {
 	use bitcoin::secp256k1::PublicKey;
-	use crate::blinded_path::payment::{ForwardNode, ForwardTlvs, ReceiveTlvs, PaymentConstraints, PaymentRelay};
-	use crate::ln::PaymentSecret;
+	use crate::blinded_path::payment::{ForwardNode, ForwardTlvs, ReceiveTlvs, PaymentConstraints, PaymentContext, PaymentRelay};
+	use crate::ln::types::PaymentSecret;
 	use crate::ln::features::BlindedHopFeatures;
+	use crate::ln::functional_test_utils::TEST_FINAL_CLTV;
 
 	#[test]
 	fn compute_payinfo() {
@@ -331,12 +473,13 @@ mod tests {
 				max_cltv_expiry: 0,
 				htlc_minimum_msat: 1,
 			},
+			payment_context: PaymentContext::unknown(),
 		};
 		let htlc_maximum_msat = 100_000;
-		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat).unwrap();
+		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat, 12).unwrap();
 		assert_eq!(blinded_payinfo.fee_base_msat, 201);
 		assert_eq!(blinded_payinfo.fee_proportional_millionths, 1001);
-		assert_eq!(blinded_payinfo.cltv_expiry_delta, 288);
+		assert_eq!(blinded_payinfo.cltv_expiry_delta, 300);
 		assert_eq!(blinded_payinfo.htlc_minimum_msat, 900);
 		assert_eq!(blinded_payinfo.htlc_maximum_msat, htlc_maximum_msat);
 	}
@@ -349,11 +492,12 @@ mod tests {
 				max_cltv_expiry: 0,
 				htlc_minimum_msat: 1,
 			},
+			payment_context: PaymentContext::unknown(),
 		};
-		let blinded_payinfo = super::compute_payinfo(&[], &recv_tlvs, 4242).unwrap();
+		let blinded_payinfo = super::compute_payinfo(&[], &recv_tlvs, 4242, TEST_FINAL_CLTV as u16).unwrap();
 		assert_eq!(blinded_payinfo.fee_base_msat, 0);
 		assert_eq!(blinded_payinfo.fee_proportional_millionths, 0);
-		assert_eq!(blinded_payinfo.cltv_expiry_delta, 0);
+		assert_eq!(blinded_payinfo.cltv_expiry_delta, TEST_FINAL_CLTV as u16);
 		assert_eq!(blinded_payinfo.htlc_minimum_msat, 1);
 		assert_eq!(blinded_payinfo.htlc_maximum_msat, 4242);
 	}
@@ -402,9 +546,10 @@ mod tests {
 				max_cltv_expiry: 0,
 				htlc_minimum_msat: 3,
 			},
+			payment_context: PaymentContext::unknown(),
 		};
 		let htlc_maximum_msat = 100_000;
-		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat).unwrap();
+		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat, TEST_FINAL_CLTV as u16).unwrap();
 		assert_eq!(blinded_payinfo.htlc_minimum_msat, 2_000);
 	}
 
@@ -452,12 +597,13 @@ mod tests {
 				max_cltv_expiry: 0,
 				htlc_minimum_msat: 1,
 			},
+			payment_context: PaymentContext::unknown(),
 		};
 		let htlc_minimum_msat = 3798;
-		assert!(super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_minimum_msat - 1).is_err());
+		assert!(super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_minimum_msat - 1, TEST_FINAL_CLTV as u16).is_err());
 
 		let htlc_maximum_msat = htlc_minimum_msat + 1;
-		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat).unwrap();
+		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, htlc_maximum_msat, TEST_FINAL_CLTV as u16).unwrap();
 		assert_eq!(blinded_payinfo.htlc_minimum_msat, htlc_minimum_msat);
 		assert_eq!(blinded_payinfo.htlc_maximum_msat, htlc_maximum_msat);
 	}
@@ -506,9 +652,10 @@ mod tests {
 				max_cltv_expiry: 0,
 				htlc_minimum_msat: 1,
 			},
+			payment_context: PaymentContext::unknown(),
 		};
 
-		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, 10_000).unwrap();
+		let blinded_payinfo = super::compute_payinfo(&intermediate_nodes[..], &recv_tlvs, 10_000, TEST_FINAL_CLTV as u16).unwrap();
 		assert_eq!(blinded_payinfo.htlc_maximum_msat, 3997);
 	}
 }

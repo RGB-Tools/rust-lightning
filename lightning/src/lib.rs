@@ -40,9 +40,8 @@
 #![cfg_attr(not(any(test, fuzzing, feature = "_test_utils")), deny(missing_docs))]
 #![cfg_attr(not(any(test, feature = "_test_utils")), forbid(unsafe_code))]
 
-// Prefix these with `rustdoc::` when we update our MSRV to be >= 1.52 to remove warnings.
-#![deny(broken_intra_doc_links)]
-#![deny(private_intra_doc_links)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 // In general, rust is absolutely horrid at supporting users doing things like,
 // for example, compiling Rust code for real environments. Disable useless lints
@@ -66,10 +65,11 @@ extern crate bitcoin;
 #[cfg(any(test, feature = "std"))]
 extern crate core;
 
-#[cfg(any(test, feature = "_test_utils"))] extern crate hex;
+extern crate hex;
 #[cfg(any(test, feature = "_test_utils"))] extern crate regex;
 
 #[cfg(not(feature = "std"))] extern crate core2;
+#[cfg(not(feature = "std"))] extern crate libm;
 
 #[cfg(ldk_bench)] extern crate criterion;
 
@@ -84,6 +84,8 @@ pub mod onion_message;
 pub mod blinded_path;
 pub mod events;
 
+pub(crate) mod crypto;
+
 #[cfg(feature = "std")]
 /// Re-export of either `core2::io` or `std::io`, depending on the `std` feature flag.
 pub use std::io;
@@ -92,7 +94,9 @@ pub use std::io;
 pub use core2::io;
 
 #[cfg(not(feature = "std"))]
-mod io_extras {
+#[doc(hidden)]
+/// IO utilities public only for use by in-crate macros. These should not be used externally
+pub mod io_extras {
 	use core2::io::{self, Read, Write};
 
 	/// A writer which will move data into the void.
@@ -152,6 +156,8 @@ mod io_extras {
 }
 
 #[cfg(feature = "std")]
+#[doc(hidden)]
+/// IO utilities public only for use by in-crate macros. These should not be used externally
 mod io_extras {
 	pub fn read_to_end<D: ::std::io::Read>(mut d: D) -> Result<Vec<u8>, ::std::io::Error> {
 		let mut buf = Vec::new();
@@ -163,17 +169,18 @@ mod io_extras {
 }
 
 mod prelude {
-	#[cfg(feature = "hashbrown")]
-	extern crate hashbrown;
+	#![allow(unused_imports)]
 
 	pub use alloc::{vec, vec::Vec, string::String, collections::VecDeque, boxed::Box};
-	#[cfg(not(feature = "hashbrown"))]
-	pub use std::collections::{HashMap, HashSet, hash_map};
-	#[cfg(feature = "hashbrown")]
-	pub use self::hashbrown::{HashMap, HashSet, hash_map};
 
 	pub use alloc::borrow::ToOwned;
 	pub use alloc::string::ToString;
+
+	pub use core::convert::{AsMut, AsRef, TryFrom, TryInto};
+	pub use core::default::Default;
+	pub use core::marker::Sized;
+
+	pub(crate) use crate::util::hash_tables::*;
 }
 
 #[cfg(all(not(ldk_bench), feature = "backtrace", feature = "std", test))]

@@ -9,17 +9,18 @@
 
 //! Message handling for BOLT 12 Offers.
 
-use core::convert::TryFrom;
+use core::fmt;
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::offers::invoice_error::InvoiceError;
 use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::parse::Bolt12ParseError;
-use crate::onion_message::OnionMessageContents;
-use crate::onion_message::messenger::PendingOnionMessage;
+use crate::onion_message::packet::OnionMessageContents;
 use crate::util::logger::Logger;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+#[cfg(not(c_bindings))]
+use crate::onion_message::messenger::PendingOnionMessage;
 
 use crate::prelude::*;
 
@@ -37,7 +38,7 @@ pub trait OffersMessageHandler {
 	///
 	/// The returned [`OffersMessage`], if any, is enqueued to be sent by [`OnionMessenger`].
 	///
-	/// [`OnionMessenger`]: crate::onion_message::OnionMessenger
+	/// [`OnionMessenger`]: crate::onion_message::messenger::OnionMessenger
 	fn handle_message(&self, message: OffersMessage) -> Option<OffersMessage>;
 
 	/// Releases any [`OffersMessage`]s that need to be sent.
@@ -52,13 +53,13 @@ pub trait OffersMessageHandler {
 	/// Typically, this is used for messages initiating a payment flow rather than in response to
 	/// another message. The latter should use the return value of [`Self::handle_message`].
 	#[cfg(c_bindings)]
-	fn release_pending_messages(&self) -> Vec<(OffersMessage, crate::onion_message::Destination, Option<crate::blinded_path::BlindedPath>)> { vec![] }
+	fn release_pending_messages(&self) -> Vec<(OffersMessage, crate::onion_message::messenger::Destination, Option<crate::blinded_path::BlindedPath>)> { vec![] }
 }
 
 /// Possible BOLT 12 Offers messages sent and received via an [`OnionMessage`].
 ///
 /// [`OnionMessage`]: crate::ln::msgs::OnionMessage
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum OffersMessage {
 	/// A request for a [`Bolt12Invoice`] for a particular [`Offer`].
 	///
@@ -88,6 +89,22 @@ impl OffersMessage {
 			INVOICE_REQUEST_TLV_TYPE => Ok(Self::InvoiceRequest(InvoiceRequest::try_from(bytes)?)),
 			INVOICE_TLV_TYPE => Ok(Self::Invoice(Bolt12Invoice::try_from(bytes)?)),
 			_ => Err(Bolt12ParseError::Decode(DecodeError::InvalidValue)),
+		}
+	}
+}
+
+impl fmt::Debug for OffersMessage {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			OffersMessage::InvoiceRequest(message) => {
+				write!(f, "{:?}", message.as_tlv_stream())
+			}
+			OffersMessage::Invoice(message) => {
+				write!(f, "{:?}", message.as_tlv_stream())
+			}
+			OffersMessage::InvoiceError(message) => {
+				write!(f, "{:?}", message)
+			}
 		}
 	}
 }

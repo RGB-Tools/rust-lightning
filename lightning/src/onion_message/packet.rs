@@ -12,14 +12,14 @@
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::ecdh::SharedSecret;
 
-use crate::blinded_path::BlindedPath;
+use crate::blinded_path::{BlindedPath, NextMessageHop};
 use crate::blinded_path::message::{ForwardTlvs, ReceiveTlvs};
 use crate::blinded_path::utils::Padding;
 use crate::ln::msgs::DecodeError;
 use crate::ln::onion_utils;
 use super::messenger::CustomOnionMessageHandler;
 use super::offers::OffersMessage;
-use crate::util::chacha20poly1305rfc::{ChaChaPolyReadAdapter, ChaChaPolyWriteAdapter};
+use crate::crypto::streams::{ChaChaPolyReadAdapter, ChaChaPolyWriteAdapter};
 use crate::util::logger::Logger;
 use crate::util::ser::{BigSize, FixedLengthReader, LengthRead, LengthReadable, LengthReadableArgs, Readable, ReadableArgs, Writeable, Writer};
 
@@ -33,7 +33,7 @@ pub(super) const SMALL_PACKET_HOP_DATA_LEN: usize = 1300;
 pub(super) const BIG_PACKET_HOP_DATA_LEN: usize = 32768;
 
 /// Packet of hop data for next peer
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Packet {
 	/// Bolt 04 version number
 	pub version: u8,
@@ -117,7 +117,7 @@ pub(super) enum Payload<T: OnionMessageContents> {
 /// The contents of an [`OnionMessage`] as read from the wire.
 ///
 /// [`OnionMessage`]: crate::ln::msgs::OnionMessage
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ParsedOnionMessageContents<T: OnionMessageContents> {
 	/// A message related to BOLT 12 Offers.
 	Offers(OffersMessage),
@@ -147,7 +147,7 @@ impl<T: OnionMessageContents> Writeable for ParsedOnionMessageContents<T> {
 }
 
 /// The contents of an onion message.
-pub trait OnionMessageContents: Writeable {
+pub trait OnionMessageContents: Writeable + core::fmt::Debug {
 	/// Returns the TLV type identifying the message contents. MUST be >= 64.
 	fn tlv_type(&self) -> u64;
 }
@@ -284,20 +284,26 @@ impl Readable for ControlTlvs {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		_init_and_read_tlv_stream!(r, {
 			(1, _padding, option),
-			(2, _short_channel_id, option),
+			(2, short_channel_id, option),
 			(4, next_node_id, option),
 			(6, path_id, option),
 			(8, next_blinding_override, option),
 		});
 		let _padding: Option<Padding> = _padding;
-		let _short_channel_id: Option<u64> = _short_channel_id;
 
-		let valid_fwd_fmt  = next_node_id.is_some() && path_id.is_none();
-		let valid_recv_fmt = next_node_id.is_none() && next_blinding_override.is_none();
+		let next_hop = match (short_channel_id, next_node_id) {
+			(Some(_), Some(_)) => return Err(DecodeError::InvalidValue),
+			(Some(scid), None) => Some(NextMessageHop::ShortChannelId(scid)),
+			(None, Some(pubkey)) => Some(NextMessageHop::NodeId(pubkey)),
+			(None, None) => None,
+		};
+
+		let valid_fwd_fmt = next_hop.is_some() && path_id.is_none();
+		let valid_recv_fmt = next_hop.is_none() && next_blinding_override.is_none();
 
 		let payload_fmt = if valid_fwd_fmt {
 			ControlTlvs::Forward(ForwardTlvs {
-				next_node_id: next_node_id.unwrap(),
+				next_hop: next_hop.unwrap(),
 				next_blinding_override,
 			})
 		} else if valid_recv_fmt {

@@ -1,8 +1,8 @@
 use crate::http::{BinaryResponse, JsonResponse};
-use crate::utils::hex_to_uint256;
+use crate::utils::hex_to_work;
 use crate::{BlockHeaderData, BlockSourceError};
 
-use bitcoin::blockdata::block::{Block, BlockHeader};
+use bitcoin::blockdata::block::{Block, Header};
 use bitcoin::consensus::encode;
 use bitcoin::hash_types::{BlockHash, TxMerkleNode, Txid};
 use bitcoin::hashes::hex::FromHex;
@@ -88,17 +88,21 @@ impl TryFrom<serde_json::Value> for BlockHeaderData {
 		} }
 
 		Ok(BlockHeaderData {
-			header: BlockHeader {
-				version: get_field!("version", as_i64).try_into().map_err(|_| ())?,
+			header: Header {
+				version: bitcoin::blockdata::block::Version::from_consensus(
+					get_field!("version", as_i64).try_into().map_err(|_| ())?
+				),
 				prev_blockhash: if let Some(hash_str) = response.get("previousblockhash") {
-						BlockHash::from_hex(hash_str.as_str().ok_or(())?).map_err(|_| ())?
+						BlockHash::from_str(hash_str.as_str().ok_or(())?).map_err(|_| ())?
 					} else { BlockHash::all_zeros() },
-				merkle_root: TxMerkleNode::from_hex(get_field!("merkleroot", as_str)).map_err(|_| ())?,
+				merkle_root: TxMerkleNode::from_str(get_field!("merkleroot", as_str)).map_err(|_| ())?,
 				time: get_field!("time", as_u64).try_into().map_err(|_| ())?,
-				bits: u32::from_be_bytes(<[u8; 4]>::from_hex(get_field!("bits", as_str)).map_err(|_| ())?),
+				bits: bitcoin::CompactTarget::from_consensus(
+					u32::from_be_bytes(<[u8; 4]>::from_hex(get_field!("bits", as_str)).map_err(|_| ())?)
+				),
 				nonce: get_field!("nonce", as_u64).try_into().map_err(|_| ())?,
 			},
-			chainwork: hex_to_uint256(get_field!("chainwork", as_str)).map_err(|_| ())?,
+			chainwork: hex_to_work(get_field!("chainwork", as_str)).map_err(|_| ())?,
 			height: get_field!("height", as_u64).try_into().map_err(|_| ())?,
 		})
 	}
@@ -132,7 +136,7 @@ impl TryInto<(BlockHash, Option<u32>)> for JsonResponse {
 		}
 
 		let hash = match &self.0["bestblockhash"] {
-			serde_json::Value::String(hex_data) => match BlockHash::from_hex(&hex_data) {
+			serde_json::Value::String(hex_data) => match BlockHash::from_str(&hex_data) {
 				Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hex data")),
 				Ok(block_hash) => block_hash,
 			},
@@ -158,25 +162,8 @@ impl TryInto<(BlockHash, Option<u32>)> for JsonResponse {
 impl TryInto<Txid> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<Txid> {
-		match self.0.as_str() {
-			None => Err(std::io::Error::new(
-				std::io::ErrorKind::InvalidData,
-				"expected JSON string",
-			)),
-			Some(hex_data) => match Vec::<u8>::from_hex(hex_data) {
-				Err(_) => Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					"invalid hex data",
-				)),
-				Ok(txid_data) => match encode::deserialize(&txid_data) {
-					Err(_) => Err(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"invalid txid",
-					)),
-					Ok(txid) => Ok(txid),
-				},
-			},
-		}
+		let hex_data = self.0.as_str().ok_or(Self::Error::new(std::io::ErrorKind::InvalidData, "expected JSON string" ))?;
+		Txid::from_str(hex_data).map_err(|err|Self::Error::new(std::io::ErrorKind::InvalidData, err.to_string() ))
 	}
 }
 
@@ -260,10 +247,12 @@ impl TryInto<BlockHash> for JsonResponse {
 /// The REST `getutxos` endpoint retuns a whole pile of data we don't care about and one bit we do
 /// - whether the `hit bitmap` field had any entries. Thus we condense the result down into only
 /// that.
+#[cfg(feature = "rest-client")]
 pub(crate) struct GetUtxosResponse {
 	pub(crate) hit_bitmap_nonempty: bool
 }
 
+#[cfg(feature = "rest-client")]
 impl TryInto<GetUtxosResponse> for JsonResponse {
 	type Error = std::io::Error;
 
@@ -288,8 +277,8 @@ pub(crate) mod tests {
 	use super::*;
 	use bitcoin::blockdata::constants::genesis_block;
 	use bitcoin::hashes::Hash;
-	use bitcoin::hashes::hex::ToHex;
 	use bitcoin::network::constants::Network;
+	use hex::DisplayHex;
 	use serde_json::value::Number;
 	use serde_json::Value;
 
@@ -298,14 +287,14 @@ pub(crate) mod tests {
 		fn from(data: BlockHeaderData) -> Self {
 			let BlockHeaderData { chainwork, height, header } = data;
 			serde_json::json!({
-				"chainwork": chainwork.to_string()["0x".len()..],
+				"chainwork": chainwork.to_be_bytes().as_hex().to_string(),
 				"height": height,
-				"version": header.version,
-				"merkleroot": header.merkle_root.to_hex(),
+				"version": header.version.to_consensus(),
+				"merkleroot": header.merkle_root.to_string(),
 				"time": header.time,
 				"nonce": header.nonce,
-				"bits": header.bits.to_hex(),
-				"previousblockhash": header.prev_blockhash.to_hex(),
+				"bits": header.bits.to_consensus().to_be_bytes().as_hex().to_string(),
+				"previousblockhash": header.prev_blockhash.to_string(),
 			})
 		}
 	}
@@ -394,7 +383,7 @@ pub(crate) mod tests {
 	#[test]
 	fn into_block_header_from_json_response_with_valid_header_array() {
 		let genesis_block = genesis_block(Network::Bitcoin);
-		let best_block_header = BlockHeader {
+		let best_block_header = Header {
 			prev_blockhash: genesis_block.block_hash(),
 			..genesis_block.header
 		};
@@ -541,7 +530,7 @@ pub(crate) mod tests {
 	fn into_block_hash_from_json_response_without_height() {
 		let block = genesis_block(Network::Bitcoin);
 		let response = JsonResponse(serde_json::json!({
-			"bestblockhash": block.block_hash().to_hex(),
+			"bestblockhash": block.block_hash().to_string(),
 		}));
 		match TryInto::<(BlockHash, Option<u32>)>::try_into(response) {
 			Err(e) => panic!("Unexpected error: {:?}", e),
@@ -556,7 +545,7 @@ pub(crate) mod tests {
 	fn into_block_hash_from_json_response_with_unexpected_blocks_type() {
 		let block = genesis_block(Network::Bitcoin);
 		let response = JsonResponse(serde_json::json!({
-			"bestblockhash": block.block_hash().to_hex(),
+			"bestblockhash": block.block_hash().to_string(),
 			"blocks": "foo",
 		}));
 		match TryInto::<(BlockHash, Option<u32>)>::try_into(response) {
@@ -572,7 +561,7 @@ pub(crate) mod tests {
 	fn into_block_hash_from_json_response_with_invalid_height() {
 		let block = genesis_block(Network::Bitcoin);
 		let response = JsonResponse(serde_json::json!({
-			"bestblockhash": block.block_hash().to_hex(),
+			"bestblockhash": block.block_hash().to_string(),
 			"blocks": std::u64::MAX,
 		}));
 		match TryInto::<(BlockHash, Option<u32>)>::try_into(response) {
@@ -588,7 +577,7 @@ pub(crate) mod tests {
 	fn into_block_hash_from_json_response_with_height() {
 		let block = genesis_block(Network::Bitcoin);
 		let response = JsonResponse(serde_json::json!({
-			"bestblockhash": block.block_hash().to_hex(),
+			"bestblockhash": block.block_hash().to_string(),
 			"blocks": 1,
 		}));
 		match TryInto::<(BlockHash, Option<u32>)>::try_into(response) {
@@ -618,7 +607,7 @@ pub(crate) mod tests {
 		match TryInto::<Txid>::try_into(response) {
 			Err(e) => {
 				assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
-				assert_eq!(e.get_ref().unwrap().to_string(), "invalid hex data");
+				assert_eq!(e.get_ref().unwrap().to_string(), "bad hex string length 6 (expected 64)");
 			}
 			Ok(_) => panic!("Expected error"),
 		}
@@ -630,7 +619,7 @@ pub(crate) mod tests {
 		match TryInto::<Txid>::try_into(response) {
 			Err(e) => {
 				assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
-				assert_eq!(e.get_ref().unwrap().to_string(), "invalid txid");
+				assert_eq!(e.get_ref().unwrap().to_string(), "bad hex string length 4 (expected 64)");
 			}
 			Ok(_) => panic!("Expected error"),
 		}
@@ -644,6 +633,20 @@ pub(crate) mod tests {
 			Err(e) => panic!("Unexpected error: {:?}", e),
 			Ok(txid) => assert_eq!(txid, target_txid),
 		}
+	}
+
+	#[test]
+	fn into_txid_from_bitcoind_rpc_json_response() {
+		let mut rpc_response = serde_json::json!(
+            {"error": "", "id": "770", "result": "7934f775149929a8b742487129a7c3a535dfb612f0b726cc67bc10bc2628f906"}
+
+        );
+        let r: std::io::Result<Txid> = JsonResponse(rpc_response.get_mut("result").unwrap().take())
+            .try_into();
+        assert_eq!(
+            r.unwrap().to_string(),
+            "7934f775149929a8b742487129a7c3a535dfb612f0b726cc67bc10bc2628f906"
+        );
 	}
 
 	// TryInto<Transaction> can be used in two ways, first with plain hex response where data is

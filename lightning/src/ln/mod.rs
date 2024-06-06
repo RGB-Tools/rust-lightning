@@ -13,14 +13,18 @@
 #[macro_use]
 pub mod functional_test_utils;
 
+pub mod onion_payment;
 pub mod channelmanager;
+pub mod channel_keys;
 pub mod inbound_payment;
 pub mod msgs;
 pub mod peer_handler;
 pub mod chan_utils;
 pub mod features;
 pub mod script;
-mod channel_id;
+pub mod types;
+
+pub use types::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 
 #[cfg(fuzzing)]
 pub mod peer_channel_encryptor;
@@ -32,13 +36,11 @@ pub mod channel;
 #[cfg(not(fuzzing))]
 pub(crate) mod channel;
 
-// Re-export ChannelId
-pub use channel_id::ChannelId;
-
 pub(crate) mod onion_utils;
 mod outbound_payment;
 pub mod wire;
 
+pub use onion_utils::create_payment_onion;
 // Older rustc (which we support) refuses to let us call the get_payment_preimage_hash!() macro
 // without the node parameter being mut. This is incorrect, and thus newer rustcs will complain
 // about an unnecessary mut. Thus, we silence the unused_mut warning in two test modules below.
@@ -73,73 +75,13 @@ mod monitor_tests;
 #[cfg(test)]
 #[allow(unused_mut)]
 mod shutdown_tests;
+#[cfg(all(test, async_signing))]
+#[allow(unused_mut)]
+mod async_signer_tests;
+#[cfg(test)]
+#[allow(unused_mut)]
+mod offers_tests;
+#[allow(dead_code)] // TODO(dual_funding): Exchange for dual_funding cfg
+pub(crate) mod interactivetxs;
 
 pub use self::peer_channel_encryptor::LN_MAX_MSG_LEN;
-
-/// payment_hash type, use to cross-lock hop
-///
-/// This is not exported to bindings users as we just use [u8; 32] directly
-#[derive(Hash, Copy, Clone, PartialEq, Eq, Debug, Ord, PartialOrd)]
-pub struct PaymentHash(pub [u8; 32]);
-
-impl core::fmt::Display for PaymentHash {
-	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-		crate::util::logger::DebugBytes(&self.0).fmt(f)
-	}
-}
-
-impl PaymentHash {
-	/// Create a payment hash consisting of all-zeros data (e.g. when uninitialized or a placeholder).
-	pub fn new_zero() -> Self {
-		Self([0; 32])
-	}
-}
-
-/// payment_preimage type, use to route payment between hop
-///
-/// This is not exported to bindings users as we just use [u8; 32] directly
-#[derive(Hash, Copy, Clone, PartialEq, Eq, Debug, Ord, PartialOrd)]
-pub struct PaymentPreimage(pub [u8; 32]);
-
-impl core::fmt::Display for PaymentPreimage {
-	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-		crate::util::logger::DebugBytes(&self.0).fmt(f)
-	}
-}
-
-/// payment_secret type, use to authenticate sender to the receiver and tie MPP HTLCs together
-///
-/// This is not exported to bindings users as we just use [u8; 32] directly
-#[derive(Hash, Copy, Clone, PartialEq, Eq, Debug, Ord, PartialOrd)]
-pub struct PaymentSecret(pub [u8; 32]);
-
-use crate::prelude::*;
-use bitcoin::bech32;
-use bitcoin::bech32::{Base32Len, FromBase32, ToBase32, WriteBase32, u5};
-
-impl FromBase32 for PaymentSecret {
-	type Err = bech32::Error;
-
-	fn from_base32(field_data: &[u5]) -> Result<PaymentSecret, bech32::Error> {
-		if field_data.len() != 52 {
-			return Err(bech32::Error::InvalidLength)
-		} else {
-			let data_bytes = Vec::<u8>::from_base32(field_data)?;
-			let mut payment_secret = [0; 32];
-			payment_secret.copy_from_slice(&data_bytes);
-			Ok(PaymentSecret(payment_secret))
-		}
-	}
-}
-
-impl ToBase32 for PaymentSecret {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		(&self.0[..]).write_base32(writer)
-	}
-}
-
-impl Base32Len for PaymentSecret {
-	fn base32_len(&self) -> usize {
-		52
-	}
-}

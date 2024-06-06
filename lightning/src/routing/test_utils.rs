@@ -9,28 +9,26 @@
 
 use crate::routing::gossip::{NetworkGraph, NodeAlias, P2PGossipSync};
 use crate::ln::features::{ChannelFeatures, NodeFeatures};
-use crate::ln::msgs::{UnsignedChannelAnnouncement, ChannelAnnouncement, RoutingMessageHandler,
-	NodeAnnouncement, UnsignedNodeAnnouncement, ChannelUpdate, UnsignedChannelUpdate, MAX_VALUE_MSAT};
+use crate::ln::msgs::{ChannelAnnouncement, ChannelUpdate, MAX_VALUE_MSAT, NodeAnnouncement, RoutingMessageHandler, SocketAddress, UnsignedChannelAnnouncement, UnsignedChannelUpdate, UnsignedNodeAnnouncement};
 use crate::util::test_utils;
 use crate::util::ser::Writeable;
 
 use bitcoin::blockdata::constants::ChainHash;
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::hex::FromHex;
 use bitcoin::network::constants::Network;
-
-use hex;
-
 use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1, All};
 
+#[allow(unused)]
 use crate::prelude::*;
 use crate::sync::{self, Arc};
 
 use crate::routing::gossip::NodeId;
 
 // Using the same keys for LN and BTC ids
-pub(super) fn add_channel(
+pub(crate) fn add_channel(
 	gossip_sync: &P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
 	secp_ctx: &Secp256k1<All>, node_1_privkey: &SecretKey, node_2_privkey: &SecretKey, features: ChannelFeatures, short_channel_id: u64
 ) {
@@ -62,7 +60,7 @@ pub(super) fn add_channel(
 	};
 }
 
-pub(super) fn add_or_update_node(
+pub(crate) fn add_or_update_node(
 	gossip_sync: &P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
 	secp_ctx: &Secp256k1<All>, node_privkey: &SecretKey, features: NodeFeatures, timestamp: u32
 ) {
@@ -73,7 +71,7 @@ pub(super) fn add_or_update_node(
 		node_id,
 		rgb: [0; 3],
 		alias: NodeAlias([0; 32]),
-		addresses: Vec::new(),
+		addresses: vec![SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 1000 }],
 		excess_address_data: Vec::new(),
 		excess_data: Vec::new(),
 	};
@@ -89,7 +87,7 @@ pub(super) fn add_or_update_node(
 	};
 }
 
-pub(super) fn update_channel(
+pub(crate) fn update_channel(
 	gossip_sync: &P2PGossipSync<Arc<NetworkGraph<Arc<test_utils::TestLogger>>>, Arc<test_utils::TestChainSource>, Arc<test_utils::TestLogger>>,
 	secp_ctx: &Secp256k1<All>, node_privkey: &SecretKey, update: UnsignedChannelUpdate
 ) {
@@ -107,12 +105,12 @@ pub(super) fn update_channel(
 
 pub(super) fn get_nodes(secp_ctx: &Secp256k1<All>) -> (SecretKey, PublicKey, Vec<SecretKey>, Vec<PublicKey>) {
 	let privkeys: Vec<SecretKey> = (2..22).map(|i| {
-		SecretKey::from_slice(&hex::decode(format!("{:02x}", i).repeat(32)).unwrap()[..]).unwrap()
+		SecretKey::from_slice(&<Vec<u8>>::from_hex(&format!("{:02x}", i).repeat(32)).unwrap()[..]).unwrap()
 	}).collect();
 
 	let pubkeys = privkeys.iter().map(|secret| PublicKey::from_secret_key(&secp_ctx, secret)).collect();
 
-	let our_privkey = SecretKey::from_slice(&hex::decode("01".repeat(32)).unwrap()[..]).unwrap();
+	let our_privkey = SecretKey::from_slice(&<Vec<u8>>::from_hex(&"01".repeat(32)).unwrap()[..]).unwrap();
 	let our_id = PublicKey::from_secret_key(&secp_ctx, &our_privkey);
 
 	(our_privkey, our_id, privkeys, pubkeys)

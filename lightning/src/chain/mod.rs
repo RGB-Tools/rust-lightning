@@ -9,17 +9,20 @@
 
 //! Structs and traits which allow other parts of rust-lightning to interact with the blockchain.
 
-use bitcoin::blockdata::block::{Block, BlockHeader};
+use bitcoin::blockdata::block::{Block, Header};
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::blockdata::script::Script;
+use bitcoin::blockdata::script::{Script, ScriptBuf};
 use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
 
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, MonitorEvent};
-use crate::sign::WriteableEcdsaChannelSigner;
+use crate::ln::types::ChannelId;
+use crate::sign::ecdsa::WriteableEcdsaChannelSigner;
 use crate::chain::transaction::{OutPoint, TransactionData};
+use crate::impl_writeable_tlv_based;
 
+#[allow(unused_imports)]
 use crate::prelude::*;
 
 pub mod chaininterface;
@@ -30,10 +33,12 @@ pub(crate) mod onchaintx;
 pub(crate) mod package;
 
 /// The best known block as identified by its hash and height.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct BestBlock {
-	block_hash: BlockHash,
-	height: u32,
+	/// The block's hash
+	pub block_hash: BlockHash,
+	/// The height at which the block was confirmed.
+	pub height: u32,
 }
 
 impl BestBlock {
@@ -50,13 +55,12 @@ impl BestBlock {
 	pub fn new(block_hash: BlockHash, height: u32) -> Self {
 		BestBlock { block_hash, height }
 	}
-
-	/// Returns the best block hash.
-	pub fn block_hash(&self) -> BlockHash { self.block_hash }
-
-	/// Returns the best block height.
-	pub fn height(&self) -> u32 { self.height }
 }
+
+impl_writeable_tlv_based!(BestBlock, {
+	(0, block_hash, required),
+	(2, height, required),
+});
 
 
 /// The `Listen` trait is used to notify when blocks have been connected or disconnected from the
@@ -73,7 +77,7 @@ impl BestBlock {
 pub trait Listen {
 	/// Notifies the listener that a block was added at the given height, with the transaction data
 	/// possibly filtered.
-	fn filtered_block_connected(&self, header: &BlockHeader, txdata: &TransactionData, height: u32);
+	fn filtered_block_connected(&self, header: &Header, txdata: &TransactionData, height: u32);
 
 	/// Notifies the listener that a block was added at the given height.
 	fn block_connected(&self, block: &Block, height: u32) {
@@ -82,7 +86,7 @@ pub trait Listen {
 	}
 
 	/// Notifies the listener that a block was removed at the given height.
-	fn block_disconnected(&self, header: &BlockHeader, height: u32);
+	fn block_disconnected(&self, header: &Header, height: u32);
 }
 
 /// The `Confirm` trait is used to notify LDK when relevant transactions have been confirmed on
@@ -135,7 +139,7 @@ pub trait Confirm {
 	///
 	/// [chain order]: Confirm#order
 	/// [`best_block_updated`]: Self::best_block_updated
-	fn transactions_confirmed(&self, header: &BlockHeader, txdata: &TransactionData, height: u32);
+	fn transactions_confirmed(&self, header: &Header, txdata: &TransactionData, height: u32);
 	/// Notifies LDK of a transaction that is no longer confirmed as result of a chain reorganization.
 	///
 	/// Must be called for any transaction returned by [`get_relevant_txids`] if it has been
@@ -150,9 +154,9 @@ pub trait Confirm {
 	///
 	/// Must be called whenever a new chain tip becomes available. May be skipped for intermediary
 	/// blocks.
-	fn best_block_updated(&self, header: &BlockHeader, height: u32);
+	fn best_block_updated(&self, header: &Header, height: u32);
 	/// Returns transactions that must be monitored for reorganization out of the chain along
-	/// with the hash of the block as part of which it had been previously confirmed.
+	/// with the height and the hash of the block as part of which it had been previously confirmed.
 	///
 	/// Note that the returned `Option<BlockHash>` might be `None` for channels created with LDK
 	/// 0.0.112 and prior, in which case you need to manually track previous confirmations.
@@ -167,12 +171,12 @@ pub trait Confirm {
 	/// given to [`transaction_unconfirmed`].
 	///
 	/// If any of the returned transactions are confirmed in a block other than the one with the
-	/// given hash, they need to be unconfirmed and reconfirmed via [`transaction_unconfirmed`] and
-	/// [`transactions_confirmed`], respectively.
+	/// given hash at the given height, they need to be unconfirmed and reconfirmed via
+	/// [`transaction_unconfirmed`] and [`transactions_confirmed`], respectively.
 	///
 	/// [`transactions_confirmed`]: Self::transactions_confirmed
 	/// [`transaction_unconfirmed`]: Self::transaction_unconfirmed
-	fn get_relevant_txids(&self) -> Vec<(Txid, Option<BlockHash>)>;
+	fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<BlockHash>)>;
 }
 
 /// An enum representing the status of a channel monitor update persistence.
@@ -297,7 +301,7 @@ pub trait Watch<ChannelSigner: WriteableEcdsaChannelSigner> {
 	///
 	/// For details on asynchronous [`ChannelMonitor`] updating and returning
 	/// [`MonitorEvent::Completed`] here, see [`ChannelMonitorUpdateStatus::InProgress`].
-	fn release_pending_monitor_events(&self) -> Vec<(OutPoint, Vec<MonitorEvent>, Option<PublicKey>)>;
+	fn release_pending_monitor_events(&self) -> Vec<(OutPoint, ChannelId, Vec<MonitorEvent>, Option<PublicKey>)>;
 }
 
 /// The `Filter` trait defines behavior for indicating chain activity of interest pertaining to
@@ -354,15 +358,15 @@ pub struct WatchedOutput {
 	pub outpoint: OutPoint,
 
 	/// Spending condition of the transaction output.
-	pub script_pubkey: Script,
+	pub script_pubkey: ScriptBuf,
 }
 
-impl<T: Listen> Listen for core::ops::Deref<Target = T> {
-	fn filtered_block_connected(&self, header: &BlockHeader, txdata: &TransactionData, height: u32) {
+impl<T: Listen> Listen for dyn core::ops::Deref<Target = T> {
+	fn filtered_block_connected(&self, header: &Header, txdata: &TransactionData, height: u32) {
 		(**self).filtered_block_connected(header, txdata, height);
 	}
 
-	fn block_disconnected(&self, header: &BlockHeader, height: u32) {
+	fn block_disconnected(&self, header: &Header, height: u32) {
 		(**self).block_disconnected(header, height);
 	}
 }
@@ -372,12 +376,12 @@ where
 	T::Target: Listen,
 	U::Target: Listen,
 {
-	fn filtered_block_connected(&self, header: &BlockHeader, txdata: &TransactionData, height: u32) {
+	fn filtered_block_connected(&self, header: &Header, txdata: &TransactionData, height: u32) {
 		self.0.filtered_block_connected(header, txdata, height);
 		self.1.filtered_block_connected(header, txdata, height);
 	}
 
-	fn block_disconnected(&self, header: &BlockHeader, height: u32) {
+	fn block_disconnected(&self, header: &Header, height: u32) {
 		self.0.block_disconnected(header, height);
 		self.1.block_disconnected(header, height);
 	}

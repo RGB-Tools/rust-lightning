@@ -7,25 +7,24 @@
 //! This module contains a simple key-value store trait [`KVStore`] that
 //! allows one to implement the persistence for [`ChannelManager`], [`NetworkGraph`],
 //! and [`ChannelMonitor`] all in one place.
+//!
+//! [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 
 use core::cmp;
-use core::convert::{TryFrom, TryInto};
 use core::ops::Deref;
-use bitcoin::hashes::hex::{FromHex, ToHex};
+use core::str::FromStr;
 use bitcoin::{BlockHash, Txid};
 
 use crate::{io, log_error};
-use crate::alloc::string::ToString;
 use crate::prelude::*;
 
 use crate::chain;
 use crate::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use crate::chain::chainmonitor::{Persist, MonitorUpdateId};
-use crate::sign::{EntropySource, NodeSigner, WriteableEcdsaChannelSigner, SignerProvider};
+use crate::sign::{EntropySource, ecdsa::WriteableEcdsaChannelSigner, SignerProvider};
 use crate::chain::transaction::OutPoint;
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, CLOSED_CHANNEL_UPDATE_ID};
-use crate::ln::channelmanager::ChannelManager;
-use crate::routing::router::Router;
+use crate::ln::channelmanager::AChannelManager;
 use crate::routing::gossip::NetworkGraph;
 use crate::routing::scoring::WriteableScore;
 use crate::util::logger::Logger;
@@ -40,10 +39,16 @@ pub const KVSTORE_NAMESPACE_KEY_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyzABCD
 pub const KVSTORE_NAMESPACE_KEY_MAX_LEN: usize = 120;
 
 /// The primary namespace under which the [`ChannelManager`] will be persisted.
+///
+/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 pub const CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
 /// The secondary namespace under which the [`ChannelManager`] will be persisted.
+///
+/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 pub const CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 /// The key under which the [`ChannelManager`] will be persisted.
+///
+/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 pub const CHANNEL_MANAGER_PERSISTENCE_KEY: &str = "manager";
 
 /// The primary namespace under which [`ChannelMonitor`]s will be persisted.
@@ -52,6 +57,11 @@ pub const CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE: &str = "monitors";
 pub const CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 /// The primary namespace under which [`ChannelMonitorUpdate`]s will be persisted.
 pub const CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "monitor_updates";
+
+/// The primary namespace under which archived [`ChannelMonitor`]s will be persisted.
+pub const ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE: &str = "archived_monitors";
+/// The secondary namespace under which archived [`ChannelMonitor`]s will be persisted.
+pub const ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 
 /// The primary namespace under which the [`NetworkGraph`] will be persisted.
 pub const NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
@@ -66,6 +76,20 @@ pub const SCORER_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
 pub const SCORER_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 /// The key under which the [`WriteableScore`] will be persisted.
 pub const SCORER_PERSISTENCE_KEY: &str = "scorer";
+
+/// The primary namespace under which [`OutputSweeper`] state will be persisted.
+///
+/// [`OutputSweeper`]: crate::util::sweep::OutputSweeper
+pub const OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
+/// The secondary namespace under which [`OutputSweeper`] state will be persisted.
+///
+/// [`OutputSweeper`]: crate::util::sweep::OutputSweeper
+pub const OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+/// The secondary namespace under which [`OutputSweeper`] state will be persisted.
+/// The key under which [`OutputSweeper`] state will be persisted.
+///
+/// [`OutputSweeper`]: crate::util::sweep::OutputSweeper
+pub const OUTPUT_SWEEPER_PERSISTENCE_KEY: &str = "output_sweeper";
 
 /// A sentinel value to be prepended to monitors persisted by the [`MonitorUpdatingPersister`].
 ///
@@ -133,18 +157,17 @@ pub trait KVStore {
 }
 
 /// Trait that handles persisting a [`ChannelManager`], [`NetworkGraph`], and [`WriteableScore`] to disk.
-pub trait Persister<'a, M: Deref, T: Deref, ES: Deref, NS: Deref, SP: Deref, F: Deref, R: Deref, L: Deref, S: WriteableScore<'a>>
-	where M::Target: 'static + chain::Watch<<SP::Target as SignerProvider>::Signer>,
-		T::Target: 'static + BroadcasterInterface,
-		ES::Target: 'static + EntropySource,
-		NS::Target: 'static + NodeSigner,
-		SP::Target: 'static + SignerProvider,
-		F::Target: 'static + FeeEstimator,
-		R::Target: 'static + Router,
-		L::Target: 'static + Logger,
+///
+/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+pub trait Persister<'a, CM: Deref, L: Deref, S: WriteableScore<'a>>
+where
+	CM::Target: 'static + AChannelManager,
+	L::Target: 'static + Logger,
 {
 	/// Persist the given ['ChannelManager'] to disk, returning an error if persistence failed.
-	fn persist_manager(&self, channel_manager: &ChannelManager<M, T, ES, NS, SP, F, R, L>) -> Result<(), io::Error>;
+	///
+	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+	fn persist_manager(&self, channel_manager: &CM) -> Result<(), io::Error>;
 
 	/// Persist the given [`NetworkGraph`] to disk, returning an error if persistence failed.
 	fn persist_graph(&self, network_graph: &NetworkGraph<L>) -> Result<(), io::Error>;
@@ -154,25 +177,18 @@ pub trait Persister<'a, M: Deref, T: Deref, ES: Deref, NS: Deref, SP: Deref, F: 
 }
 
 
-impl<'a, A: KVStore, M: Deref, T: Deref, ES: Deref, NS: Deref, SP: Deref, F: Deref, R: Deref, L: Deref, S: WriteableScore<'a>> Persister<'a, M, T, ES, NS, SP, F, R, L, S> for A
-	where M::Target: 'static + chain::Watch<<SP::Target as SignerProvider>::Signer>,
-		T::Target: 'static + BroadcasterInterface,
-		ES::Target: 'static + EntropySource,
-		NS::Target: 'static + NodeSigner,
-		SP::Target: 'static + SignerProvider,
-		F::Target: 'static + FeeEstimator,
-		R::Target: 'static + Router,
-		L::Target: 'static + Logger,
+impl<'a, A: KVStore + ?Sized, CM: Deref, L: Deref, S: WriteableScore<'a>> Persister<'a, CM, L, S> for A
+where
+	CM::Target: 'static + AChannelManager,
+	L::Target: 'static + Logger,
 {
-	/// Persist the given [`ChannelManager`] to disk, returning an error if persistence failed.
-	fn persist_manager(&self, channel_manager: &ChannelManager<M, T, ES, NS, SP, F, R, L>) -> Result<(), io::Error> {
+	fn persist_manager(&self, channel_manager: &CM) -> Result<(), io::Error> {
 		self.write(CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 			CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 			CHANNEL_MANAGER_PERSISTENCE_KEY,
-			&channel_manager.encode())
+			&channel_manager.get_cm().encode())
 	}
 
-	/// Persist the given [`NetworkGraph`] to disk, returning an error if persistence failed.
 	fn persist_graph(&self, network_graph: &NetworkGraph<L>) -> Result<(), io::Error> {
 		self.write(NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
 			NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -180,7 +196,6 @@ impl<'a, A: KVStore, M: Deref, T: Deref, ES: Deref, NS: Deref, SP: Deref, F: Der
 			&network_graph.encode())
 	}
 
-	/// Persist the given [`WriteableScore`] to disk, returning an error if persistence failed.
 	fn persist_scorer(&self, scorer: &S) -> Result<(), io::Error> {
 		self.write(SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 			SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -189,14 +204,14 @@ impl<'a, A: KVStore, M: Deref, T: Deref, ES: Deref, NS: Deref, SP: Deref, F: Der
 	}
 }
 
-impl<ChannelSigner: WriteableEcdsaChannelSigner, K: KVStore> Persist<ChannelSigner> for K {
+impl<ChannelSigner: WriteableEcdsaChannelSigner, K: KVStore + ?Sized> Persist<ChannelSigner> for K {
 	// TODO: We really need a way for the persister to inform the user that its time to crash/shut
 	// down once these start returning failure.
 	// Then we should return InProgress rather than UnrecoverableError, implying we should probably
 	// just shut down the node since we're not retrying persistence!
 
 	fn persist_new_channel(&self, funding_txo: OutPoint, monitor: &ChannelMonitor<ChannelSigner>, _update_id: MonitorUpdateId) -> chain::ChannelMonitorUpdateStatus {
-		let key = format!("{}_{}", funding_txo.txid.to_hex(), funding_txo.index);
+		let key = format!("{}_{}", funding_txo.txid.to_string(), funding_txo.index);
 		match self.write(
 			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
 			CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -208,7 +223,7 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner, K: KVStore> Persist<ChannelSign
 	}
 
 	fn update_persisted_channel(&self, funding_txo: OutPoint, _update: Option<&ChannelMonitorUpdate>, monitor: &ChannelMonitor<ChannelSigner>, _update_id: MonitorUpdateId) -> chain::ChannelMonitorUpdateStatus {
-		let key = format!("{}_{}", funding_txo.txid.to_hex(), funding_txo.index);
+		let key = format!("{}_{}", funding_txo.txid.to_string(), funding_txo.index);
 		match self.write(
 			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
 			CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -218,12 +233,39 @@ impl<ChannelSigner: WriteableEcdsaChannelSigner, K: KVStore> Persist<ChannelSign
 			Err(_) => chain::ChannelMonitorUpdateStatus::UnrecoverableError
 		}
 	}
+
+	fn archive_persisted_channel(&self, funding_txo: OutPoint) {
+		let monitor_name = MonitorName::from(funding_txo);
+		let monitor = match self.read(
+			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+			CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+			monitor_name.as_str(),
+		) {
+			Ok(monitor) => monitor,
+			Err(_) => return
+		};
+		match self.write(
+			ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+			ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+			monitor_name.as_str(),
+			&monitor,
+		) {
+			Ok(()) => {}
+			Err(_e) => return
+		};
+		let _ = self.remove(
+			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+			CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+			monitor_name.as_str(),
+			true,
+		);
+	}
 }
 
 /// Read previously persisted [`ChannelMonitor`]s from the store.
 pub fn read_channel_monitors<K: Deref, ES: Deref, SP: Deref>(
 	kv_store: K, entropy_source: ES, signer_provider: SP, ldk_data_dir: PathBuf,
-) -> Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>, io::Error>
+) -> Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>, io::Error>
 where
 	K::Target: KVStore,
 	ES::Target: EntropySource + Sized,
@@ -240,7 +282,7 @@ where
 				"Stored key has invalid length"));
 		}
 
-		let txid = Txid::from_hex(stored_key.split_at(64).0).map_err(|_| {
+		let txid = Txid::from_str(stored_key.split_at(64).0).map_err(|_| {
 			io::Error::new(io::ErrorKind::InvalidData, "Invalid tx ID in stored key")
 		})?;
 
@@ -248,7 +290,7 @@ where
 			io::Error::new(io::ErrorKind::InvalidData, "Invalid tx index in stored key")
 		})?;
 
-		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>::read(
+		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>::read(
 			&mut io::Cursor::new(
 				kv_store.read(CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE, &stored_key)?),
 			(&*entropy_source, &*signer_provider, ldk_data_dir.clone()),
@@ -336,9 +378,9 @@ where
 /// [`MonitorUpdatingPersister::read_all_channel_monitors_with_updates`]. Alternatively, users can
 /// list channel monitors themselves and load channels individually using
 /// [`MonitorUpdatingPersister::read_channel_monitor_with_updates`].
-/// 
+///
 /// ## EXTREMELY IMPORTANT
-/// 
+///
 /// It is extremely important that your [`KVStore::read`] implementation uses the
 /// [`io::ErrorKind::NotFound`] variant correctly: that is, when a file is not found, and _only_ in
 /// that circumstance (not when there is really a permissions error, for example). This is because
@@ -348,9 +390,10 @@ where
 ///
 /// # Pruning stale channel updates
 ///
-/// Stale updates are pruned when a full monitor is written. The old monitor is first read, and if
-/// that succeeds, updates in the range between the old and new monitors are deleted. The `lazy`
-/// flag is used on the [`KVStore::remove`] method, so there are no guarantees that the deletions
+/// Stale updates are pruned when the consolidation threshold is reached according to `maximum_pending_updates`.
+/// Monitor updates in the range between the latest `update_id` and `update_id - maximum_pending_updates`
+/// are deleted.
+/// The `lazy` flag is used on the [`KVStore::remove`] method, so there are no guarantees that the deletions
 /// will complete. However, stale updates are not a problem for data integrity, since updates are
 /// only read that are higher than the stored [`ChannelMonitor`]'s `update_id`.
 ///
@@ -388,7 +431,7 @@ where
 	/// consolidation will frequently occur with fewer updates than what you set here; this number
 	/// is merely the maximum that may be stored. When setting this value, consider that for higher
 	/// values of `maximum_pending_updates`:
-	/// 
+	///
 	///   - [`MonitorUpdatingPersister`] will tend to write more [`ChannelMonitorUpdate`]s than
 	/// [`ChannelMonitor`]s, approaching one [`ChannelMonitor`] write for every
 	/// `maximum_pending_updates` [`ChannelMonitorUpdate`]s.
@@ -418,7 +461,7 @@ where
 	/// documentation for [`MonitorUpdatingPersister`].
 	pub fn read_all_channel_monitors_with_updates<B: Deref, F: Deref>(
 		&self, broadcaster: &B, fee_estimator: &F,
-	) -> Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>, io::Error>
+	) -> Result<Vec<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>, io::Error>
 	where
 		B::Target: BroadcasterInterface,
 		F::Target: FeeEstimator,
@@ -452,12 +495,12 @@ where
 	///
 	/// The correct `monitor_key` would be:
 	/// `deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef_1`
-	/// 
+	///
 	/// Loading a large number of monitors will be faster if done in parallel. You can use this
 	/// function to accomplish this. Take care to limit the number of parallel readers.
 	pub fn read_channel_monitor_with_updates<B: Deref, F: Deref>(
 		&self, broadcaster: &B, fee_estimator: &F, monitor_key: String,
-	) -> Result<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>), io::Error>
+	) -> Result<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), io::Error>
 	where
 		B::Target: BroadcasterInterface,
 		F::Target: FeeEstimator,
@@ -498,7 +541,7 @@ where
 	/// Read a channel monitor.
 	fn read_monitor(
 		&self, monitor_name: &MonitorName,
-	) -> Result<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>), io::Error> {
+	) -> Result<(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), io::Error> {
 		let outpoint: OutPoint = monitor_name.try_into()?;
 		let mut monitor_cursor = io::Cursor::new(self.kv_store.read(
 			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -509,7 +552,7 @@ where
 		if monitor_cursor.get_ref().starts_with(MONITOR_UPDATING_PERSISTER_PREPEND_SENTINEL) {
 			monitor_cursor.set_position(MONITOR_UPDATING_PERSISTER_PREPEND_SENTINEL.len() as u64);
 		}
-		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::Signer>)>::read(
+		match <(BlockHash, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>)>::read(
 			&mut monitor_cursor,
 			(&*self.entropy_source, &*self.signer_provider, self.ldk_data_dir.clone()),
 		) {
@@ -598,7 +641,7 @@ where
 	}
 }
 
-impl<ChannelSigner: WriteableEcdsaChannelSigner, K: Deref, L: Deref, ES: Deref, SP: Deref> 
+impl<ChannelSigner: WriteableEcdsaChannelSigner, K: Deref, L: Deref, ES: Deref, SP: Deref>
 	Persist<ChannelSigner> for MonitorUpdatingPersister<K, L, ES, SP>
 where
 	K::Target: KVStore,
@@ -614,24 +657,6 @@ where
 	) -> chain::ChannelMonitorUpdateStatus {
 		// Determine the proper key for this monitor
 		let monitor_name = MonitorName::from(funding_txo);
-		let maybe_old_monitor = self.read_monitor(&monitor_name);
-		match maybe_old_monitor {
-			Ok((_, ref old_monitor)) => {
-				// Check that this key isn't already storing a monitor with a higher update_id
-				// (collision)
-				if old_monitor.get_latest_update_id() > monitor.get_latest_update_id() {
-					log_error!(
-						self.logger,
-						"Tried to write a monitor at the same outpoint {} with a higher update_id!",
-						monitor_name.as_str()
-					);
-					return chain::ChannelMonitorUpdateStatus::UnrecoverableError;
-				}
-			}
-			// This means the channel monitor is new.
-			Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-			_ => return chain::ChannelMonitorUpdateStatus::UnrecoverableError,
-		}
 		// Serialize and write the new monitor
 		let mut monitor_bytes = Vec::with_capacity(
 			MONITOR_UPDATING_PERSISTER_PREPEND_SENTINEL.len() + monitor.serialized_length(),
@@ -645,65 +670,12 @@ where
 			&monitor_bytes,
 		) {
 			Ok(_) => {
-				// Assess cleanup. Typically, we'll clean up only between the last two known full
-				// monitors.
-				if let Ok((_, old_monitor)) = maybe_old_monitor {
-					let start = old_monitor.get_latest_update_id();
-					let end = if monitor.get_latest_update_id() == CLOSED_CHANNEL_UPDATE_ID {
-						// We don't want to clean the rest of u64, so just do possible pending
-						// updates. Note that we never write updates at
-						// `CLOSED_CHANNEL_UPDATE_ID`.
-						cmp::min(
-							start.saturating_add(self.maximum_pending_updates),
-							CLOSED_CHANNEL_UPDATE_ID - 1,
-						)
-					} else {
-						monitor.get_latest_update_id().saturating_sub(1)
-					};
-					// We should bother cleaning up only if there's at least one update
-					// expected.
-					for update_id in start..=end {
-						let update_name = UpdateName::from(update_id);
-						#[cfg(debug_assertions)]
-						{
-							if let Ok(update) =
-								self.read_monitor_update(&monitor_name, &update_name)
-							{
-								// Assert that we are reading what we think we are.
-								debug_assert_eq!(update.update_id, update_name.0);
-							} else if update_id != start && monitor.get_latest_update_id() != CLOSED_CHANNEL_UPDATE_ID
-							{
-								// We're deleting something we should know doesn't exist.
-								panic!(
-									"failed to read monitor update {}",
-									update_name.as_str()
-								);
-							}
-							// On closed channels, we will unavoidably try to read
-							// non-existent updates since we have to guess at the range of
-							// stale updates, so do nothing.
-						}
-						if let Err(e) = self.kv_store.remove(
-							CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
-							monitor_name.as_str(),
-							update_name.as_str(),
-							true,
-						) {
-							log_error!(
-								self.logger,
-								"error cleaning up channel monitor updates for monitor {}, reason: {}",
-								monitor_name.as_str(),
-								e
-							);
-						};
-					}
-				};
 				chain::ChannelMonitorUpdateStatus::Completed
 			}
 			Err(e) => {
 				log_error!(
 					self.logger,
-					"error writing channel monitor {}/{}/{} reason: {}",
+					"Failed to write ChannelMonitor {}/{}/{} reason: {}",
 					CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
 					CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 					monitor_name.as_str(),
@@ -745,7 +717,7 @@ where
 					Err(e) => {
 						log_error!(
 							self.logger,
-							"error writing channel monitor update {}/{}/{} reason: {}",
+							"Failed to write ChannelMonitorUpdate {}/{}/{} reason: {}",
 							CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
 							monitor_name.as_str(),
 							update_name.as_str(),
@@ -755,12 +727,96 @@ where
 					}
 				}
 			} else {
-				// We could write this update, but it meets criteria of our design that call for a full monitor write.
-				self.persist_new_channel(funding_txo, monitor, monitor_update_call_id)
+				let monitor_name = MonitorName::from(funding_txo);
+				// In case of channel-close monitor update, we need to read old monitor before persisting
+				// the new one in order to determine the cleanup range.
+				let maybe_old_monitor = match monitor.get_latest_update_id() {
+					CLOSED_CHANNEL_UPDATE_ID => self.read_monitor(&monitor_name).ok(),
+					_ => None
+				};
+
+				// We could write this update, but it meets criteria of our design that calls for a full monitor write.
+				let monitor_update_status = self.persist_new_channel(funding_txo, monitor, monitor_update_call_id);
+
+				if let chain::ChannelMonitorUpdateStatus::Completed = monitor_update_status {
+					let cleanup_range = if monitor.get_latest_update_id() == CLOSED_CHANNEL_UPDATE_ID {
+						// If there is an error while reading old monitor, we skip clean up.
+						maybe_old_monitor.map(|(_, ref old_monitor)| {
+							let start = old_monitor.get_latest_update_id();
+							// We never persist an update with update_id = CLOSED_CHANNEL_UPDATE_ID
+							let end = cmp::min(
+								start.saturating_add(self.maximum_pending_updates),
+								CLOSED_CHANNEL_UPDATE_ID - 1,
+							);
+							(start, end)
+						})
+					} else {
+						let end = monitor.get_latest_update_id();
+						let start = end.saturating_sub(self.maximum_pending_updates);
+						Some((start, end))
+					};
+
+					if let Some((start, end)) = cleanup_range {
+						self.cleanup_in_range(monitor_name, start, end);
+					}
+				}
+
+				monitor_update_status
 			}
 		} else {
 			// There is no update given, so we must persist a new monitor.
 			self.persist_new_channel(funding_txo, monitor, monitor_update_call_id)
+		}
+	}
+
+	fn archive_persisted_channel(&self, funding_txo: OutPoint) {
+		let monitor_name = MonitorName::from(funding_txo);
+		let monitor = match self.read_monitor(&monitor_name) {
+			Ok((_block_hash, monitor)) => monitor,
+			Err(_) => return
+		};
+		match self.kv_store.write(
+			ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+			ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+			monitor_name.as_str(),
+			&monitor.encode()
+		) {
+			Ok(()) => {},
+			Err(_e) => return,
+		};
+		let _ = self.kv_store.remove(
+			CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+			CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+			monitor_name.as_str(),
+			true,
+		);
+	}
+}
+
+impl<K: Deref, L: Deref, ES: Deref, SP: Deref> MonitorUpdatingPersister<K, L, ES, SP>
+where
+	ES::Target: EntropySource + Sized,
+	K::Target: KVStore,
+	L::Target: Logger,
+	SP::Target: SignerProvider + Sized
+{
+	// Cleans up monitor updates for given monitor in range `start..=end`.
+	fn cleanup_in_range(&self, monitor_name: MonitorName, start: u64, end: u64) {
+		for update_id in start..=end {
+			let update_name = UpdateName::from(update_id);
+			if let Err(e) = self.kv_store.remove(
+				CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
+				monitor_name.as_str(),
+				update_name.as_str(),
+				true,
+			) {
+				log_error!(
+					self.logger,
+					"Failed to clean up channel monitor updates for monitor {}, reason: {}",
+					monitor_name.as_str(),
+					e
+				);
+			};
 		}
 	}
 }
@@ -784,7 +840,7 @@ impl MonitorName {
 	fn do_try_into_outpoint(name: &str) -> Result<OutPoint, io::Error> {
 		let mut parts = name.splitn(2, '_');
 		let txid = if let Some(part) = parts.next() {
-			Txid::from_hex(part).map_err(|_| {
+			Txid::from_str(part).map_err(|_| {
 				io::Error::new(io::ErrorKind::InvalidData, "Invalid tx ID in stored key")
 			})?
 		} else {
@@ -817,7 +873,7 @@ impl TryFrom<&MonitorName> for OutPoint {
 
 impl From<OutPoint> for MonitorName {
 	fn from(value: OutPoint) -> Self {
-		MonitorName(format!("{}_{}", value.txid.to_hex(), value.index))
+		MonitorName(format!("{}_{}", value.txid.to_string(), value.index))
 	}
 }
 
@@ -852,12 +908,13 @@ impl From<u64> for UpdateName {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::chain::chainmonitor::Persist;
 	use crate::chain::ChannelMonitorUpdateStatus;
 	use crate::events::{ClosureReason, MessageSendEventsProvider};
 	use crate::ln::functional_test_utils::*;
 	use crate::util::test_utils::{self, TestLogger, TestStore};
 	use crate::{check_added_monitors, check_closed_broadcast};
+	use crate::sync::Arc;
+	use crate::util::test_channel_signer::TestChannelSigner;
 
 	const EXPECTED_UPDATES_PER_PAYMENT: u64 = 5;
 
@@ -877,13 +934,13 @@ mod tests {
 	#[test]
 	fn monitor_from_outpoint_works() {
 		let monitor_name1 = MonitorName::from(OutPoint {
-			txid: Txid::from_hex("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap(),
+			txid: Txid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap(),
 			index: 1,
 		});
 		assert_eq!(monitor_name1.as_str(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef_1");
 
 		let monitor_name2 = MonitorName::from(OutPoint {
-			txid: Txid::from_hex("f33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeef").unwrap(),
+			txid: Txid::from_str("f33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeef").unwrap(),
 			index: u16::MAX,
 		});
 		assert_eq!(monitor_name2.as_str(), "f33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeeff33dbeef_65535");
@@ -900,20 +957,21 @@ mod tests {
 	#[test]
 	fn persister_with_real_monitors() {
 		// This value is used later to limit how many iterations we perform.
-		let test_max_pending_updates = 7;
+		let persister_0_max_pending_updates = 7;
+		// Intentionally set this to a smaller value to test a different alignment.
+		let persister_1_max_pending_updates = 3;
 		let chanmon_cfgs = create_chanmon_cfgs(4);
 		let persister_0 = MonitorUpdatingPersister {
 			kv_store: &TestStore::new(false),
 			logger: &TestLogger::new(),
-			maximum_pending_updates: test_max_pending_updates,
+			maximum_pending_updates: persister_0_max_pending_updates,
 			entropy_source: &chanmon_cfgs[0].keys_manager,
 			signer_provider: &chanmon_cfgs[0].keys_manager,
 		};
 		let persister_1 = MonitorUpdatingPersister {
 			kv_store: &TestStore::new(false),
 			logger: &TestLogger::new(),
-			// Intentionally set this to a smaller value to test a different alignment.
-			maximum_pending_updates: 3,
+			maximum_pending_updates: persister_1_max_pending_updates,
 			entropy_source: &chanmon_cfgs[1].keys_manager,
 			signer_provider: &chanmon_cfgs[1].keys_manager,
 		};
@@ -938,7 +996,6 @@ mod tests {
 		node_cfgs[1].chain_monitor = chain_mon_1;
 		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-
 		let broadcaster_0 = &chanmon_cfgs[2].tx_broadcaster;
 		let broadcaster_1 = &chanmon_cfgs[3].tx_broadcaster;
 
@@ -961,10 +1018,11 @@ mod tests {
 				for (_, mon) in persisted_chan_data_0.iter() {
 					// check that when we read it, we got the right update id
 					assert_eq!(mon.get_latest_update_id(), $expected_update_id);
-					// if the CM is at the correct update id without updates, ensure no updates are stored
+
+					// if the CM is at consolidation threshold, ensure no updates are stored.
 					let monitor_name = MonitorName::from(mon.get_funding_txo().0);
-					let (_, cm_0) = persister_0.read_monitor(&monitor_name).unwrap();
-					if cm_0.get_latest_update_id() == $expected_update_id {
+					if mon.get_latest_update_id() % persister_0_max_pending_updates == 0
+							|| mon.get_latest_update_id() == CLOSED_CHANNEL_UPDATE_ID {
 						assert_eq!(
 							persister_0.kv_store.list(CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
 								monitor_name.as_str()).unwrap().len(),
@@ -979,8 +1037,9 @@ mod tests {
 				for (_, mon) in persisted_chan_data_1.iter() {
 					assert_eq!(mon.get_latest_update_id(), $expected_update_id);
 					let monitor_name = MonitorName::from(mon.get_funding_txo().0);
-					let (_, cm_1) = persister_1.read_monitor(&monitor_name).unwrap();
-					if cm_1.get_latest_update_id() == $expected_update_id {
+					// if the CM is at consolidation threshold, ensure no updates are stored.
+					if mon.get_latest_update_id() % persister_1_max_pending_updates == 0
+							|| mon.get_latest_update_id() == CLOSED_CHANNEL_UPDATE_ID {
 						assert_eq!(
 							persister_1.kv_store.list(CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
 								monitor_name.as_str()).unwrap().len(),
@@ -1005,7 +1064,7 @@ mod tests {
 		// Send a few more payments to try all the alignments of max pending updates with
 		// updates for a payment sent and received.
 		let mut sender = 0;
-		for i in 3..=test_max_pending_updates * 2 {
+		for i in 3..=persister_0_max_pending_updates * 2 {
 			let receiver;
 			if sender == 0 {
 				sender = 1;
@@ -1063,10 +1122,10 @@ mod tests {
 		{
 			let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 			let update_map = nodes[1].chain_monitor.latest_monitor_update_id.lock().unwrap();
-			let update_id = update_map.get(&added_monitors[0].0.to_channel_id()).unwrap();
+			let update_id = update_map.get(&added_monitors[0].1.channel_id()).unwrap();
 			let cmu_map = nodes[1].chain_monitor.monitor_updates.lock().unwrap();
-			let cmu = &cmu_map.get(&added_monitors[0].0.to_channel_id()).unwrap()[0];
-			let test_txo = OutPoint { txid: Txid::from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(), index: 0 };
+			let cmu = &cmu_map.get(&added_monitors[0].1.channel_id()).unwrap()[0];
+			let test_txo = OutPoint { txid: Txid::from_str("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(), index: 0 };
 
 			let ro_persister = MonitorUpdatingPersister {
 				kv_store: &TestStore::new(true),
@@ -1195,5 +1254,15 @@ mod tests {
 			.kv_store
 			.read(CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE, monitor_name.as_str(), UpdateName::from(u64::MAX - 1).as_str())
 			.is_err());
+	}
+
+	fn persist_fn<P: Deref, ChannelSigner: WriteableEcdsaChannelSigner>(_persist: P) -> bool where P::Target: Persist<ChannelSigner> {
+		true
+	}
+
+	#[test]
+	fn kvstore_trait_object_usage() {
+		let store: Arc<dyn KVStore + Send + Sync> = Arc::new(TestStore::new(false));
+		assert!(persist_fn::<_, TestChannelSigner>(store.clone()));
 	}
 }

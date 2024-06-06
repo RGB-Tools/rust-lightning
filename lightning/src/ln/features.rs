@@ -41,6 +41,12 @@
 //!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#basic-multi-part-payments) for more information).
 //! - `Wumbo` - requires/supports that a node create large channels. Called `option_support_large_channel` in the spec.
 //!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
+//! - `AnchorsZeroFeeHtlcTx` - requires/supports that commitment transactions include anchor outputs
+//!     and HTLC transactions are pre-signed with zero fee (see
+//!     [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more
+//!     information).
+//! - `RouteBlinding` - requires/supports that a node can relay payments over blinded paths
+//!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#route-blinding) for more information).
 //! - `ShutdownAnySegwit` - requires/supports that future segwit versions are allowed in `shutdown`
 //!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md) for more information).
 //! - `OnionMessages` - requires/supports forwarding onion messages
@@ -60,10 +66,8 @@
 //!      for more info).
 //! - `Keysend` - send funds to a node without an invoice
 //!     (see the [`Keysend` feature assignment proposal](https://github.com/lightning/bolts/issues/605#issuecomment-606679798) for more information).
-//! - `AnchorsZeroFeeHtlcTx` - requires/supports that commitment transactions include anchor outputs
-//!     and HTLC transactions are pre-signed with zero fee (see
-//!     [BOLT-3](https://github.com/lightning/bolts/blob/master/03-transactions.md) for more
-//!     information).
+//! - `Trampoline` - supports receiving and forwarding Trampoline payments
+//!     (see the [`Trampoline` feature proposal](https://github.com/lightning/bolts/pull/836) for more information).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -74,8 +78,10 @@
 //! [BOLT #9]: https://github.com/lightning/bolts/blob/master/09-features.md
 //! [messages]: crate::ln::msgs
 
-use crate::{io, io_extras};
+#[allow(unused_imports)]
 use crate::prelude::*;
+
+use crate::{io, io_extras};
 use core::{cmp, fmt};
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
@@ -87,6 +93,7 @@ use crate::ln::msgs::DecodeError;
 use crate::util::ser::{Readable, WithoutLength, Writeable, Writer};
 
 mod sealed {
+	#[allow(unused_imports)]
 	use crate::prelude::*;
 	use crate::ln::features::Features;
 
@@ -143,13 +150,15 @@ mod sealed {
 		// Byte 2
 		BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 		// Byte 3
-		ShutdownAnySegwit | Taproot,
+		RouteBlinding | ShutdownAnySegwit | Taproot,
 		// Byte 4
 		OnionMessages,
 		// Byte 5
 		ChannelType | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7
+		Trampoline,
 	]);
 	define_context!(NodeContext, [
 		// Byte 0
@@ -159,13 +168,15 @@ mod sealed {
 		// Byte 2
 		BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 		// Byte 3
-		ShutdownAnySegwit | Taproot,
+		RouteBlinding | ShutdownAnySegwit | Taproot,
 		// Byte 4
 		OnionMessages,
 		// Byte 5
 		ChannelType | SCIDPrivacy,
 		// Byte 6
 		ZeroConf | Keysend,
+		// Byte 7
+		Trampoline,
 	]);
 	define_context!(ChannelContext, []);
 	define_context!(Bolt11InvoiceContext, [
@@ -183,6 +194,8 @@ mod sealed {
 		,
 		// Byte 6
 		PaymentMetadata,
+		// Byte 7
+		Trampoline,
 	]);
 	define_context!(OfferContext, []);
 	define_context!(InvoiceRequestContext, []);
@@ -391,6 +404,9 @@ mod sealed {
 	define_feature!(23, AnchorsZeroFeeHtlcTx, [InitContext, NodeContext, ChannelTypeContext],
 		"Feature flags for `option_anchors_zero_fee_htlc_tx`.", set_anchors_zero_fee_htlc_tx_optional,
 		set_anchors_zero_fee_htlc_tx_required, supports_anchors_zero_fee_htlc_tx, requires_anchors_zero_fee_htlc_tx);
+	define_feature!(25, RouteBlinding, [InitContext, NodeContext],
+		"Feature flags for `option_route_blinding`.", set_route_blinding_optional,
+		set_route_blinding_required, supports_route_blinding, requires_route_blinding);
 	define_feature!(27, ShutdownAnySegwit, [InitContext, NodeContext],
 		"Feature flags for `opt_shutdown_anysegwit`.", set_shutdown_any_segwit_optional,
 		set_shutdown_any_segwit_required, supports_shutdown_anysegwit, requires_shutdown_anysegwit);
@@ -415,6 +431,9 @@ mod sealed {
 	define_feature!(55, Keysend, [NodeContext],
 		"Feature flags for keysend payments.", set_keysend_optional, set_keysend_required,
 		supports_keysend, requires_keysend);
+	define_feature!(57, Trampoline, [InitContext, NodeContext, Bolt11InvoiceContext],
+		"Feature flags for Trampoline routing.", set_trampoline_routing_optional, set_trampoline_routing_required,
+		supports_trampoline_routing, requires_trampoline_routing);
 	// Note: update the module-level docs when a new feature bit is added!
 
 	#[cfg(test)]
@@ -464,12 +483,24 @@ impl<T: sealed::Context> Clone for Features<T> {
 }
 impl<T: sealed::Context> Hash for Features<T> {
 	fn hash<H: Hasher>(&self, hasher: &mut H) {
-		self.flags.hash(hasher);
+		let mut nonzero_flags = &self.flags[..];
+		while nonzero_flags.last() == Some(&0) {
+			nonzero_flags = &nonzero_flags[..nonzero_flags.len() - 1];
+		}
+		nonzero_flags.hash(hasher);
 	}
 }
 impl<T: sealed::Context> PartialEq for Features<T> {
 	fn eq(&self, o: &Self) -> bool {
-		self.flags.eq(&o.flags)
+		let mut o_iter = o.flags.iter();
+		let mut self_iter = self.flags.iter();
+		loop {
+			match (o_iter.next(), self_iter.next()) {
+				(Some(o), Some(us)) => if o != us { return false },
+				(Some(b), None) | (None, Some(b)) => if *b != 0 { return false },
+				(None, None) => return true,
+			}
+		}
 	}
 }
 impl<T: sealed::Context> PartialOrd for Features<T> {
@@ -915,6 +946,13 @@ impl<T: sealed::AnchorsZeroFeeHtlcTx> Features<T> {
 	}
 }
 
+impl<T: sealed::RouteBlinding> Features<T> {
+	#[cfg(test)]
+	pub(crate) fn clear_route_blinding(&mut self) {
+		<T as sealed::RouteBlinding>::clear_bits(&mut self.flags);
+	}
+}
+
 #[cfg(test)]
 impl<T: sealed::UnknownFeature> Features<T> {
 	pub(crate) fn unknown() -> Self {
@@ -1053,6 +1091,7 @@ mod tests {
 		init_features.set_basic_mpp_optional();
 		init_features.set_wumbo_optional();
 		init_features.set_anchors_zero_fee_htlc_tx_optional();
+		init_features.set_route_blinding_optional();
 		init_features.set_shutdown_any_segwit_optional();
 		init_features.set_onion_messages_optional();
 		init_features.set_channel_type_optional();
@@ -1068,8 +1107,8 @@ mod tests {
 			// Check that the flags are as expected:
 			// - option_data_loss_protect (req)
 			// - var_onion_optin (req) | static_remote_key (req) | payment_secret(req)
-			// - basic_mpp | wumbo | anchors_zero_fee_htlc_tx
-			// - opt_shutdown_anysegwit
+			// - basic_mpp | wumbo | option_anchors_zero_fee_htlc_tx
+			// - option_route_blinding | opt_shutdown_anysegwit
 			// - onion_messages
 			// - option_channel_type | option_scid_alias
 			// - option_zeroconf
@@ -1077,7 +1116,7 @@ mod tests {
 			assert_eq!(node_features.flags[0], 0b00000001);
 			assert_eq!(node_features.flags[1], 0b01010001);
 			assert_eq!(node_features.flags[2], 0b10001010);
-			assert_eq!(node_features.flags[3], 0b00001000);
+			assert_eq!(node_features.flags[3], 0b00001010);
 			assert_eq!(node_features.flags[4], 0b10000000);
 			assert_eq!(node_features.flags[5], 0b10100000);
 			assert_eq!(node_features.flags[6], 0b00001000);
@@ -1208,5 +1247,27 @@ mod tests {
 		assert_eq!(converted_features, ChannelTypeFeatures::only_static_remote_key());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
+	}
+
+	#[test]
+	#[cfg(feature = "std")]
+	fn test_excess_zero_bytes_ignored() {
+		// Checks that `Hash` and `PartialEq` ignore excess zero bytes, which may appear due to
+		// feature conversion or because a peer serialized their feature poorly.
+		use std::collections::hash_map::DefaultHasher;
+		use std::hash::{Hash, Hasher};
+
+		let mut zerod_features = InitFeatures::empty();
+		zerod_features.flags = vec![0];
+		let empty_features = InitFeatures::empty();
+		assert!(empty_features.flags.is_empty());
+
+		assert_eq!(zerod_features, empty_features);
+
+		let mut zerod_hash = DefaultHasher::new();
+		zerod_features.hash(&mut zerod_hash);
+		let mut empty_hash = DefaultHasher::new();
+		empty_features.hash(&mut empty_hash);
+		assert_eq!(zerod_hash.finish(), empty_hash.finish());
 	}
 }

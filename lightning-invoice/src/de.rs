@@ -1,5 +1,6 @@
 #[cfg(feature = "std")]
 use std::error;
+#[cfg(not(feature = "std"))]
 use core::convert::TryFrom;
 use core::fmt;
 use core::fmt::{Display, Formatter};
@@ -10,16 +11,14 @@ use core::str::FromStr;
 use bech32::{u5, FromBase32};
 
 use bitcoin::{PubkeyHash, ScriptHash};
-use bitcoin::util::address::WitnessVersion;
-use bitcoin_hashes::Hash;
-use bitcoin_hashes::sha256;
+use bitcoin::address::WitnessVersion;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
 use rgb_lib::ContractId;
 use crate::prelude::*;
-use lightning::ln::PaymentSecret;
+use lightning::ln::types::PaymentSecret;
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{RouteHint, RouteHintHop};
-
-use num_traits::{CheckedAdd, CheckedMul};
 
 use secp256k1::ecdsa::{RecoveryId, RecoverableSignature};
 use secp256k1::PublicKey;
@@ -45,7 +44,11 @@ mod hrp_sm {
 	}
 
 	impl States {
-		fn next_state(&self, read_symbol: char) -> Result<States, super::Bolt11ParseError> {
+		fn next_state(&self, read_byte: u8) -> Result<States, super::Bolt11ParseError> {
+			let read_symbol = match char::from_u32(read_byte.into()) {
+				Some(symb) if symb.is_ascii() => symb,
+				_ => return Err(super::Bolt11ParseError::MalformedHRP),
+			};
 			match *self {
 				States::Start => {
 					if read_symbol == 'l' {
@@ -121,7 +124,7 @@ mod hrp_sm {
 			*range = Some(new_range);
 		}
 
-		fn step(&mut self, c: char) -> Result<(), super::Bolt11ParseError> {
+		fn step(&mut self, c: u8) -> Result<(), super::Bolt11ParseError> {
 			let next_state = self.state.next_state(c)?;
 			match next_state {
 				States::ParseCurrencyPrefix => {
@@ -160,7 +163,7 @@ mod hrp_sm {
 
 	pub fn parse_hrp(input: &str) -> Result<(&str, &str, &str), super::Bolt11ParseError> {
 		let mut sm = StateMachine::new();
-		for c in input.chars() {
+		for c in input.bytes() {
 			sm.step(c)?;
 		}
 
@@ -357,7 +360,7 @@ impl FromBase32 for PositiveTimestamp {
 		if b32.len() != 7 {
 			return Err(Bolt11ParseError::InvalidSliceLength("PositiveTimestamp::from_base32()".into()));
 		}
-		let timestamp: u64 = parse_int_be(b32, 32)
+		let timestamp: u64 = parse_u64_be(b32)
 			.expect("7*5bit < 64bit, no overflow possible");
 		match PositiveTimestamp::from_unix_timestamp(timestamp) {
 			Ok(t) => Ok(t),
@@ -383,16 +386,17 @@ impl FromBase32 for Bolt11InvoiceSignature {
 	}
 }
 
-pub(crate) fn parse_int_be<T, U>(digits: &[U], base: T) -> Option<T>
-	where T: CheckedAdd + CheckedMul + From<u8> + Default,
-	      U: Into<u8> + Copy
-{
-	digits.iter().fold(Some(Default::default()), |acc, b|
-		acc
-			.and_then(|x| x.checked_mul(&base))
-			.and_then(|x| x.checked_add(&(Into::<u8>::into(*b)).into()))
-	)
-}
+macro_rules! define_parse_int_be { ($name: ident, $ty: ty) => {
+	fn $name(digits: &[u5]) -> Option<$ty> {
+		digits.iter().fold(Some(Default::default()), |acc, b|
+			acc
+				.and_then(|x| x.checked_mul(32))
+				.and_then(|x| x.checked_add((Into::<u8>::into(*b)).into()))
+		)
+	}
+} }
+define_parse_int_be!(parse_u16_be, u16);
+define_parse_int_be!(parse_u64_be, u64);
 
 fn parse_tagged_parts(data: &[u5]) -> Result<Vec<RawTaggedField>, Bolt11ParseError> {
 	let mut parts = Vec::<RawTaggedField>::new();
@@ -405,7 +409,7 @@ fn parse_tagged_parts(data: &[u5]) -> Result<Vec<RawTaggedField>, Bolt11ParseErr
 
 		// Ignore tag at data[0], it will be handled in the TaggedField parsers and
 		// parse the length to find the end of the tagged field's data
-		let len = parse_int_be(&data[1..3], 32).expect("can't overflow");
+		let len = parse_u16_be(&data[1..3]).expect("can't overflow") as usize;
 		let last_element = 3 + len;
 
 		if data.len() < last_element {
@@ -522,7 +526,7 @@ impl FromBase32 for ExpiryTime {
 	type Err = Bolt11ParseError;
 
 	fn from_base32(field_data: &[u5]) -> Result<ExpiryTime, Bolt11ParseError> {
-		match parse_int_be::<u64, u5>(field_data, 32)
+		match parse_u64_be(field_data)
 			.map(ExpiryTime::from_seconds)
 		{
 			Some(t) => Ok(t),
@@ -535,7 +539,7 @@ impl FromBase32 for MinFinalCltvExpiryDelta {
 	type Err = Bolt11ParseError;
 
 	fn from_base32(field_data: &[u5]) -> Result<MinFinalCltvExpiryDelta, Bolt11ParseError> {
-		let expiry = parse_int_be::<u64, u5>(field_data, 32);
+		let expiry = parse_u64_be(field_data);
 		if let Some(expiry) = expiry {
 			Ok(MinFinalCltvExpiryDelta(expiry))
 		} else {
@@ -569,14 +573,14 @@ impl FromBase32 for Fallback {
 			17 => {
 				let pkh = match PubkeyHash::from_slice(&bytes) {
 					Ok(pkh) => pkh,
-					Err(bitcoin_hashes::Error::InvalidLength(_, _)) => return Err(Bolt11ParseError::InvalidPubKeyHashLength),
+					Err(bitcoin::hashes::Error::InvalidLength(_, _)) => return Err(Bolt11ParseError::InvalidPubKeyHashLength),
 				};
 				Ok(Fallback::PubKeyHash(pkh))
 			}
 			18 => {
 				let sh = match ScriptHash::from_slice(&bytes) {
 					Ok(sh) => sh,
-					Err(bitcoin_hashes::Error::InvalidLength(_, _)) => return Err(Bolt11ParseError::InvalidScriptHashLength),
+					Err(bitcoin::hashes::Error::InvalidLength(_, _)) => return Err(Bolt11ParseError::InvalidScriptHashLength),
 				};
 				Ok(Fallback::ScriptHash(sh))
 			}
@@ -607,12 +611,12 @@ impl FromBase32 for PrivateRoute {
 
 			let hop = RouteHintHop {
 				src_node_id: PublicKey::from_slice(&hop_bytes[0..33])?,
-				short_channel_id: parse_int_be(&channel_id, 256).expect("short chan ID slice too big?"),
+				short_channel_id: u64::from_be_bytes(channel_id),
 				fees: RoutingFees {
-					base_msat: parse_int_be(&hop_bytes[41..45], 256).expect("slice too big?"),
-					proportional_millionths: parse_int_be(&hop_bytes[45..49], 256).expect("slice too big?"),
+					base_msat: u32::from_be_bytes(hop_bytes[41..45].try_into().expect("slice too big?")),
+					proportional_millionths: u32::from_be_bytes(hop_bytes[45..49].try_into().expect("slice too big?")),
 				},
-				cltv_expiry_delta: parse_int_be(&hop_bytes[49..51], 256).expect("slice too big?"),
+				cltv_expiry_delta: u16::from_be_bytes(hop_bytes[49..51].try_into().expect("slice too big?")),
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
 			};
@@ -628,7 +632,7 @@ impl FromBase32 for RgbAmount {
 	type Err = Bolt11ParseError;
 
 	fn from_base32(field_data: &[u5]) -> Result<RgbAmount, Bolt11ParseError> {
-		let rgb_amount = parse_int_be::<u64, u5>(field_data, 32);
+		let rgb_amount = parse_u64_be(field_data);
 		if let Some(rgb_amount) = rgb_amount {
 			Ok(RgbAmount(rgb_amount))
 		} else {
@@ -760,8 +764,8 @@ mod test {
 	use crate::de::Bolt11ParseError;
 	use secp256k1::PublicKey;
 	use bech32::u5;
-	use bitcoin_hashes::hex::FromHex;
-	use bitcoin_hashes::sha256;
+	use bitcoin::hashes::sha256;
+	use std::str::FromStr;
 
 	const CHARSET_REV: [i8; 128] = [
 		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -795,12 +799,16 @@ mod test {
 
 	#[test]
 	fn test_parse_int_from_bytes_be() {
-		use crate::de::parse_int_be;
+		use crate::de::parse_u16_be;
 
-		assert_eq!(parse_int_be::<u32, u8>(&[1, 2, 3, 4], 256), Some(16909060));
-		assert_eq!(parse_int_be::<u32, u8>(&[1, 3], 32), Some(35));
-		assert_eq!(parse_int_be::<u32, u8>(&[255, 255, 255, 255], 256), Some(4294967295));
-		assert_eq!(parse_int_be::<u32, u8>(&[1, 0, 0, 0, 0], 256), None);
+		assert_eq!(parse_u16_be(&[
+				u5::try_from_u8(1).unwrap(), u5::try_from_u8(2).unwrap(),
+				u5::try_from_u8(3).unwrap(), u5::try_from_u8(4).unwrap()]
+			), Some(34916));
+		assert_eq!(parse_u16_be(&[
+				u5::try_from_u8(2).unwrap(), u5::try_from_u8(0).unwrap(),
+				u5::try_from_u8(0).unwrap(), u5::try_from_u8(0).unwrap()]
+			), None);
 	}
 
 	#[test]
@@ -812,7 +820,7 @@ mod test {
 			"qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypq".as_bytes()
 		);
 
-		let hash = sha256::Hash::from_hex(
+		let hash = sha256::Hash::from_str(
 			"0001020304050607080900010203040506070809000102030405060708090102"
 		).unwrap();
 		let expected = Ok(Sha256(hash));
@@ -889,8 +897,8 @@ mod test {
 		use crate::Fallback;
 		use bech32::FromBase32;
 		use bitcoin::{PubkeyHash, ScriptHash};
-		use bitcoin::util::address::WitnessVersion;
-		use bitcoin_hashes::Hash;
+		use bitcoin::address::WitnessVersion;
+		use bitcoin::hashes::Hash;
 
 		let cases = vec![
 			(
@@ -950,7 +958,6 @@ mod test {
 		use lightning::routing::router::{RouteHint, RouteHintHop};
 		use crate::PrivateRoute;
 		use bech32::FromBase32;
-		use crate::de::parse_int_be;
 
 		let input = from_bech32(
 			"q20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqpqqqqq9qqqvpeuqa\
@@ -966,7 +973,7 @@ mod test {
 					0x7e, 0x14, 0x8f, 0x78, 0xc7, 0x72, 0x55
 				][..]
 			).unwrap(),
-			short_channel_id: parse_int_be(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08], 256).expect("short chan ID slice too big?"),
+			short_channel_id: 0x0102030405060708,
 			fees: RoutingFees {
 				base_msat: 1,
 				proportional_millionths: 20,
@@ -983,7 +990,7 @@ mod test {
 					0x7e, 0x14, 0x8f, 0x78, 0xc7, 0x72, 0x55
 				][..]
 			).unwrap(),
-			short_channel_id: parse_int_be(&[0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a], 256).expect("short chan ID slice too big?"),
+			short_channel_id: 0x030405060708090a,
 			fees: RoutingFees {
 				base_msat: 2,
 				proportional_millionths: 30,
@@ -1022,7 +1029,7 @@ mod test {
 						data: RawDataPart {
 							timestamp: PositiveTimestamp::from_unix_timestamp(1496314658).unwrap(),
 							tagged_fields: vec ! [
-								PaymentHash(Sha256(sha256::Hash::from_hex(
+								PaymentHash(Sha256(sha256::Hash::from_str(
 									"0001020304050607080900010203040506070809000102030405060708090102"
 								).unwrap())).into(),
 								Description(crate::Description::new("coffee beans".to_owned()).unwrap()).into(),
@@ -1069,7 +1076,7 @@ mod test {
 					data: RawDataPart {
 					timestamp: PositiveTimestamp::from_unix_timestamp(1496314658).unwrap(),
 					tagged_fields: vec ! [
-						PaymentHash(Sha256(sha256::Hash::from_hex(
+						PaymentHash(Sha256(sha256::Hash::from_str(
 							"0001020304050607080900010203040506070809000102030405060708090102"
 						).unwrap())).into(),
 						Description(

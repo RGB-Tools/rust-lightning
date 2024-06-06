@@ -9,18 +9,16 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use crate::io;
-
 #[cfg(not(fuzzing))]
 mod real_chacha {
 	use core::cmp;
-	use core::convert::TryInto;
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	#[allow(non_camel_case_types)]
 	struct u32x4(pub u32, pub u32, pub u32, pub u32);
 	impl ::core::ops::Add for u32x4 {
 		type Output = u32x4;
+		#[inline]
 		fn add(self, rhs: u32x4) -> u32x4 {
 			u32x4(self.0.wrapping_add(rhs.0),
 			      self.1.wrapping_add(rhs.1),
@@ -30,6 +28,7 @@ mod real_chacha {
 	}
 	impl ::core::ops::Sub for u32x4 {
 		type Output = u32x4;
+		#[inline]
 		fn sub(self, rhs: u32x4) -> u32x4 {
 			u32x4(self.0.wrapping_sub(rhs.0),
 			      self.1.wrapping_sub(rhs.1),
@@ -39,23 +38,27 @@ mod real_chacha {
 	}
 	impl ::core::ops::BitXor for u32x4 {
 		type Output = u32x4;
+		#[inline]
 		fn bitxor(self, rhs: u32x4) -> u32x4 {
 			u32x4(self.0 ^ rhs.0, self.1 ^ rhs.1, self.2 ^ rhs.2, self.3 ^ rhs.3)
 		}
 	}
-	impl ::core::ops::Shr<u32x4> for u32x4 {
+	impl ::core::ops::Shr<u8> for u32x4 {
 		type Output = u32x4;
-		fn shr(self, rhs: u32x4) -> u32x4 {
-			u32x4(self.0 >> rhs.0, self.1 >> rhs.1, self.2 >> rhs.2, self.3 >> rhs.3)
+		#[inline]
+		fn shr(self, shr: u8) -> u32x4 {
+			u32x4(self.0 >> shr, self.1 >> shr, self.2 >> shr, self.3 >> shr)
 		}
 	}
-	impl ::core::ops::Shl<u32x4> for u32x4 {
+	impl ::core::ops::Shl<u8> for u32x4 {
 		type Output = u32x4;
-		fn shl(self, rhs: u32x4) -> u32x4 {
-			u32x4(self.0 << rhs.0, self.1 << rhs.1, self.2 << rhs.2, self.3 << rhs.3)
+		#[inline]
+		fn shl(self, shl: u8) -> u32x4 {
+			u32x4(self.0 << shl, self.1 << shl, self.2 << shl, self.3 << shl)
 		}
 	}
 	impl u32x4 {
+		#[inline]
 		fn from_bytes(bytes: &[u8]) -> Self {
 			assert_eq!(bytes.len(), 4*4);
 			Self (
@@ -118,30 +121,24 @@ mod real_chacha {
 	macro_rules! round{
 		($state: expr) => {{
 			$state.a = $state.a + $state.b;
-			rotate!($state.d, $state.a, S16);
+			rotate!($state.d, $state.a, 16);
 			$state.c = $state.c + $state.d;
-			rotate!($state.b, $state.c, S12);
+			rotate!($state.b, $state.c, 12);
 			$state.a = $state.a + $state.b;
-			rotate!($state.d, $state.a, S8);
+			rotate!($state.d, $state.a, 8);
 			$state.c = $state.c + $state.d;
-			rotate!($state.b, $state.c, S7);
+			rotate!($state.b, $state.c, 7);
 		}}
 	}
 
 	macro_rules! rotate {
-		($a: expr, $b: expr, $c:expr) => {{
+		($a: expr, $b: expr, $rot: expr) => {{
 			let v = $a ^ $b;
-			let r = S32 - $c;
+			let r = 32 - $rot;
 			let right = v >> r;
-			$a = (v << $c) ^ right
+			$a = (v << $rot) ^ right
 		}}
 	}
-
-	const S32:u32x4 = u32x4(32, 32, 32, 32);
-	const S16:u32x4 = u32x4(16, 16, 16, 16);
-	const S12:u32x4 = u32x4(12, 12, 12, 12);
-	const S8:u32x4 = u32x4(8, 8, 8, 8);
-	const S7:u32x4 = u32x4(7, 7, 7, 7);
 
 	impl ChaCha20 {
 		pub fn new(key: &[u8], nonce: &[u8]) -> ChaCha20 {
@@ -335,27 +332,13 @@ mod fuzzy_chacha {
 #[cfg(fuzzing)]
 pub use self::fuzzy_chacha::ChaCha20;
 
-pub(crate) struct ChaChaReader<'a, R: io::Read> {
-	pub chacha: &'a mut ChaCha20,
-	pub read: R,
-}
-impl<'a, R: io::Read> io::Read for ChaChaReader<'a, R> {
-	fn read(&mut self, dest: &mut [u8]) -> Result<usize, io::Error> {
-		let res = self.read.read(dest)?;
-		if res > 0 {
-			self.chacha.process_in_place(&mut dest[0..res]);
-		}
-		Ok(res)
-	}
-}
-
 #[cfg(test)]
 mod test {
-	use crate::prelude::*;
 	use core::iter::repeat;
 
+	use crate::prelude::*;
+
 	use super::ChaCha20;
-	use std::convert::TryInto;
 
 	#[test]
 	fn test_chacha20_256_tls_vectors() {

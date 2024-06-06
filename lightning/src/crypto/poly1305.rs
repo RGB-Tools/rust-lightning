@@ -8,7 +8,8 @@
 // https://github.com/floodyberry/poly1305-donna
 
 use core::cmp::min;
-use core::convert::TryInto;
+
+use crate::prelude::*;
 
 #[derive(Clone, Copy)]
 pub struct Poly1305 {
@@ -205,10 +206,9 @@ impl Poly1305 {
 
 #[cfg(test)]
 mod test {
-	use crate::prelude::*;
 	use core::iter::repeat;
 
-	use crate::util::poly1305::Poly1305;
+	use super::Poly1305;
 
 	fn poly1305(key: &[u8], msg: &[u8], mac: &mut [u8]) {
 		let mut poly = Poly1305::new(key);

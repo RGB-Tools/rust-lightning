@@ -369,7 +369,6 @@ mod tests {
 	use super::*;
 	use crate::test_utils::{do_read_write_remove_list_persist, do_test_store};
 
-	use bitcoin::hashes::hex::FromHex;
 	use bitcoin::Txid;
 
 	use lightning::chain::ChannelMonitorUpdateStatus;
@@ -380,12 +379,7 @@ mod tests {
 	use lightning::ln::functional_test_utils::*;
 	use lightning::util::test_utils;
 	use lightning::util::persist::read_channel_monitors;
-	use std::fs;
-	#[cfg(target_os = "windows")]
-	use {
-		lightning::get_event_msg,
-		lightning::ln::msgs::ChannelMessageHandler,
-	};
+	use std::str::FromStr;
 
 	impl Drop for FilesystemStore {
 		fn drop(&mut self) {
@@ -455,7 +449,7 @@ mod tests {
 		check_closed_event!(nodes[1], 1, ClosureReason::HolderForceClosed, [nodes[0].node.get_our_node_id()], 100000);
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 		let update_map = nodes[1].chain_monitor.latest_monitor_update_id.lock().unwrap();
-		let update_id = update_map.get(&added_monitors[0].0.to_channel_id()).unwrap();
+		let update_id = update_map.get(&added_monitors[0].1.channel_id()).unwrap();
 
 		// Set the store's directory to read-only, which should result in
 		// returning an unrecoverable failure when we then attempt to persist a
@@ -466,7 +460,7 @@ mod tests {
 		fs::set_permissions(path, perms).unwrap();
 
 		let test_txo = OutPoint {
-			txid: Txid::from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(),
+			txid: Txid::from_str("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(),
 			index: 0
 		};
 		match store.persist_new_channel(test_txo, &added_monitors[0].1, update_id.2) {
@@ -494,7 +488,7 @@ mod tests {
 		check_closed_event!(nodes[1], 1, ClosureReason::HolderForceClosed, [nodes[0].node.get_our_node_id()], 100000);
 		let mut added_monitors = nodes[1].chain_monitor.added_monitors.lock().unwrap();
 		let update_map = nodes[1].chain_monitor.latest_monitor_update_id.lock().unwrap();
-		let update_id = update_map.get(&added_monitors[0].0.to_channel_id()).unwrap();
+		let update_id = update_map.get(&added_monitors[0].1.channel_id()).unwrap();
 
 		// Create the store with an invalid directory name and test that the
 		// channel fails to open because the directories fail to be created. There
@@ -503,7 +497,7 @@ mod tests {
 		let store = FilesystemStore::new(":<>/".into());
 
 		let test_txo = OutPoint {
-			txid: Txid::from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(),
+			txid: Txid::from_str("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").unwrap(),
 			index: 0
 		};
 		match store.persist_new_channel(test_txo, &added_monitors[0].1, update_id.2) {

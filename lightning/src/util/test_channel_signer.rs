@@ -9,24 +9,39 @@
 
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, MIN_CHAN_DUST_LIMIT_SATOSHIS};
 use crate::ln::chan_utils::{HTLCOutputInCommitment, ChannelPublicKeys, HolderCommitmentTransaction, CommitmentTransaction, ChannelTransactionParameters, TrustedCommitmentTransaction, ClosingTransaction};
-use crate::ln::{chan_utils, msgs, PaymentPreimage};
-use crate::sign::{WriteableEcdsaChannelSigner, InMemorySigner, ChannelSigner, EcdsaChannelSigner};
+use crate::ln::channel_keys::{HtlcKey};
+use crate::ln::msgs;
+use crate::ln::types::PaymentPreimage;
+use crate::sign::{InMemorySigner, ChannelSigner};
+use crate::sign::ecdsa::{EcdsaChannelSigner, WriteableEcdsaChannelSigner};
 
+#[allow(unused_imports)]
 use crate::prelude::*;
+
 use core::cmp;
 use crate::sync::{Mutex, Arc};
 #[cfg(test)] use crate::sync::MutexGuard;
 
-use bitcoin::blockdata::transaction::{Transaction, EcdsaSighashType};
-use bitcoin::util::sighash;
+use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::hashes::Hash;
+use bitcoin::sighash;
+use bitcoin::sighash::EcdsaSighashType;
 
 use bitcoin::secp256k1;
+#[cfg(taproot)]
+use bitcoin::secp256k1::All;
 use bitcoin::secp256k1::{SecretKey, PublicKey};
 use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
+#[cfg(taproot)]
+use musig2::types::{PartialSignature, PublicNonce, SecretNonce};
 use crate::sign::HTLCDescriptor;
 use crate::util::ser::{Writeable, Writer};
 use crate::io::Error;
 use crate::ln::features::ChannelTypeFeatures;
+#[cfg(taproot)]
+use crate::ln::msgs::PartialSignatureWithNonce;
+#[cfg(taproot)]
+use crate::sign::taproot::TaprootChannelSigner;
 
 /// Initial value for revoked commitment downward counter
 pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
@@ -56,6 +71,9 @@ pub struct TestChannelSigner {
 	/// Channel state used for policy enforcement
 	pub state: Arc<Mutex<EnforcementState>>,
 	pub disable_revocation_policy_check: bool,
+	/// When `true` (the default), the signer will respond immediately with signatures. When `false`,
+	/// the signer will return an error indicating that it is unavailable.
+	pub available: Arc<Mutex<bool>>,
 }
 
 impl PartialEq for TestChannelSigner {
@@ -71,7 +89,8 @@ impl TestChannelSigner {
 		Self {
 			inner,
 			state,
-			disable_revocation_policy_check: false
+			disable_revocation_policy_check: false,
+			available: Arc::new(Mutex::new(true)),
 		}
 	}
 
@@ -84,7 +103,8 @@ impl TestChannelSigner {
 		Self {
 			inner,
 			state,
-			disable_revocation_policy_check
+			disable_revocation_policy_check,
+			available: Arc::new(Mutex::new(true)),
 		}
 	}
 
@@ -93,6 +113,15 @@ impl TestChannelSigner {
 	#[cfg(test)]
 	pub fn get_enforcement_state(&self) -> MutexGuard<EnforcementState> {
 		self.state.lock().unwrap()
+	}
+
+	/// Marks the signer's availability.
+	///
+	/// When `true`, methods are forwarded to the underlying signer as normal. When `false`, some
+	/// methods will return `Err` indicating that the signer is unavailable. Intended to be used for
+	/// testing asynchronous signing.
+	pub fn set_available(&self, available: bool) {
+		*self.available.lock().unwrap() = available;
 	}
 }
 
@@ -111,11 +140,21 @@ impl ChannelSigner for TestChannelSigner {
 		self.inner.release_commitment_secret(idx)
 	}
 
-	fn validate_holder_commitment(&self, holder_tx: &HolderCommitmentTransaction, _preimages: Vec<PaymentPreimage>) -> Result<(), ()> {
+	fn validate_holder_commitment(&self, holder_tx: &HolderCommitmentTransaction, _outbound_htlc_preimages: Vec<PaymentPreimage>) -> Result<(), ()> {
 		let mut state = self.state.lock().unwrap();
 		let idx = holder_tx.commitment_number();
 		assert!(idx == state.last_holder_commitment || idx == state.last_holder_commitment - 1, "expecting to validate the current or next holder commitment - trying {}, current {}", idx, state.last_holder_commitment);
 		state.last_holder_commitment = idx;
+		Ok(())
+	}
+
+	fn validate_counterparty_revocation(&self, idx: u64, _secret: &SecretKey) -> Result<(), ()> {
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
+		let mut state = self.state.lock().unwrap();
+		assert!(idx == state.last_counterparty_revoked_commitment || idx == state.last_counterparty_revoked_commitment - 1, "expecting to validate the current or next counterparty revocation - trying {}, current {}", idx, state.last_counterparty_revoked_commitment);
+		state.last_counterparty_revoked_commitment = idx;
 		Ok(())
 	}
 
@@ -129,10 +168,13 @@ impl ChannelSigner for TestChannelSigner {
 }
 
 impl EcdsaChannelSigner for TestChannelSigner {
-	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
+	fn sign_counterparty_commitment(&self, commitment_tx: &CommitmentTransaction, inbound_htlc_preimages: Vec<PaymentPreimage>, outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<(Signature, Vec<Signature>), ()> {
 		self.verify_counterparty_commitment_tx(commitment_tx, secp_ctx);
 
 		{
+			if !*self.available.lock().unwrap() {
+				return Err(());
+			}
 			let mut state = self.state.lock().unwrap();
 			let actual_commitment_number = commitment_tx.commitment_number();
 			let last_commitment_number = state.last_counterparty_commitment;
@@ -145,17 +187,13 @@ impl EcdsaChannelSigner for TestChannelSigner {
 			state.last_counterparty_commitment = cmp::min(last_commitment_number, actual_commitment_number)
 		}
 
-		Ok(self.inner.sign_counterparty_commitment(commitment_tx, preimages, secp_ctx).unwrap())
-	}
-
-	fn validate_counterparty_revocation(&self, idx: u64, _secret: &SecretKey) -> Result<(), ()> {
-		let mut state = self.state.lock().unwrap();
-		assert!(idx == state.last_counterparty_revoked_commitment || idx == state.last_counterparty_revoked_commitment - 1, "expecting to validate the current or next counterparty revocation - trying {}, current {}", idx, state.last_counterparty_revoked_commitment);
-		state.last_counterparty_revoked_commitment = idx;
-		Ok(())
+		Ok(self.inner.sign_counterparty_commitment(commitment_tx, inbound_htlc_preimages, outbound_htlc_preimages, secp_ctx).unwrap())
 	}
 
 	fn sign_holder_commitment(&self, commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
 		let trusted_tx = self.verify_holder_commitment_tx(commitment_tx, secp_ctx);
 		let state = self.state.lock().unwrap();
 		let commitment_number = trusted_tx.commitment_number();
@@ -174,17 +212,26 @@ impl EcdsaChannelSigner for TestChannelSigner {
 	}
 
 	fn sign_justice_revoked_output(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
-		Ok(self.inner.sign_justice_revoked_output(justice_tx, input, amount, per_commitment_key, secp_ctx).unwrap())
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
+		Ok(EcdsaChannelSigner::sign_justice_revoked_output(&self.inner, justice_tx, input, amount, per_commitment_key, secp_ctx).unwrap())
 	}
 
 	fn sign_justice_revoked_htlc(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
-		Ok(self.inner.sign_justice_revoked_htlc(justice_tx, input, amount, per_commitment_key, htlc, secp_ctx).unwrap())
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
+		Ok(EcdsaChannelSigner::sign_justice_revoked_htlc(&self.inner, justice_tx, input, amount, per_commitment_key, htlc, secp_ctx).unwrap())
 	}
 
 	fn sign_holder_htlc_transaction(
 		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
 		secp_ctx: &Secp256k1<secp256k1::All>
 	) -> Result<Signature, ()> {
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
 		let state = self.state.lock().unwrap();
 		if state.last_holder_revoked_commitment - 1 != htlc_descriptor.per_commitment_number &&
 			state.last_holder_revoked_commitment - 2 != htlc_descriptor.per_commitment_number
@@ -206,18 +253,22 @@ impl EcdsaChannelSigner for TestChannelSigner {
 			let sighash = &sighash::SighashCache::new(&*htlc_tx).segwit_signature_hash(
 				input, &witness_script, htlc_descriptor.htlc.amount_msat / 1000, sighash_type
 			).unwrap();
-			let countersignatory_htlc_key = chan_utils::derive_public_key(
-				&secp_ctx, &htlc_descriptor.per_commitment_point, &self.inner.counterparty_pubkeys().unwrap().htlc_basepoint
+			let countersignatory_htlc_key = HtlcKey::from_basepoint(
+				&secp_ctx, &self.inner.counterparty_pubkeys().unwrap().htlc_basepoint, &htlc_descriptor.per_commitment_point,
 			);
+
 			secp_ctx.verify_ecdsa(
-				&hash_to_message!(&sighash), &htlc_descriptor.counterparty_sig, &countersignatory_htlc_key
+				&hash_to_message!(sighash.as_byte_array()), &htlc_descriptor.counterparty_sig, &countersignatory_htlc_key.to_public_key()
 			).unwrap();
 		}
-		Ok(self.inner.sign_holder_htlc_transaction(htlc_tx, input, htlc_descriptor, secp_ctx).unwrap())
+		Ok(EcdsaChannelSigner::sign_holder_htlc_transaction(&self.inner, htlc_tx, input, htlc_descriptor, secp_ctx).unwrap())
 	}
 
 	fn sign_counterparty_htlc_transaction(&self, htlc_tx: &Transaction, input: usize, amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
-		Ok(self.inner.sign_counterparty_htlc_transaction(htlc_tx, input, amount, per_commitment_point, htlc, secp_ctx).unwrap())
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
+		Ok(EcdsaChannelSigner::sign_counterparty_htlc_transaction(&self.inner, htlc_tx, input, amount, per_commitment_point, htlc, secp_ctx).unwrap())
 	}
 
 	fn sign_closing_transaction(&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()> {
@@ -233,7 +284,10 @@ impl EcdsaChannelSigner for TestChannelSigner {
 		// As long as our minimum dust limit is enforced and is greater than our anchor output
 		// value, an anchor output can only have an index within [0, 1].
 		assert!(anchor_tx.input[input].previous_output.vout == 0 || anchor_tx.input[input].previous_output.vout == 1);
-		self.inner.sign_holder_anchor_input(anchor_tx, input, secp_ctx)
+		if !*self.available.lock().unwrap() {
+			return Err(());
+		}
+		EcdsaChannelSigner::sign_holder_anchor_input(&self.inner, anchor_tx, input, secp_ctx)
 	}
 
 	fn sign_channel_announcement_with_funding_key(
@@ -244,6 +298,45 @@ impl EcdsaChannelSigner for TestChannelSigner {
 }
 
 impl WriteableEcdsaChannelSigner for TestChannelSigner {}
+
+#[cfg(taproot)]
+impl TaprootChannelSigner for TestChannelSigner {
+	fn generate_local_nonce_pair(&self, commitment_number: u64, secp_ctx: &Secp256k1<All>) -> PublicNonce {
+		todo!()
+	}
+
+	fn partially_sign_counterparty_commitment(&self, counterparty_nonce: PublicNonce, commitment_tx: &CommitmentTransaction, inbound_htlc_preimages: Vec<PaymentPreimage>, outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<All>) -> Result<(PartialSignatureWithNonce, Vec<secp256k1::schnorr::Signature>), ()> {
+		todo!()
+	}
+
+	fn finalize_holder_commitment(&self, commitment_tx: &HolderCommitmentTransaction, counterparty_partial_signature: PartialSignatureWithNonce, secp_ctx: &Secp256k1<All>) -> Result<PartialSignature, ()> {
+		todo!()
+	}
+
+	fn sign_justice_revoked_output(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, secp_ctx: &Secp256k1<All>) -> Result<secp256k1::schnorr::Signature, ()> {
+		todo!()
+	}
+
+	fn sign_justice_revoked_htlc(&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey, htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>) -> Result<secp256k1::schnorr::Signature, ()> {
+		todo!()
+	}
+
+	fn sign_holder_htlc_transaction(&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor, secp_ctx: &Secp256k1<All>) -> Result<secp256k1::schnorr::Signature, ()> {
+		todo!()
+	}
+
+	fn sign_counterparty_htlc_transaction(&self, htlc_tx: &Transaction, input: usize, amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>) -> Result<secp256k1::schnorr::Signature, ()> {
+		todo!()
+	}
+
+	fn partially_sign_closing_transaction(&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<All>) -> Result<PartialSignature, ()> {
+		todo!()
+	}
+
+	fn sign_holder_anchor_input(&self, anchor_tx: &Transaction, input: usize, secp_ctx: &Secp256k1<All>) -> Result<secp256k1::schnorr::Signature, ()> {
+		todo!()
+	}
+}
 
 impl Writeable for TestChannelSigner {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {

@@ -9,10 +9,7 @@ use bitcoin::blockdata::constants::ChainHash;
 use bitcoin::blockdata::transaction::{TxOut, OutPoint};
 use bitcoin::hash_types::BlockHash;
 
-use lightning::sign::NodeSigner;
-
-use lightning::ln::peer_handler::{CustomMessageHandler, PeerManager, SocketDescriptor};
-use lightning::ln::msgs::{ChannelMessageHandler, OnionMessageHandler};
+use lightning::ln::peer_handler::APeerManager;
 
 use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 use lightning::routing::utxo::{UtxoFuture, UtxoLookup, UtxoResult, UtxoLookupError};
@@ -135,21 +132,12 @@ impl<
 pub struct GossipVerifier<S: FutureSpawner,
 	Blocks: Deref + Send + Sync + 'static + Clone,
 	L: Deref + Send + Sync + 'static,
-	Descriptor: SocketDescriptor + Send + Sync + 'static,
-	CM: Deref + Send + Sync + 'static,
-	OM: Deref + Send + Sync + 'static,
-	CMH: Deref + Send + Sync + 'static,
-	NS: Deref + Send + Sync + 'static,
 > where
 	Blocks::Target: UtxoSource,
 	L::Target: Logger,
-	CM::Target: ChannelMessageHandler,
-	OM::Target: OnionMessageHandler,
-	CMH::Target: CustomMessageHandler,
-	NS::Target: NodeSigner,
 {
 	source: Blocks,
-	peer_manager: Arc<PeerManager<Descriptor, CM, Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>, OM, L, CMH, NS>>,
+	peer_manager_wake: Arc<dyn Fn() + Send + Sync>,
 	gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>,
 	spawn: S,
 	block_cache: Arc<Mutex<VecDeque<(u32, Block)>>>,
@@ -160,26 +148,20 @@ const BLOCK_CACHE_SIZE: usize = 5;
 impl<S: FutureSpawner,
 	Blocks: Deref + Send + Sync + Clone,
 	L: Deref + Send + Sync,
-	Descriptor: SocketDescriptor + Send + Sync,
-	CM: Deref + Send + Sync,
-	OM: Deref + Send + Sync,
-	CMH: Deref + Send + Sync,
-	NS: Deref + Send + Sync,
-> GossipVerifier<S, Blocks, L, Descriptor, CM, OM, CMH, NS> where
+> GossipVerifier<S, Blocks, L> where
 	Blocks::Target: UtxoSource,
 	L::Target: Logger,
-	CM::Target: ChannelMessageHandler,
-	OM::Target: OnionMessageHandler,
-	CMH::Target: CustomMessageHandler,
-	NS::Target: NodeSigner,
 {
 	/// Constructs a new [`GossipVerifier`].
 	///
 	/// This is expected to be given to a [`P2PGossipSync`] (initially constructed with `None` for
 	/// the UTXO lookup) via [`P2PGossipSync::add_utxo_lookup`].
-	pub fn new(source: Blocks, spawn: S, gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>, peer_manager: Arc<PeerManager<Descriptor, CM, Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>, OM, L, CMH, NS>>) -> Self {
+	pub fn new<APM: Deref + Send + Sync + Clone + 'static>(
+		source: Blocks, spawn: S, gossiper: Arc<P2PGossipSync<Arc<NetworkGraph<L>>, Self, L>>, peer_manager: APM
+	) -> Self where APM::Target: APeerManager {
+		let peer_manager_wake = Arc::new(move || peer_manager.as_ref().process_events());
 		Self {
-			source, spawn, gossiper, peer_manager,
+			source, spawn, gossiper, peer_manager_wake,
 			block_cache: Arc::new(Mutex::new(VecDeque::with_capacity(BLOCK_CACHE_SIZE))),
 		}
 	}
@@ -269,18 +251,9 @@ impl<S: FutureSpawner,
 impl<S: FutureSpawner,
 	Blocks: Deref + Send + Sync + Clone,
 	L: Deref + Send + Sync,
-	Descriptor: SocketDescriptor + Send + Sync,
-	CM: Deref + Send + Sync,
-	OM: Deref + Send + Sync,
-	CMH: Deref + Send + Sync,
-	NS: Deref + Send + Sync,
-> Deref for GossipVerifier<S, Blocks, L, Descriptor, CM, OM, CMH, NS> where
+> Deref for GossipVerifier<S, Blocks, L> where
 	Blocks::Target: UtxoSource,
 	L::Target: Logger,
-	CM::Target: ChannelMessageHandler,
-	OM::Target: OnionMessageHandler,
-	CMH::Target: CustomMessageHandler,
-	NS::Target: NodeSigner,
 {
 	type Target = Self;
 	fn deref(&self) -> &Self { self }
@@ -290,18 +263,9 @@ impl<S: FutureSpawner,
 impl<S: FutureSpawner,
 	Blocks: Deref + Send + Sync + Clone,
 	L: Deref + Send + Sync,
-	Descriptor: SocketDescriptor + Send + Sync,
-	CM: Deref + Send + Sync,
-	OM: Deref + Send + Sync,
-	CMH: Deref + Send + Sync,
-	NS: Deref + Send + Sync,
-> UtxoLookup for GossipVerifier<S, Blocks, L, Descriptor, CM, OM, CMH, NS> where
+> UtxoLookup for GossipVerifier<S, Blocks, L> where
 	Blocks::Target: UtxoSource,
 	L::Target: Logger,
-	CM::Target: ChannelMessageHandler,
-	OM::Target: OnionMessageHandler,
-	CMH::Target: CustomMessageHandler,
-	NS::Target: NodeSigner,
 {
 	fn get_utxo(&self, _chain_hash: &ChainHash, short_channel_id: u64) -> UtxoResult {
 		let res = UtxoFuture::new();
@@ -309,11 +273,11 @@ impl<S: FutureSpawner,
 		let source = self.source.clone();
 		let gossiper = Arc::clone(&self.gossiper);
 		let block_cache = Arc::clone(&self.block_cache);
-		let pm = Arc::clone(&self.peer_manager);
+		let pmw = Arc::clone(&self.peer_manager_wake);
 		self.spawn.spawn(async move {
 			let res = Self::retrieve_utxo(source, block_cache, short_channel_id).await;
 			fut.resolve(gossiper.network_graph(), &*gossiper, res);
-			pm.process_events();
+			(pmw)();
 		});
 		UtxoResult::Async(res)
 	}

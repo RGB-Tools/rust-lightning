@@ -15,6 +15,8 @@ use crate::chain::transaction::OutPoint;
 use crate::chain::Confirm;
 use crate::events::{Event, MessageSendEventsProvider, ClosureReason, HTLCDestination, MessageSendEvent};
 use crate::ln::msgs::{ChannelMessageHandler, Init};
+use crate::ln::types::ChannelId;
+use crate::sign::OutputSpender;
 use crate::util::test_utils;
 use crate::util::ser::Writeable;
 use crate::util::string::UntrustedString;
@@ -270,8 +272,9 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 		if use_funding_unconfirmed {
 			let relevant_txids = nodes[0].node.get_relevant_txids();
 			assert_eq!(relevant_txids.len(), 1);
-			let block_hash_opt = relevant_txids[0].1;
+			let block_hash_opt = relevant_txids[0].2;
 			let expected_hash = nodes[0].get_block_header(chan_conf_height).block_hash();
+			assert_eq!(relevant_txids[0].1, chan_conf_height);
 			assert_eq!(block_hash_opt, Some(expected_hash));
 			let txid = relevant_txids[0].0;
 			assert_eq!(txid, chan.3.txid());
@@ -315,8 +318,9 @@ fn do_test_unconf_chan(reload_node: bool, reorg_after_reload: bool, use_funding_
 		if use_funding_unconfirmed {
 			let relevant_txids = nodes[0].node.get_relevant_txids();
 			assert_eq!(relevant_txids.len(), 1);
-			let block_hash_opt = relevant_txids[0].1;
+			let block_hash_opt = relevant_txids[0].2;
 			let expected_hash = nodes[0].get_block_header(chan_conf_height).block_hash();
+			assert_eq!(chan_conf_height, relevant_txids[0].1);
 			assert_eq!(block_hash_opt, Some(expected_hash));
 			let txid = relevant_txids[0].0;
 			assert_eq!(txid, chan.3.txid());
@@ -463,7 +467,7 @@ fn test_set_outpoints_partial_claiming() {
 	// Connect blocks on node B
 	connect_blocks(&nodes[1], TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + 1);
 	check_closed_broadcast!(nodes[1], true);
-	check_closed_event!(nodes[1], 1, ClosureReason::HolderForceClosed, [nodes[0].node.get_our_node_id()], 1000000);
+	check_closed_event!(nodes[1], 1, ClosureReason::HTLCsTimedOut, [nodes[0].node.get_our_node_id()], 1000000);
 	check_added_monitors!(nodes[1], 1);
 	// Verify node B broadcast 2 HTLC-timeout txn
 	let partial_claim_tx = {
@@ -529,7 +533,7 @@ fn do_test_to_remote_after_local_detection(style: ConnectStyle) {
 	let (_, _, chan_id, funding_tx) =
 		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
 	let funding_outpoint = OutPoint { txid: funding_tx.txid(), index: 0 };
-	assert_eq!(funding_outpoint.to_channel_id(), chan_id);
+	assert_eq!(ChannelId::v1_from_funding_outpoint(funding_outpoint), chan_id);
 
 	let remote_txn_a = get_local_commitment_txn!(nodes[0], chan_id);
 	let remote_txn_b = get_local_commitment_txn!(nodes[1], chan_id);
@@ -664,6 +668,9 @@ fn test_htlc_preimage_claim_holder_commitment_after_counterparty_commitment_reor
 
 	mine_transaction(&nodes[0], &commitment_tx_b);
 	mine_transaction(&nodes[1], &commitment_tx_b);
+	if nodes[1].connect_style.borrow().updates_best_block_first() {
+		let _ = nodes[1].tx_broadcaster.txn_broadcast();
+	}
 
 	// Provide the preimage now, such that we only claim from the holder commitment (since it's
 	// currently confirmed) and not the counterparty's.
@@ -753,4 +760,123 @@ fn test_htlc_preimage_claim_prev_counterparty_commitment_after_current_counterpa
 	// Make sure it was indeed a preimage claim and not a revocation claim since the previous
 	// commitment (still unrevoked) is the currently confirmed closing transaction.
 	assert_eq!(htlc_preimage_tx.input[0].witness.second_to_last().unwrap(), &payment_preimage.0[..]);
+}
+
+fn do_test_retries_own_commitment_broadcast_after_reorg(anchors: bool, revoked_counterparty_commitment: bool) {
+	// Tests that a node will retry broadcasting its own commitment after seeing a confirmed
+	// counterparty commitment be reorged out.
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	if revoked_counterparty_commitment {
+		chanmon_cfgs[1].keys_manager.disable_revocation_policy_check = true;
+	}
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	if anchors {
+		config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+		config.manually_accept_inbound_channels = true;
+	}
+	let persister;
+	let new_chain_monitor;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config), Some(config)]);
+	let nodes_1_deserialized;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	// Route a payment so we have an HTLC to claim as well.
+	let _ = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	if revoked_counterparty_commitment {
+		// Trigger a fee update such that we advance the state. We will have B broadcast its state
+		// without the fee update.
+		let serialized_node = nodes[1].node.encode();
+		let serialized_monitor = get_monitor!(nodes[1], chan_id).encode();
+
+		*chanmon_cfgs[0].fee_estimator.sat_per_kw.lock().unwrap() += 1;
+		nodes[0].node.timer_tick_occurred();
+		check_added_monitors!(nodes[0], 1);
+
+		let fee_update = get_htlc_update_msgs!(nodes[0], nodes[1].node.get_our_node_id());
+		nodes[1].node.handle_update_fee(&nodes[0].node.get_our_node_id(), &fee_update.update_fee.unwrap());
+		commitment_signed_dance!(nodes[1], nodes[0], fee_update.commitment_signed, false);
+
+		reload_node!(
+			nodes[1], config, &serialized_node, &[&serialized_monitor], persister, new_chain_monitor, nodes_1_deserialized
+		);
+	}
+
+	// Connect blocks until the HTLC expiry is met, prompting a commitment broadcast by A.
+	connect_blocks(&nodes[0], TEST_FINAL_CLTV + LATENCY_GRACE_PERIOD_BLOCKS + 1);
+	check_closed_broadcast(&nodes[0], 1, true);
+	check_added_monitors(&nodes[0], 1);
+	check_closed_event(&nodes[0], 1, ClosureReason::HTLCsTimedOut, false, &[nodes[1].node.get_our_node_id()], 100_000);
+
+	{
+		let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
+		if anchors {
+			assert_eq!(txn.len(), 1);
+			let commitment_tx_a = txn.pop().unwrap();
+			check_spends!(commitment_tx_a, funding_tx);
+		} else {
+			assert_eq!(txn.len(), 2);
+			let htlc_tx_a = txn.pop().unwrap();
+			let commitment_tx_a = txn.pop().unwrap();
+			check_spends!(commitment_tx_a, funding_tx);
+			check_spends!(htlc_tx_a, commitment_tx_a);
+		}
+	};
+
+	// B will also broadcast its own commitment.
+	nodes[1].node.force_close_broadcasting_latest_txn(&chan_id, &nodes[0].node.get_our_node_id()).unwrap();
+	check_closed_broadcast(&nodes[1], 1, true);
+	check_added_monitors(&nodes[1], 1);
+	check_closed_event(&nodes[1], 1, ClosureReason::HolderForceClosed, false, &[nodes[0].node.get_our_node_id()], 100_000);
+
+	let commitment_b = {
+		let mut txn = nodes[1].tx_broadcaster.txn_broadcast();
+		assert_eq!(txn.len(), 1);
+		let tx = txn.pop().unwrap();
+		check_spends!(tx, funding_tx);
+		tx
+	};
+
+	// Confirm B's commitment, A should now broadcast an HTLC timeout for commitment B.
+	mine_transaction(&nodes[0], &commitment_b);
+	{
+		let mut txn = nodes[0].tx_broadcaster.txn_broadcast();
+		if nodes[0].connect_style.borrow().updates_best_block_first() {
+			// `commitment_a` and `htlc_timeout_a` are rebroadcast because the best block was
+			// updated prior to seeing `commitment_b`.
+			assert_eq!(txn.len(), if anchors { 2 } else { 3 });
+			check_spends!(txn.last().unwrap(), commitment_b);
+		} else {
+			assert_eq!(txn.len(), 1);
+			check_spends!(txn[0], commitment_b);
+		}
+	}
+
+	// Disconnect the block, allowing A to retry its own commitment. Note that we connect two
+	// blocks, one to get us back to the original height, and another to retry our pending claims.
+	disconnect_blocks(&nodes[0], 1);
+	connect_blocks(&nodes[0], 2);
+	{
+		let mut txn = nodes[0].tx_broadcaster.unique_txn_broadcast();
+		if anchors {
+			assert_eq!(txn.len(), 1);
+			check_spends!(txn[0], funding_tx);
+		} else {
+			assert_eq!(txn.len(), 2);
+			check_spends!(txn[0], txn[1]); // HTLC timeout A
+			check_spends!(txn[1], funding_tx); // Commitment A
+			assert_ne!(txn[1].txid(), commitment_b.txid());
+		}
+	}
+}
+
+#[test]
+fn test_retries_own_commitment_broadcast_after_reorg() {
+	do_test_retries_own_commitment_broadcast_after_reorg(false, false);
+	do_test_retries_own_commitment_broadcast_after_reorg(false, true);
+	do_test_retries_own_commitment_broadcast_after_reorg(true, false);
+	do_test_retries_own_commitment_broadcast_after_reorg(true, true);
 }

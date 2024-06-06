@@ -14,7 +14,8 @@
 //! disconnections, transaction broadcasting, and feerate information requests.
 
 use core::{cmp, ops::Deref};
-use core::convert::TryInto;
+
+use crate::prelude::*;
 
 use bitcoin::blockdata::transaction::Transaction;
 
@@ -40,7 +41,7 @@ pub trait BroadcasterInterface {
 	/// be sure to manage both cases correctly.
 	///
 	/// Bitcoin transaction packages are defined in BIP 331 and here:
-	/// https://github.com/bitcoin/bitcoin/blob/master/doc/policy/packages.md
+	/// <https://github.com/bitcoin/bitcoin/blob/master/doc/policy/packages.md>
 	fn broadcast_transactions(&self, txs: &[&Transaction]);
 }
 
@@ -53,23 +54,6 @@ pub enum ConfirmationTarget {
 	/// to low hundreds of blocks to get our transaction on-chain, but we shouldn't risk too low a
 	/// fee - this should be a relatively high priority feerate.
 	OnChainSweep,
-	/// The highest feerate we will allow our channel counterparty to have in a non-anchor channel.
-	///
-	/// This is the feerate on the transaction which we (or our counterparty) will broadcast in
-	/// order to close the channel unilaterally. Because our counterparty must ensure they can
-	/// always broadcast the latest state, this value being too low will cause immediate
-	/// force-closures.
-	///
-	/// Allowing this value to be too high can allow our counterparty to burn our HTLC outputs to
-	/// dust, which can result in HTLCs failing or force-closures (when the dust HTLCs exceed
-	/// [`ChannelConfig::max_dust_htlc_exposure`]).
-	///
-	/// Because most nodes use a feerate estimate which is based on a relatively high priority
-	/// transaction entering the current mempool, setting this to a small multiple of your current
-	/// high priority feerate estimate should suffice.
-	///
-	/// [`ChannelConfig::max_dust_htlc_exposure`]: crate::util::config::ChannelConfig::max_dust_htlc_exposure
-	MaxAllowedNonAnchorChannelRemoteFee,
 	/// This is the lowest feerate we will allow our channel counterparty to have in an anchor
 	/// channel in order to close the channel if a channel party goes away.
 	///
@@ -140,6 +124,17 @@ pub enum ConfirmationTarget {
 	///
 	/// [`ChannelManager::close_channel_with_feerate_and_script`]: crate::ln::channelmanager::ChannelManager::close_channel_with_feerate_and_script
 	ChannelCloseMinimum,
+	/// The feerate [`OutputSweeper`] will use on transactions spending
+	/// [`SpendableOutputDescriptor`]s after a channel closure.
+	///
+	/// Generally spending these outputs is safe as long as they eventually confirm, so a value
+	/// (slightly above) the mempool minimum should suffice. However, as this value will influence
+	/// how long funds will be unavailable after channel closure, [`FeeEstimator`] implementors
+	/// might want to choose a higher feerate to regain control over funds faster.
+	///
+	/// [`OutputSweeper`]: crate::util::sweep::OutputSweeper
+	/// [`SpendableOutputDescriptor`]: crate::sign::SpendableOutputDescriptor
+	OutputSpendingFee,
 }
 
 /// A trait which should be implemented to provide feerate information on a number of time
@@ -152,6 +147,10 @@ pub enum ConfirmationTarget {
 ///
 /// Note that all of the functions implemented here *must* be reentrant-safe (obviously - they're
 /// called from inside the library in response to chain events, P2P events, or timer events).
+///
+/// LDK may generate a substantial number of fee-estimation calls in some cases. You should
+/// pre-calculate and cache the fee estimate results to ensure you don't substantially slow HTLC
+/// handling.
 pub trait FeeEstimator {
 	/// Gets estimated satoshis of fee required per 1000 Weight-Units.
 	///

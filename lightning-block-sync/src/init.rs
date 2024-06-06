@@ -4,7 +4,7 @@
 use crate::{BlockSource, BlockSourceResult, Cache, ChainNotifier};
 use crate::poll::{ChainPoller, Validate, ValidatedBlockHeader};
 
-use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::blockdata::block::Header;
 use bitcoin::hash_types::BlockHash;
 use bitcoin::network::constants::Network;
 
@@ -69,10 +69,10 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 /// 	R: Router,
 /// 	L: Logger,
 /// 	C: chain::Filter,
-/// 	P: chainmonitor::Persist<SP::Signer>,
+/// 	P: chainmonitor::Persist<SP::EcdsaSigner>,
 /// >(
 /// 	block_source: &B,
-/// 	chain_monitor: &ChainMonitor<SP::Signer, &C, &T, &F, &L, &P>,
+/// 	chain_monitor: &ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P>,
 /// 	config: UserConfig,
 /// 	entropy_source: &ES,
 /// 	node_signer: &NS,
@@ -85,7 +85,7 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 /// ) {
 /// 	// Read a serialized channel monitor paired with the block hash when it was persisted.
 /// 	let serialized_monitor = "...";
-/// 	let (monitor_block_hash, mut monitor) = <(BlockHash, ChannelMonitor<SP::Signer>)>::read(
+/// 	let (monitor_block_hash, mut monitor) = <(BlockHash, ChannelMonitor<SP::EcdsaSigner>)>::read(
 /// 		&mut Cursor::new(&serialized_monitor), (entropy_source, signer_provider)).unwrap();
 ///
 /// 	// Read the channel manager paired with the block hash when it was persisted.
@@ -103,7 +103,7 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 /// 			config,
 /// 			vec![&mut monitor],
 /// 		);
-/// 		<(BlockHash, ChannelManager<&ChainMonitor<SP::Signer, &C, &T, &F, &L, &P>, &T, &ES, &NS, &SP, &F, &R, &L>)>::read(
+/// 		<(BlockHash, ChannelManager<&ChainMonitor<SP::EcdsaSigner, &C, &T, &F, &L, &P>, &T, &ES, &NS, &SP, &F, &R, &L>)>::read(
 /// 			&mut Cursor::new(&serialized_manager), read_args).unwrap()
 /// 	};
 ///
@@ -211,11 +211,11 @@ impl<'a, C: Cache> Cache for ReadOnlyCache<'a, C> {
 struct DynamicChainListener<'a, L: chain::Listen + ?Sized>(&'a L);
 
 impl<'a, L: chain::Listen + ?Sized> chain::Listen for DynamicChainListener<'a, L> {
-	fn filtered_block_connected(&self, _header: &BlockHeader, _txdata: &chain::transaction::TransactionData, _height: u32) {
+	fn filtered_block_connected(&self, _header: &Header, _txdata: &chain::transaction::TransactionData, _height: u32) {
 		unreachable!()
 	}
 
-	fn block_disconnected(&self, header: &BlockHeader, height: u32) {
+	fn block_disconnected(&self, header: &Header, height: u32) {
 		self.0.block_disconnected(header, height)
 	}
 }
@@ -234,7 +234,7 @@ impl<'a, L: chain::Listen + ?Sized> chain::Listen for ChainListenerSet<'a, L> {
 		}
 	}
 
-	fn filtered_block_connected(&self, header: &BlockHeader, txdata: &chain::transaction::TransactionData, height: u32) {
+	fn filtered_block_connected(&self, header: &Header, txdata: &chain::transaction::TransactionData, height: u32) {
 		for (starting_height, chain_listener) in self.0.iter() {
 			if height > *starting_height {
 				chain_listener.filtered_block_connected(header, txdata, height);
@@ -242,7 +242,7 @@ impl<'a, L: chain::Listen + ?Sized> chain::Listen for ChainListenerSet<'a, L> {
 		}
 	}
 
-	fn block_disconnected(&self, _header: &BlockHeader, _height: u32) {
+	fn block_disconnected(&self, _header: &Header, _height: u32) {
 		unreachable!()
 	}
 }
@@ -251,8 +251,6 @@ impl<'a, L: chain::Listen + ?Sized> chain::Listen for ChainListenerSet<'a, L> {
 mod tests {
 	use crate::test_utils::{Blockchain, MockChainListener};
 	use super::*;
-
-	use bitcoin::network::constants::Network;
 
 	#[tokio::test]
 	async fn sync_from_same_chain() {

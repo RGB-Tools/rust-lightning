@@ -13,6 +13,9 @@
 use crate::ln::channel::MAX_FUNDING_SATOSHIS_NO_WUMBO;
 use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, MAX_LOCAL_BREAKDOWN_TIMEOUT};
 
+#[cfg(fuzzing)]
+use crate::util::ser::Readable;
+
 /// Configuration we set when applicable.
 ///
 /// Default::default() provides sane defaults.
@@ -210,6 +213,27 @@ impl Default for ChannelHandshakeConfig {
 	}
 }
 
+// When fuzzing, we want to allow the fuzzer to pick any configuration parameters. Thus, we
+// implement Readable here in a naive way (which is a bit easier for the fuzzer to handle). We
+// don't really want to ever expose this to users (if we did we'd want to use TLVs).
+#[cfg(fuzzing)]
+impl Readable for ChannelHandshakeConfig {
+	fn read<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::ln::msgs::DecodeError> {
+		Ok(Self {
+			minimum_depth: Readable::read(reader)?,
+			our_to_self_delay: Readable::read(reader)?,
+			our_htlc_minimum_msat: Readable::read(reader)?,
+			max_inbound_htlc_value_in_flight_percent_of_channel: Readable::read(reader)?,
+			negotiate_scid_privacy: Readable::read(reader)?,
+			announced_channel: Readable::read(reader)?,
+			commit_upfront_shutdown_pubkey: Readable::read(reader)?,
+			their_channel_reserve_proportional_millionths: Readable::read(reader)?,
+			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
+			our_max_accepted_htlcs: Readable::read(reader)?,
+		})
+	}
+}
+
 /// Optional channel limits which are applied during channel creation.
 ///
 /// These limits are only applied to our counterparty's limits, not our own.
@@ -315,7 +339,28 @@ impl Default for ChannelHandshakeLimits {
 	}
 }
 
-/// Options for how to set the max dust HTLC exposure allowed on a channel. See
+// When fuzzing, we want to allow the fuzzer to pick any configuration parameters. Thus, we
+// implement Readable here in a naive way (which is a bit easier for the fuzzer to handle). We
+// don't really want to ever expose this to users (if we did we'd want to use TLVs).
+#[cfg(fuzzing)]
+impl Readable for ChannelHandshakeLimits {
+	fn read<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::ln::msgs::DecodeError> {
+		Ok(Self {
+			min_funding_satoshis: Readable::read(reader)?,
+			max_funding_satoshis: Readable::read(reader)?,
+			max_htlc_minimum_msat: Readable::read(reader)?,
+			min_max_htlc_value_in_flight_msat: Readable::read(reader)?,
+			max_channel_reserve_satoshis: Readable::read(reader)?,
+			min_max_accepted_htlcs: Readable::read(reader)?,
+			trust_own_funding_0conf: Readable::read(reader)?,
+			max_minimum_depth: Readable::read(reader)?,
+			force_announced_channel_preference: Readable::read(reader)?,
+			their_to_self_delay: Readable::read(reader)?,
+		})
+	}
+}
+
+/// Options for how to set the max dust exposure allowed on a channel. See
 /// [`ChannelConfig::max_dust_htlc_exposure`] for details.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MaxDustHTLCExposure {
@@ -329,19 +374,17 @@ pub enum MaxDustHTLCExposure {
 	/// to this maximum the channel may be unable to send/receive HTLCs between the maximum dust
 	/// exposure and the new minimum value for HTLCs to be economically viable to claim.
 	FixedLimitMsat(u64),
-	/// This sets a multiplier on the estimated high priority feerate (sats/KW, as obtained from
-	/// [`FeeEstimator`]) to determine the maximum allowed dust exposure. If this variant is used
-	/// then the maximum dust exposure in millisatoshis is calculated as:
-	/// `high_priority_feerate_per_kw * value`. For example, with our default value
-	/// `FeeRateMultiplier(5000)`:
+	/// This sets a multiplier on the [`ConfirmationTarget::OnChainSweep`] feerate (in sats/KW) to
+	/// determine the maximum allowed dust exposure. If this variant is used then the maximum dust
+	/// exposure in millisatoshis is calculated as:
+	/// `feerate_per_kw * value`. For example, with our default value
+	/// `FeeRateMultiplier(10_000)`:
 	///
 	/// - For the minimum fee rate of 1 sat/vByte (250 sat/KW, although the minimum
 	/// defaults to 253 sats/KW for rounding, see [`FeeEstimator`]), the max dust exposure would
-	/// be 253 * 5000 = 1,265,000 msats.
+	/// be 253 * 10_000 = 2,530,000 msats.
 	/// - For a fee rate of 30 sat/vByte (7500 sat/KW), the max dust exposure would be
-	/// 7500 * 5000 = 37,500,000 msats.
-	///
-	/// This allows the maximum dust exposure to automatically scale with fee rate changes.
+	/// 7500 * 50_000 = 75,000,000 msats (0.00075 BTC).
 	///
 	/// Note, if you're using a third-party fee estimator, this may leave you more exposed to a
 	/// fee griefing attack, where your fee estimator may purposely overestimate the fee rate,
@@ -356,6 +399,7 @@ pub enum MaxDustHTLCExposure {
 	/// by default this will be set to a [`Self::FixedLimitMsat`] of 5,000,000 msat.
 	///
 	/// [`FeeEstimator`]: crate::chain::chaininterface::FeeEstimator
+	/// [`ConfirmationTarget::OnChainSweep`]: crate::chain::chaininterface::ConfirmationTarget::OnChainSweep
 	FeeRateMultiplier(u64),
 }
 
@@ -408,13 +452,16 @@ pub struct ChannelConfig {
 	///
 	/// [`MIN_CLTV_EXPIRY_DELTA`]: crate::ln::channelmanager::MIN_CLTV_EXPIRY_DELTA
 	pub cltv_expiry_delta: u16,
-	/// Limit our total exposure to in-flight HTLCs which are burned to fees as they are too
-	/// small to claim on-chain.
+	/// Limit our total exposure to potential loss to on-chain fees on close, including in-flight
+	/// HTLCs which are burned to fees as they are too small to claim on-chain and fees on
+	/// commitment transaction(s) broadcasted by our counterparty in excess of our own fee estimate.
+	///
+	/// # HTLC-based Dust Exposure
 	///
 	/// When an HTLC present in one of our channels is below a "dust" threshold, the HTLC will
 	/// not be claimable on-chain, instead being turned into additional miner fees if either
 	/// party force-closes the channel. Because the threshold is per-HTLC, our total exposure
-	/// to such payments may be sustantial if there are many dust HTLCs present when the
+	/// to such payments may be substantial if there are many dust HTLCs present when the
 	/// channel is force-closed.
 	///
 	/// The dust threshold for each HTLC is based on the `dust_limit_satoshis` for each party in a
@@ -428,7 +475,42 @@ pub struct ChannelConfig {
 	/// The selected limit is applied for sent, forwarded, and received HTLCs and limits the total
 	/// exposure across all three types per-channel.
 	///
-	/// Default value: [`MaxDustHTLCExposure::FeeRateMultiplier`] with a multiplier of 5000.
+	/// # Transaction Fee Dust Exposure
+	///
+	/// Further, counterparties broadcasting a commitment transaction in a force-close may result
+	/// in other balance being burned to fees, and thus all fees on commitment and HTLC
+	/// transactions in excess of our local fee estimates are included in the dust calculation.
+	///
+	/// Because of this, another way to look at this limit is to divide it by 43,000 (or 218,750
+	/// for non-anchor channels) and see it as the maximum feerate disagreement (in sats/vB) per
+	/// non-dust HTLC we're allowed to have with our peers before risking a force-closure for
+	/// inbound channels.
+	// This works because, for anchor channels the on-chain cost is 172 weight (172+703 for
+	// non-anchors with an HTLC-Success transaction), i.e.
+	// dust_exposure_limit_msat / 1000 = 172 * feerate_in_sat_per_vb / 4 * HTLC count
+	// dust_exposure_limit_msat = 43,000 * feerate_in_sat_per_vb * HTLC count
+	// dust_exposure_limit_msat / HTLC count / 43,000 = feerate_in_sat_per_vb
+	///
+	/// Thus, for the default value of 10_000 * a current feerate estimate of 10 sat/vB (or 2,500
+	/// sat/KW), we risk force-closure if we disagree with our peer by:
+	/// * `10_000 * 2_500 / 43_000 / (483*2)` = 0.6 sat/vB for anchor channels with 483 HTLCs in
+	///   both directions (the maximum),
+	/// * `10_000 * 2_500 / 43_000 / (50*2)` = 5.8 sat/vB for anchor channels with 50 HTLCs in both
+	///   directions (the LDK default max from [`ChannelHandshakeConfig::our_max_accepted_htlcs`])
+	/// * `10_000 * 2_500 / 218_750 / (483*2)` = 0.1 sat/vB for non-anchor channels with 483 HTLCs
+	///   in both directions (the maximum),
+	/// * `10_000 * 2_500 / 218_750 / (50*2)` = 1.1 sat/vB for non-anchor channels with 50 HTLCs
+	///   in both (the LDK default maximum from [`ChannelHandshakeConfig::our_max_accepted_htlcs`])
+	///
+	/// Note that when using [`MaxDustHTLCExposure::FeeRateMultiplier`] this maximum disagreement
+	/// will scale linearly with increases (or decreases) in the our feerate estimates. Further,
+	/// for anchor channels we expect our counterparty to use a relatively low feerate estimate
+	/// while we use [`ConfirmationTarget::OnChainSweep`] (which should be relatively high) and
+	/// feerate disagreement force-closures should only occur when theirs is higher than ours.
+	///
+	/// Default value: [`MaxDustHTLCExposure::FeeRateMultiplier`] with a multiplier of 10_000.
+	///
+	/// [`ConfirmationTarget::OnChainSweep`]: crate::chain::chaininterface::ConfirmationTarget::OnChainSweep
 	pub max_dust_htlc_exposure: MaxDustHTLCExposure,
 	/// The additional fee we're willing to pay to avoid waiting for the counterparty's
 	/// `to_self_delay` to reclaim funds.
@@ -462,8 +544,9 @@ pub struct ChannelConfig {
 	/// - The counterparty will get an [`HTLCIntercepted`] event upon payment forward, and call
 	///   [`forward_intercepted_htlc`] with less than the amount provided in
 	///   [`HTLCIntercepted::expected_outbound_amount_msat`]. The difference between the expected and
-	///   actual forward amounts is their fee.
-	// TODO: link to LSP JIT channel invoice generation spec when it's merged
+	///   actual forward amounts is their fee. See
+	///   <https://github.com/BitcoinAndLightningLayerSpecs/lsp/tree/main/LSPS2#flow-lsp-trusts-client-model>
+	///   for how this feature may be used in the LSP use case.
 	///
 	/// # Note
 	/// It's important for payee wallet software to verify that [`PaymentClaimable::amount_msat`] is
@@ -515,7 +598,7 @@ impl Default for ChannelConfig {
 			forwarding_fee_proportional_millionths: 0,
 			forwarding_fee_base_msat: 1000,
 			cltv_expiry_delta: 6 * 12, // 6 blocks/hour * 12 hours
-			max_dust_htlc_exposure: MaxDustHTLCExposure::FeeRateMultiplier(5000),
+			max_dust_htlc_exposure: MaxDustHTLCExposure::FeeRateMultiplier(10000),
 			force_close_avoidance_max_fee_satoshis: 1000,
 			accept_underpaying_htlcs: false,
 		}
@@ -778,5 +861,24 @@ impl Default for UserConfig {
 			accept_intercept_htlcs: false,
 			accept_mpp_keysend: false,
 		}
+	}
+}
+
+// When fuzzing, we want to allow the fuzzer to pick any configuration parameters. Thus, we
+// implement Readable here in a naive way (which is a bit easier for the fuzzer to handle). We
+// don't really want to ever expose this to users (if we did we'd want to use TLVs).
+#[cfg(fuzzing)]
+impl Readable for UserConfig {
+	fn read<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::ln::msgs::DecodeError> {
+		Ok(Self {
+			channel_handshake_config: Readable::read(reader)?,
+			channel_handshake_limits: Readable::read(reader)?,
+			channel_config: Readable::read(reader)?,
+			accept_forwards_to_priv_channels: Readable::read(reader)?,
+			accept_inbound_channels: Readable::read(reader)?,
+			manually_accept_inbound_channels: Readable::read(reader)?,
+			accept_intercept_htlcs: Readable::read(reader)?,
+			accept_mpp_keysend: Readable::read(reader)?,
+		})
 	}
 }
