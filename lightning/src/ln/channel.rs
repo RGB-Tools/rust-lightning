@@ -24,6 +24,8 @@ use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
 
+use hex::DisplayHex;
+
 use rgb_lib::RgbTransport;
 
 use crate::ln::types::{ChannelId, PaymentPreimage, PaymentHash};
@@ -39,7 +41,7 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_pending, rename_rgb_files, update_rgb_channel_amount_pending};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_path, get_rgb_channel_info_pending, parse_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount_pending};
 use crate::sign::ecdsa::{EcdsaChannelSigner, WriteableEcdsaChannelSigner};
 use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::ClosureReason;
@@ -2324,6 +2326,33 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		self.get_htlc_maximum_msat(self.holder_max_htlc_value_in_flight_msat)
 	}
 
+	/// Get the channel local RGB amount
+	pub fn get_local_rgb_amount(&self) -> u64 {
+		let info_file_path = get_rgb_channel_info_path(&self.channel_id.0.as_hex().to_string(), &self.ldk_data_dir, false);
+		if info_file_path.exists() {
+			let rgb_info = parse_rgb_channel_info(&info_file_path);
+			rgb_info.local_rgb_amount
+		} else {
+			0
+		}
+	}
+
+	/// Get the channel remote RGB amount
+	pub fn get_remote_rgb_amount(&self) -> u64 {
+		let info_file_path = get_rgb_channel_info_path(&self.channel_id.0.as_hex().to_string(), &self.ldk_data_dir, false);
+		if info_file_path.exists() {
+			let rgb_info = parse_rgb_channel_info(&info_file_path);
+			rgb_info.remote_rgb_amount
+		} else {
+			0
+		}
+	}
+
+	/// Get the channel RGB capacity
+	pub fn get_rgb_capacity(&self) -> u64 {
+		self.get_local_rgb_amount() + self.get_remote_rgb_amount()
+	}
+
 	/// Allowed in any state (including after shutdown)
 	pub fn get_announced_htlc_max_msat(&self) -> u64 {
 		return cmp::min(
@@ -4269,6 +4298,10 @@ impl<SP: Deref> Channel<SP> where
 			self.context.channel_value_satoshis * 1000 - pending_value_to_self_msat;
 		if pending_remote_value_msat < msg.amount_msat {
 			return Err(ChannelError::Close("Remote HTLC add would overdraw remaining funds".to_owned()));
+		}
+
+		if msg.amount_rgb > Some(self.context.get_remote_rgb_amount()) {
+			return Err(ChannelError::Close("Not enough RGB funds to accept this HTLC".to_owned()));
 		}
 
 		// Check that the remote can afford to pay for this HTLC on-chain at the current
@@ -7073,6 +7106,11 @@ impl<SP: Deref> Channel<SP> where
 		if amount_msat > available_balances.next_outbound_htlc_limit_msat {
 			return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC maximum - {} msat",
 				available_balances.next_outbound_htlc_limit_msat)));
+		}
+
+		let local_rgb_amount = self.context.get_local_rgb_amount();
+		if amount_rgb > Some(local_rgb_amount) {
+			return Err(ChannelError::Ignore(format!("Cannot send more than our next-HTLC RGB maximum - {}", local_rgb_amount)));
 		}
 
 		if self.context.channel_state.is_peer_disconnected() {

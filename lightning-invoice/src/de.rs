@@ -619,6 +619,7 @@ impl FromBase32 for PrivateRoute {
 				cltv_expiry_delta: u16::from_be_bytes(hop_bytes[49..51].try_into().expect("slice too big?")),
 				htlc_minimum_msat: None,
 				htlc_maximum_msat: None,
+				htlc_maximum_rgb: None,
 			};
 
 			route_hops.push(hop);

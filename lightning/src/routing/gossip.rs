@@ -788,6 +788,8 @@ pub struct ChannelUpdateInfo {
 	/// Everything else is useful only for sending out for initial routing sync.
 	/// Not stored if contains excess data to prevent DoS.
 	pub last_update_message: Option<ChannelUpdate>,
+	/// The maximum RGB value which may be relayed to the next hop via the channel.
+	pub htlc_maximum_rgb: u64,
 }
 
 impl fmt::Display for ChannelUpdateInfo {
@@ -809,6 +811,7 @@ impl Writeable for ChannelUpdateInfo {
 			(8, Some(self.htlc_maximum_msat), required),
 			(10, self.fees, required),
 			(12, self.last_update_message, required),
+			(14, self.htlc_maximum_rgb, required),
 		});
 		Ok(())
 	}
@@ -823,6 +826,7 @@ impl Readable for ChannelUpdateInfo {
 		_init_tlv_field_var!(htlc_maximum_msat, option);
 		_init_tlv_field_var!(fees, required);
 		_init_tlv_field_var!(last_update_message, required);
+		_init_tlv_field_var!(htlc_maximum_rgb, required);
 
 		read_tlv_fields!(reader, {
 			(0, last_update, required),
@@ -831,7 +835,8 @@ impl Readable for ChannelUpdateInfo {
 			(6, htlc_minimum_msat, required),
 			(8, htlc_maximum_msat, required),
 			(10, fees, required),
-			(12, last_update_message, required)
+			(12, last_update_message, required),
+			(14, htlc_maximum_rgb, required)
 		});
 
 		if let Some(htlc_maximum_msat) = htlc_maximum_msat {
@@ -843,6 +848,7 @@ impl Readable for ChannelUpdateInfo {
 				htlc_maximum_msat,
 				fees: _init_tlv_based_struct_field!(fees, required),
 				last_update_message: _init_tlv_based_struct_field!(last_update_message, required),
+				htlc_maximum_rgb: _init_tlv_based_struct_field!(htlc_maximum_rgb, required),
 			})
 		} else {
 			Err(DecodeError::InvalidValue)
@@ -1039,6 +1045,12 @@ impl<'a> DirectedChannelInfo<'a> {
 			},
 			None => EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: htlc_maximum_msat },
 		}
+	}
+
+	/// Return the effective RGB capacity of the channel in the direction.
+	#[inline]
+	pub fn effective_capacity_rgb(&self) -> u64 {
+		self.direction().htlc_maximum_rgb
 	}
 
 	/// Returns information for the direction.
@@ -2010,7 +2022,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 								base_msat: msg.fee_base_msat,
 								proportional_millionths: msg.fee_proportional_millionths,
 							},
-							last_update_message
+							last_update_message,
+							htlc_maximum_rgb: msg.htlc_maximum_rgb,
 						};
 						Some(updated_channel_update_info)
 					} }

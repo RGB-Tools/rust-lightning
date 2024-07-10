@@ -1252,6 +1252,9 @@ pub struct UnsignedChannelUpdate {
 	///
 	/// This used to be optional.
 	pub htlc_maximum_msat: u64,
+	// TODO: if possible use Option
+	/// The maximum HTLC RGB value incoming to sender.
+	pub htlc_maximum_rgb: u64,
 	/// The base HTLC fee charged by sender, in milli-satoshi
 	pub fee_base_msat: u32,
 	/// The amount to fee multiplier, in micro-satoshi
@@ -2932,6 +2935,7 @@ impl Writeable for UnsignedChannelUpdate {
 		self.fee_base_msat.write(w)?;
 		self.fee_proportional_millionths.write(w)?;
 		self.htlc_maximum_msat.write(w)?;
+		self.htlc_maximum_rgb.write(w)?;
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
 	}
@@ -2953,6 +2957,7 @@ impl Readable for UnsignedChannelUpdate {
 			fee_base_msat: Readable::read(r)?,
 			fee_proportional_millionths: Readable::read(r)?,
 			htlc_maximum_msat: Readable::read(r)?,
+			htlc_maximum_rgb: Readable::read(r)?,
 			excess_data: read_to_end(r)?,
 		})
 	}

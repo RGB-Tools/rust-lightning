@@ -275,6 +275,7 @@ where
 					cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA,
 					htlc_minimum_msat: None,
 					htlc_maximum_msat: None,
+					htlc_maximum_rgb: None,
 				});
 				hint
 			});
@@ -630,7 +631,9 @@ where
 			},
 			cltv_expiry_delta: forwarding_info.cltv_expiry_delta,
 			htlc_minimum_msat: channel.inbound_htlc_minimum_msat,
-			htlc_maximum_msat: channel.inbound_htlc_maximum_msat,}])
+			htlc_maximum_msat: channel.inbound_htlc_maximum_msat,
+			htlc_maximum_rgb: Some(channel.inbound_htlc_maximum_rgb),
+		}])
 	};
 
 	log_trace!(logger, "Considering {} channels for invoice route hints", channels.len());

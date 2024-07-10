@@ -648,16 +648,14 @@ pub(crate) fn is_payment_rgb(ldk_data_dir: &Path, payment_hash: &PaymentHash) ->
 		|| get_rgb_payment_info_path(payment_hash, ldk_data_dir, true).exists()
 }
 
-/// Filter first_hops for contract_id
+/// Detect the contract ID of the payment and then filter hops based on contract ID and amount
 pub(crate) fn filter_first_hops(
-	ldk_data_dir: &Path, payment_hash: &PaymentHash, first_hops: &mut Vec<&ChannelDetails>,
-) -> ContractId {
+	ldk_data_dir: &Path, payment_hash: &PaymentHash, first_hops: &mut Vec<ChannelDetails>,
+) -> (ContractId, u64) {
 	let rgb_payment_info_path = get_rgb_payment_info_path(payment_hash, ldk_data_dir, false);
-	let serialized_info =
-		fs::read_to_string(rgb_payment_info_path).expect("valid rgb payment info file");
-	let rgb_payment_info: RgbPaymentInfo =
-		serde_json::from_str(&serialized_info).expect("valid rgb payment info file");
+	let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_path);
 	let contract_id = rgb_payment_info.contract_id;
+	let rgb_amount = rgb_payment_info.amount;
 	first_hops.retain(|h| {
 		let info_file_path = ldk_data_dir.join(h.channel_id.0.as_hex().to_string());
 		if !info_file_path.exists() {
@@ -666,7 +664,7 @@ pub(crate) fn filter_first_hops(
 		let serialized_info = fs::read_to_string(info_file_path).expect("valid rgb info file");
 		let rgb_info: RgbInfo =
 			serde_json::from_str(&serialized_info).expect("valid rgb info file");
-		rgb_info.contract_id == contract_id
+		rgb_info.contract_id == contract_id && rgb_info.local_rgb_amount >= rgb_amount
 	});
-	contract_id
+	(contract_id, rgb_amount)
 }
