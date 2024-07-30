@@ -7,6 +7,8 @@
 #![deny(non_snake_case)]
 #![deny(unused_mut)]
 
+#![allow(unexpected_cfgs)]
+
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 #![cfg_attr(feature = "strict", deny(warnings))]

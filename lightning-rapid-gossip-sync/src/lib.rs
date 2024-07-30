@@ -9,6 +9,9 @@
 #![deny(unused_mut)]
 #![deny(unused_variables)]
 #![deny(unused_imports)]
+
+#![allow(unexpected_cfgs)]
+
 //! This crate exposes client functionality to rapidly sync gossip data, aimed primarily at mobile
 //! devices.
 //!
