@@ -177,6 +177,19 @@ fn _counterparty_output_index(
 		.map(|(idx, _)| idx)
 }
 
+/// Return the position of the OP_RETURN output, if present
+pub fn op_return_position(tx: &Transaction) -> Option<usize> {
+	tx
+		.output
+		.iter()
+		.position(|o| o.script_pubkey.is_op_return())
+}
+
+/// Whether the transaction is colored (i.e. it has an OP_RETURN output)
+pub fn is_tx_colored(tx: &Transaction) -> bool {
+	op_return_position(tx).is_some()
+}
+
 /// Color commitment transaction
 pub(crate) fn color_commitment<SP: Deref>(
 	channel_context: &ChannelContext<SP>, commitment_transaction: &mut CommitmentTransaction,
@@ -282,16 +295,18 @@ where
 	} else {
 		channel_context.get_counterparty_pubkeys().payment_point
 	};
-	let vout_p2wpkh = _counterparty_output_index(
+
+	if let Some(vout_p2wpkh) = _counterparty_output_index(
 		&commitment_tx.output,
 		&channel_context.channel_type,
 		&payment_point,
-	)
-	.unwrap() as u32;
-	let vout_p2wsh = commitment_transaction.trust().revokeable_output_index().unwrap() as u32;
+	) {
+		output_map.insert(vout_p2wpkh as u32, vout_p2wpkh_amt);
+	}
 
-	output_map.insert(vout_p2wpkh, vout_p2wpkh_amt);
-	output_map.insert(vout_p2wsh, vout_p2wsh_amt);
+	if let Some(vout_p2wsh) = commitment_transaction.trust().revokeable_output_index() {
+		output_map.insert(vout_p2wsh as u32, vout_p2wsh_amt);
+	}
 
 	let asset_coloring_info = AssetColoringInfo {
 		iface: AssetIface::RGB20,
@@ -391,15 +406,28 @@ pub(crate) fn color_closing(
 	let (rgb_info, _) = get_rgb_channel_info_pending(channel_id, ldk_data_dir);
 	let contract_id = rgb_info.contract_id;
 
-	let holder_vout = closing_tx
-		.output
-		.iter()
-		.position(|o| o.script_pubkey == closing_transaction.to_holder_script)
-		.unwrap();
-	let counterparty_vout = holder_vout ^ 1;
-
 	let holder_vout_amount = rgb_info.local_rgb_amount;
 	let counterparty_vout_amount = rgb_info.remote_rgb_amount;
+
+	let mut output_map = HashMap::new();
+
+	if closing_transaction.to_holder_value_sat() > 0 {
+		let holder_vout = closing_tx
+			.output
+			.iter()
+			.position(|o| &o.script_pubkey == closing_transaction.to_holder_script())
+			.unwrap();
+		output_map.insert(holder_vout as u32, holder_vout_amount);
+	}
+
+	if closing_transaction.to_counterparty_value_sat() > 0 {
+		let counterparty_vout = closing_tx
+			.output
+			.iter()
+			.position(|o| &o.script_pubkey == closing_transaction.to_counterparty_script())
+			.unwrap();
+		output_map.insert(counterparty_vout as u32, counterparty_vout_amount);
+	}
 
 	let asset_coloring_info = AssetColoringInfo {
 		iface: AssetIface::RGB20,
@@ -407,10 +435,7 @@ pub(crate) fn color_closing(
 			txid: funding_outpoint.txid.to_string(),
 			vout: funding_outpoint.index as u32,
 		}],
-		output_map: HashMap::from([
-			(holder_vout as u32, holder_vout_amount),
-			(counterparty_vout as u32, counterparty_vout_amount),
-		]),
+		output_map,
 		static_blinding: Some(STATIC_BLINDING),
 	};
 	let coloring_info = ColoringInfo {

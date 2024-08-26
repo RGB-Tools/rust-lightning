@@ -41,7 +41,7 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_path, get_rgb_channel_info_pending, parse_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount_pending};
+use crate::rgb_utils::{color_closing, color_commitment, color_htlc, get_rgb_channel_info_path, get_rgb_channel_info_pending, op_return_position, parse_rgb_channel_info, rename_rgb_files, update_rgb_channel_amount_pending};
 use crate::sign::ecdsa::{EcdsaChannelSigner, WriteableEcdsaChannelSigner};
 use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::ClosureReason;
@@ -6056,9 +6056,10 @@ impl<SP: Deref> Channel<SP> where
 			},
 		};
 
-		for (idx, outp) in closing_tx.trust().built_transaction().output.iter().enumerate() {
-			// skip OP_RETURN
-			if idx < 2 && !outp.script_pubkey.is_witness_program() && outp.value < MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS {
+		let closing_transaction = closing_tx.trust().built_transaction();
+		let op_return_position = op_return_position(closing_transaction);
+		for (idx, outp) in closing_transaction.output.iter().enumerate() {
+			if Some(idx) != op_return_position && !outp.script_pubkey.is_witness_program() && outp.value < MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS {
 				return Err(ChannelError::Close("Remote sent us a closing_signed with a dust output. Always use segwit closing scripts!".to_owned()));
 			}
 		}

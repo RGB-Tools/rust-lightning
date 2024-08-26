@@ -27,7 +27,7 @@ use crate::chain::package::WEIGHT_REVOKED_OUTPUT;
 use crate::sign::EntropySource;
 use crate::ln::types::{PaymentHash, PaymentPreimage};
 use crate::ln::msgs::DecodeError;
-use crate::rgb_utils::color_htlc;
+use crate::rgb_utils::{color_htlc, is_tx_colored};
 use crate::util::ser::{Readable, RequiredWrapper, Writeable, Writer};
 use crate::util::transaction_utils;
 
@@ -1159,7 +1159,7 @@ impl BuiltCommitmentTransaction {
 pub struct ClosingTransaction {
 	to_holder_value_sat: u64,
 	to_counterparty_value_sat: u64,
-	pub(crate) to_holder_script: ScriptBuf,
+	to_holder_script: ScriptBuf,
 	to_counterparty_script: ScriptBuf,
 	pub(crate) built: Transaction,
 }
@@ -1402,13 +1402,7 @@ impl CommitmentTransaction {
 
 	/// Whether the commitment transaction is colored (i.e. it has an OP_RETURN output)
 	pub fn is_colored(&self) -> bool {
-		self
-			.built
-			.transaction
-			.output
-			.iter()
-			.enumerate()
-			.find(|(_, o)| o.script_pubkey.is_op_return()).is_some()
+		is_tx_colored(&self.built.transaction)
 	}
 
 	/// Use non-zero fee anchors
