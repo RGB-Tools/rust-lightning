@@ -56,7 +56,7 @@ libm = { version = "0.2", optional = true, default-features = false }
 
 # RGB and related
 futures = "0.3"
-rgb-lib = { version = "0.3.0-alpha.5", features = [
+rgb-lib = { version = "0.3.0-alpha.6", features = [
     "electrum",
     "esplora",
 ] }
