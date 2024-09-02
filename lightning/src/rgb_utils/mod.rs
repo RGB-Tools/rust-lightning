@@ -22,8 +22,8 @@ use rgb_lib::{
 		rust_only::{AssetColoringInfo, ColoringInfo},
 		AssetIface, DatabaseType, Outpoint, WalletData,
 	},
-	BitcoinNetwork, ContractId, Error as RgbLibError, Fascia, FileContent, RgbTransfer,
-	RgbTransport, Wallet,
+	BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError, FileContent, RgbTransfer,
+	RgbTransport, RgbTxid, Wallet,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -78,8 +78,6 @@ pub struct RgbPaymentInfo {
 /// RGB transfer info
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransferInfo {
-	/// Transfer fascia
-	pub fascia: Fascia,
 	/// Transfer contract ID
 	pub contract_id: ContractId,
 	/// Transfer RGB amount
@@ -147,7 +145,7 @@ async fn _accept_transfer(
 	tokio::task::spawn_blocking(move || {
 		let mut wallet = _new_rgb_wallet(data_dir, bitcoin_network, pubkey);
 		wallet.go_online(true, indexer_url).unwrap();
-		wallet.accept_transfer(funding_txid.clone(), 0, consignment_endpoint, STATIC_BLINDING, true)
+		wallet.accept_transfer(funding_txid.clone(), 0, consignment_endpoint, STATIC_BLINDING)
 	})
 	.await
 	.unwrap()
@@ -320,31 +318,31 @@ where
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
+		nonce: None,
 	};
 	let psbt = Psbt::from_unsigned_tx(commitment_tx.clone()).unwrap();
 	let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).unwrap();
 	let handle = Handle::current();
 	let _ = handle.enter();
 	let wallet = futures::executor::block_on(_get_rgb_wallet(ldk_data_dir));
-	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info, false).unwrap();
+	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info).unwrap();
 	let psbt = Psbt::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 
 	let txid = modified_tx.txid();
 	commitment_transaction.built = BuiltCommitmentTransaction { transaction: modified_tx, txid };
 
+	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+
 	// save RGB transfer data to disk
-	if counterparty {
-		let transfer_info =
-			TransferInfo { fascia, contract_id, rgb_amount: vout_p2wpkh_amt + rgb_offered_htlc };
-		let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
-		write_rgb_transfer_info(&transfer_info_path, &transfer_info);
+	let rgb_amount = if counterparty {
+		vout_p2wpkh_amt + rgb_offered_htlc
 	} else {
-		let transfer_info =
-			TransferInfo { fascia, contract_id, rgb_amount: vout_p2wsh_amt + rgb_received_htlc };
-		let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
-		write_rgb_transfer_info(&transfer_info_path, &transfer_info);
-	}
+		vout_p2wsh_amt + rgb_received_htlc
+	};
+	let transfer_info = TransferInfo { contract_id, rgb_amount };
+	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
+	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
 	Ok(())
 }
@@ -377,19 +375,22 @@ pub(crate) fn color_htlc(
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
+		nonce: Some(1),
 	};
 	let psbt = Psbt::from_unsigned_tx(htlc_tx.clone()).unwrap();
 	let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).unwrap();
 	let handle = Handle::current();
 	let _ = handle.enter();
 	let wallet = futures::executor::block_on(_get_rgb_wallet(ldk_data_dir));
-	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info, true).unwrap();
+	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info).unwrap();
 	let psbt = Psbt::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 	let txid = &modified_tx.txid();
 
+	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+
 	// save RGB transfer data to disk
-	let transfer_info = TransferInfo { fascia, contract_id, rgb_amount: htlc_amount_rgb };
+	let transfer_info = TransferInfo { contract_id, rgb_amount: htlc_amount_rgb };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
@@ -441,21 +442,24 @@ pub(crate) fn color_closing(
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
+		nonce: None,
 	};
 	let psbt = Psbt::from_unsigned_tx(closing_tx.clone()).unwrap();
 	let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).unwrap();
 	let handle = Handle::current();
 	let _ = handle.enter();
 	let wallet = futures::executor::block_on(_get_rgb_wallet(ldk_data_dir));
-	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info, false).unwrap();
+	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info).unwrap();
 	let psbt = Psbt::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = psbt.extract_tx();
 
 	let txid = &modified_tx.txid();
 	closing_transaction.built = modified_tx;
 
+	wallet.consume_fascia(fascia.clone(), RgbTxid::from_str(&txid.to_string()).unwrap()).unwrap();
+
 	// save RGB transfer data to disk
-	let transfer_info = TransferInfo { fascia, contract_id, rgb_amount: holder_vout_amount };
+	let transfer_info = TransferInfo { contract_id, rgb_amount: holder_vout_amount };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
