@@ -1334,6 +1334,7 @@ impl Writeable for CommitmentTransaction {
 }
 
 impl Readable for CommitmentTransaction {
+	#[allow(dependency_on_unit_never_type_fallback)]
 	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
 		_init_and_read_len_prefixed_tlv_fields!(reader, {
 			(0, commitment_number, required),
