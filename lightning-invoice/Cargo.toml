@@ -24,7 +24,7 @@ serde = { version = "1.0.118", optional = true }
 bitcoin = { version = "0.32.2", default-features = false, features = ["secp-recovery"] }
 
 # RGB and related
-rgb-lib = { version = "0.3.0-alpha.12", features = [
+rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib", rev = "fda64400", features = [
     "electrum",
     "esplora",
 ] }
