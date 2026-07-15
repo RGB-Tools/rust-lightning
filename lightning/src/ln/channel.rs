@@ -11901,12 +11901,12 @@ where
 		if self.context.secp_ctx.verify_ecdsa(&msghash, &msg.node_signature, &self.context.get_counterparty_node_id()).is_err() {
 			return Err(ChannelError::close(format!(
 				"Bad announcement_signatures. Failed to verify node_signature. UnsignedChannelAnnouncement used for verification is {:?}. their_node_key is {:?}",
-				 &announcement, self.context.get_counterparty_node_id())));
+				 announcement, self.context.get_counterparty_node_id())));
 		}
 		if self.context.secp_ctx.verify_ecdsa(&msghash, &msg.bitcoin_signature, self.funding.counterparty_funding_pubkey()).is_err() {
 			return Err(ChannelError::close(format!(
 				"Bad announcement_signatures. Failed to verify bitcoin_signature. UnsignedChannelAnnouncement used for verification is {:?}. their_bitcoin_key is ({:?})",
-				&announcement, self.funding.counterparty_funding_pubkey())));
+				announcement, self.funding.counterparty_funding_pubkey())));
 		}
 
 		self.context.announcement_sigs = Some((msg.node_signature, msg.bitcoin_signature));
@@ -13715,7 +13715,7 @@ where
 
 		debug_assert!(self.funding.funding_transaction.is_none());
 		self.funding.funding_transaction = Some(funding_transaction);
-		self.context.is_batch_funding = Some(()).filter(|_| is_batch_funding);
+		self.context.is_batch_funding = is_batch_funding.then_some(());
 
 		let funding_created = self.get_funding_created_msg(logger);
 		Ok(funding_created)

@@ -1002,8 +1002,7 @@ impl OutboundPayments {
 		let payment_params = PaymentParameters::from_bolt11_invoice(invoice)
 			.with_user_config_ignoring_fee_limit(route_params_config);
 
-		let rgb_payment =
-			invoice.rgb_amount().and_then(|amt| invoice.rgb_contract_id().map(|cid| (cid, amt)));
+		let rgb_payment = invoice.rgb_contract_id().zip(invoice.rgb_amount());
 
 		let mut route_params = RouteParameters::from_payment_params_and_value(payment_params, amount, rgb_payment);
 
