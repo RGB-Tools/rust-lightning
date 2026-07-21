@@ -89,8 +89,8 @@ pub struct TransferInfo {
 	/// Transfer contract ID
 	#[serde(with = "contract_id_serde")]
 	pub contract_id: ContractId,
-	/// Transfer RGB amount
-	pub rgb_amount: u64,
+	/// RGB amount assigned to each output of the transaction, by vout
+	pub output_map: HashMap<u32, u64>,
 }
 
 mod contract_id_serde {
@@ -333,8 +333,10 @@ where
 		output_map.insert(vout_p2wsh as u32, vout_p2wsh_amt);
 	}
 
-	let asset_coloring_info =
-		AssetColoringInfo { output_map, static_blinding: Some(STATIC_BLINDING) };
+	let asset_coloring_info = AssetColoringInfo {
+		output_map: output_map.clone(),
+		static_blinding: Some(STATIC_BLINDING),
+	};
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
@@ -359,12 +361,7 @@ where
 	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
-	let rgb_amount = if counterparty {
-		vout_p2wpkh_amt + rgb_offered_htlc
-	} else {
-		vout_p2wsh_amt + rgb_received_htlc
-	};
-	let transfer_info = TransferInfo { contract_id, rgb_amount };
+	let transfer_info = TransferInfo { contract_id, output_map };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
@@ -387,8 +384,9 @@ pub(crate) fn color_htlc(
 	let transfer_info = read_rgb_transfer_info(&transfer_info_path);
 	let contract_id = transfer_info.contract_id;
 
+	let output_map = HashMap::from([(0, htlc_amount_rgb)]);
 	let asset_coloring_info = AssetColoringInfo {
-		output_map: HashMap::from([(0, htlc_amount_rgb)]),
+		output_map: output_map.clone(),
 		static_blinding: Some(STATIC_BLINDING),
 	};
 	let coloring_info = ColoringInfo {
@@ -413,7 +411,7 @@ pub(crate) fn color_htlc(
 	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
-	let transfer_info = TransferInfo { contract_id, rgb_amount: htlc_amount_rgb };
+	let transfer_info = TransferInfo { contract_id, output_map };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
@@ -452,8 +450,10 @@ pub(crate) fn color_closing(
 		output_map.insert(counterparty_vout as u32, counterparty_vout_amount);
 	}
 
-	let asset_coloring_info =
-		AssetColoringInfo { output_map, static_blinding: Some(STATIC_BLINDING) };
+	let asset_coloring_info = AssetColoringInfo {
+		output_map: output_map.clone(),
+		static_blinding: Some(STATIC_BLINDING),
+	};
 	let coloring_info = ColoringInfo {
 		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
 		static_blinding: Some(STATIC_BLINDING),
@@ -478,7 +478,7 @@ pub(crate) fn color_closing(
 	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
 
 	// save RGB transfer data to disk
-	let transfer_info = TransferInfo { contract_id, rgb_amount: holder_vout_amount };
+	let transfer_info = TransferInfo { contract_id, output_map };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
