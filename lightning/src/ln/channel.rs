@@ -14749,6 +14749,7 @@ where
 					}
 				},
 			}
+			htlc.rgb_payment.write(writer)?;
 		}
 
 		// The elements of this vector will always be `Some` starting in 0.2,
@@ -14798,6 +14799,7 @@ where
 					reason.write(writer)?;
 				},
 			}
+			htlc.rgb_payment.write(writer)?;
 			pending_outbound_skimmed_fees.push(htlc.skimmed_fee_msat);
 			pending_outbound_blinding_points.push(htlc.blinding_point);
 			pending_outbound_held_htlc_flags.push(htlc.hold_htlc);
