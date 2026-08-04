@@ -114,4 +114,4 @@ CLIPPY() {
 		-A clippy::uninlined-format-args
 }
 
-CLIPPY
+CLIPPY "--features lightning/electrum"
