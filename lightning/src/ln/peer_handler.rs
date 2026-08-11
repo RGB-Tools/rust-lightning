@@ -913,15 +913,25 @@ impl Peer {
 ///
 /// This is not exported to bindings users as type aliases aren't supported in most languages.
 #[cfg(not(c_bindings))]
-pub type SimpleArcPeerManager<SD, M, T, F, C, L, CF, S> = PeerManager<
+pub type SimpleArcPeerManager<SD, M, T, F, C, L, CF, S, KV> = PeerManager<
 	SD,
-	Arc<SimpleArcChannelManager<M, T, F, L>>,
+	Arc<SimpleArcChannelManager<M, T, F, L, KV>>,
 	Arc<P2PGossipSync<Arc<NetworkGraph<Arc<L>>>, C, Arc<L>>>,
-	Arc<SimpleArcOnionMessenger<M, T, F, L>>,
+	Arc<SimpleArcOnionMessenger<M, T, F, L, KV>>,
 	Arc<L>,
 	IgnoringMessageHandler,
-	Arc<KeysManager>,
-	Arc<ChainMonitor<InMemorySigner, Arc<CF>, Arc<T>, Arc<F>, Arc<L>, Arc<S>, Arc<KeysManager>>>,
+	Arc<KeysManager<KV>>,
+	Arc<
+		ChainMonitor<
+			InMemorySigner<KV>,
+			Arc<CF>,
+			Arc<T>,
+			Arc<F>,
+			Arc<L>,
+			Arc<S>,
+			Arc<KeysManager<KV>>,
+		>,
+	>,
 >;
 
 /// SimpleRefPeerManager is a type alias for a PeerManager reference, and is the reference
@@ -935,16 +945,16 @@ pub type SimpleArcPeerManager<SD, M, T, F, C, L, CF, S> = PeerManager<
 #[cfg(not(c_bindings))]
 #[rustfmt::skip]
 pub type SimpleRefPeerManager<
-	'a, 'b, 'c, 'd, 'e, 'f, 'logger, 'h, 'i, 'j, 'graph, 'k, 'mr, SD, M, T, F, C, L
+	'a, 'b, 'c, 'd, 'e, 'f, 'logger, 'h, 'i, 'j, 'graph, 'k, 'mr, SD, M, T, F, C, L, KV
 > = PeerManager<
 	SD,
-	&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'graph, 'logger, 'i, 'mr, M, T, F, L>,
+	&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'graph, 'logger, 'i, 'mr, M, T, F, L, KV>,
 	&'f P2PGossipSync<&'graph NetworkGraph<&'logger L>, C, &'logger L>,
-	&'h SimpleRefOnionMessenger<'a, 'b, 'c, 'd, 'e, 'graph, 'logger, 'i, 'j, 'k, M, T, F, L>,
+	&'h SimpleRefOnionMessenger<'a, 'b, 'c, 'd, 'e, 'graph, 'logger, 'i, 'j, 'k, M, T, F, L, KV>,
 	&'logger L,
 	IgnoringMessageHandler,
-	&'c KeysManager,
-	&'j ChainMonitor<&'a M, C, &'b T, &'c F, &'logger L, &'c KeysManager, &'c KeysManager>,
+	&'c KeysManager<KV>,
+	&'j ChainMonitor<&'a M, C, &'b T, &'c F, &'logger L, &'c KeysManager<KV>, &'c KeysManager<KV>>,
 >;
 
 /// A generic trait which is implemented for all [`PeerManager`]s. This makes bounding functions or

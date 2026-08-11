@@ -119,10 +119,7 @@ use crate::onion_message::messenger::{
 	MessageRouter, MessageSendInstructions, Responder, ResponseInstruction,
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
-use crate::rgb_utils::{
-	get_rgb_channel_info, get_rgb_payment_info_path, handle_funding, is_channel_rgb,
-	parse_rgb_payment_info,
-};
+use crate::rgb_utils::{handle_funding, is_channel_rgb, RgbKvStoreExt};
 use crate::routing::router::{
 	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route,
 	RouteParameters, RouteParametersConfig, Router,
@@ -139,6 +136,7 @@ use crate::types::string::UntrustedString;
 use crate::util::config::{ChannelConfig, ChannelConfigOverrides, ChannelConfigUpdate, UserConfig};
 use crate::util::errors::APIError;
 use crate::util::logger::{Level, Logger, WithContext};
+use crate::util::persist::KVStoreSync;
 use crate::util::scid_utils::fake_scid;
 use crate::util::ser::{
 	BigSize, FixedLengthReader, LengthReadable, MaybeReadable, Readable, ReadableArgs, VecWriter,
@@ -803,7 +801,7 @@ mod fuzzy_channelmanager {
 	use super::*;
 
 	/// Tracks the inbound corresponding to an outbound HTLC
-	#[allow(clippy::derive_hash_xor_eq)] // Our Hash is faithful to the data, we just don't have SecretKey::hash
+	#[allow(clippy::derived_hash_with_manual_eq)] // Our Hash is faithful to the data, we just don't have SecretKey::hash
 	#[derive(Clone, Debug, PartialEq, Eq)]
 	pub enum HTLCSource {
 		PreviousHopData(HTLCPreviousHopData),
@@ -847,7 +845,7 @@ pub use self::fuzzy_channelmanager::*;
 #[cfg(not(fuzzing))]
 pub(crate) use self::fuzzy_channelmanager::*;
 
-#[allow(clippy::derive_hash_xor_eq)] // Our Hash is faithful to the data, we just don't have SecretKey::hash
+#[allow(clippy::derived_hash_with_manual_eq)] // Our Hash is faithful to the data, we just don't have SecretKey::hash
 impl core::hash::Hash for HTLCSource {
 	fn hash<H: core::hash::Hasher>(&self, hasher: &mut H) {
 		match self {
@@ -1590,14 +1588,14 @@ impl Readable for Option<RAAMonitorUpdateBlockingAction> {
 }
 
 /// State we hold per-peer.
-pub(super) struct PeerState<SP: Deref>
+pub(super) struct PeerState<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	/// `channel_id` -> `Channel`
 	///
 	/// Holds all channels where the peer is the counterparty.
-	pub(super) channel_by_id: HashMap<ChannelId, Channel<SP>>,
+	pub(super) channel_by_id: HashMap<ChannelId, Channel<SP, KV>>,
 	/// `temporary_channel_id` -> `InboundChannelRequest`.
 	///
 	/// When manual channel acceptance is enabled, this holds all unaccepted inbound channels where
@@ -1668,7 +1666,7 @@ where
 	peer_storage: Vec<u8>,
 }
 
-impl<SP: Deref> PeerState<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> PeerState<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -1684,7 +1682,7 @@ where
 				return false;
 			}
 		}
-		let chan_is_funded_or_outbound = |(_, channel): (_, &Channel<SP>)| {
+		let chan_is_funded_or_outbound = |(_, channel): (_, &Channel<SP, KV>)| {
 			channel.is_funded() || channel.funding().is_outbound()
 		};
 		!self.channel_by_id.iter().any(chan_is_funded_or_outbound)
@@ -1766,25 +1764,26 @@ struct PendingInboundPayment {
 ///
 /// This is not exported to bindings users as type aliases aren't supported in most languages.
 #[cfg(not(c_bindings))]
-pub type SimpleArcChannelManager<M, T, F, L> = ChannelManager<
+pub type SimpleArcChannelManager<M, T, F, L, KV> = ChannelManager<
 	Arc<M>,
 	Arc<T>,
-	Arc<KeysManager>,
-	Arc<KeysManager>,
-	Arc<KeysManager>,
+	Arc<KeysManager<KV>>,
+	Arc<KeysManager<KV>>,
+	Arc<KeysManager<KV>>,
 	Arc<F>,
 	Arc<
 		DefaultRouter<
 			Arc<NetworkGraph<Arc<L>>>,
 			Arc<L>,
-			Arc<KeysManager>,
+			Arc<KeysManager<KV>>,
 			Arc<RwLock<ProbabilisticScorer<Arc<NetworkGraph<Arc<L>>>, Arc<L>>>>,
 			ProbabilisticScoringFeeParameters,
 			ProbabilisticScorer<Arc<NetworkGraph<Arc<L>>>, Arc<L>>,
 		>,
 	>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph<Arc<L>>>, Arc<L>, Arc<KeysManager>>>,
+	Arc<DefaultMessageRouter<Arc<NetworkGraph<Arc<L>>>, Arc<L>, Arc<KeysManager<KV>>>>,
 	Arc<L>,
+	KV,
 >;
 
 /// [`SimpleRefChannelManager`] is a type alias for a ChannelManager reference, and is the reference
@@ -1799,24 +1798,26 @@ pub type SimpleArcChannelManager<M, T, F, L> = ChannelManager<
 ///
 /// This is not exported to bindings users as type aliases aren't supported in most languages.
 #[cfg(not(c_bindings))]
-pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L> = ChannelManager<
-	&'a M,
-	&'b T,
-	&'c KeysManager,
-	&'c KeysManager,
-	&'c KeysManager,
-	&'d F,
-	&'e DefaultRouter<
-		&'f NetworkGraph<&'g L>,
+pub type SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L, KV> =
+	ChannelManager<
+		&'a M,
+		&'b T,
+		&'c KeysManager<KV>,
+		&'c KeysManager<KV>,
+		&'c KeysManager<KV>,
+		&'d F,
+		&'e DefaultRouter<
+			&'f NetworkGraph<&'g L>,
+			&'g L,
+			&'c KeysManager<KV>,
+			&'h RwLock<ProbabilisticScorer<&'f NetworkGraph<&'g L>, &'g L>>,
+			ProbabilisticScoringFeeParameters,
+			ProbabilisticScorer<&'f NetworkGraph<&'g L>, &'g L>,
+		>,
+		&'i DefaultMessageRouter<&'f NetworkGraph<&'g L>, &'g L, &'c KeysManager<KV>>,
 		&'g L,
-		&'c KeysManager,
-		&'h RwLock<ProbabilisticScorer<&'f NetworkGraph<&'g L>, &'g L>>,
-		ProbabilisticScoringFeeParameters,
-		ProbabilisticScorer<&'f NetworkGraph<&'g L>, &'g L>,
-	>,
-	&'i DefaultMessageRouter<&'f NetworkGraph<&'g L>, &'g L, &'c KeysManager>,
-	&'g L,
->;
+		KV,
+	>;
 
 /// A trivial trait which describes any [`ChannelManager`].
 ///
@@ -1861,6 +1862,8 @@ pub trait AChannelManager {
 	type Logger: Logger + ?Sized;
 	/// A type that may be dereferenced to [`Self::Logger`].
 	type L: Deref<Target = Self::Logger>;
+	/// A type implementing [`KVStoreSync`].
+	type KVStore: KVStoreSync + Send + Sync + 'static;
 	/// Returns a reference to the actual [`ChannelManager`] object.
 	fn get_cm(
 		&self,
@@ -1874,6 +1877,7 @@ pub trait AChannelManager {
 		Self::R,
 		Self::MR,
 		Self::L,
+		Self::KVStore,
 	>;
 }
 
@@ -1887,7 +1891,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> AChannelManager for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> AChannelManager for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -1918,7 +1923,8 @@ where
 	type MR = MR;
 	type Logger = L::Target;
 	type L = L;
-	fn get_cm(&self) -> &ChannelManager<M, T, ES, NS, SP, F, R, MR, L> {
+	type KVStore = KV;
+	fn get_cm(&self) -> &ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV> {
 		self
 	}
 }
@@ -2712,6 +2718,7 @@ pub struct ChannelManager<
 	R: Deref,
 	MR: Deref,
 	L: Deref,
+	KV: KVStoreSync + Send + Sync + 'static,
 > where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -2755,7 +2762,7 @@ pub struct ChannelManager<
 	/// See `PendingOutboundPayment` documentation for more info.
 	///
 	/// See `ChannelManager` struct-level documentation for lock order requirements.
-	pending_outbound_payments: OutboundPayments,
+	pending_outbound_payments: OutboundPayments<KV>,
 
 	/// SCID/SCID Alias -> forward infos. Key of 0 means payments received.
 	///
@@ -2860,9 +2867,9 @@ pub struct ChannelManager<
 	///
 	/// See `ChannelManager` struct-level documentation for lock order requirements.
 	#[cfg(not(any(test, feature = "_test_utils")))]
-	per_peer_state: FairRwLock<HashMap<PublicKey, Mutex<PeerState<SP>>>>,
+	per_peer_state: FairRwLock<HashMap<PublicKey, Mutex<PeerState<SP, KV>>>>,
 	#[cfg(any(test, feature = "_test_utils"))]
-	pub(super) per_peer_state: FairRwLock<HashMap<PublicKey, Mutex<PeerState<SP>>>>,
+	pub(super) per_peer_state: FairRwLock<HashMap<PublicKey, Mutex<PeerState<SP, KV>>>>,
 
 	/// We only support using one of [`ChannelMonitorUpdateStatus::InProgress`] and
 	/// [`ChannelMonitorUpdateStatus::Completed`] without restarting. Because the API does not
@@ -2963,6 +2970,9 @@ pub struct ChannelManager<
 	logger: L,
 
 	ldk_data_dir: PathBuf,
+
+	/// KVStore for RGB data persistence
+	rgb_kv_store: Arc<KV>,
 }
 
 /// Chain-related parameters used to construct a new `ChannelManager`.
@@ -3420,7 +3430,7 @@ macro_rules! convert_channel_err {
 				$self.get_channel_update_for_broadcast(&$funded_channel).ok(),
 			)
 		};
-		let mut locked_close = |shutdown_res_mut: &mut ShutdownResult, funded_channel: &mut FundedChannel<_>| {
+		let mut locked_close = |shutdown_res_mut: &mut ShutdownResult, funded_channel: &mut FundedChannel<_, _>| {
 			locked_close_channel!($self, $peer_state, funded_channel, shutdown_res_mut, FUNDED);
 		};
 		let (close, mut err) =
@@ -3437,7 +3447,7 @@ macro_rules! convert_channel_err {
 				$self.get_channel_update_for_broadcast(&$funded_channel).ok(),
 			)
 		};
-		let mut locked_close = |shutdown_res_mut: &mut ShutdownResult, funded_channel: &mut FundedChannel<_>| {
+		let mut locked_close = |shutdown_res_mut: &mut ShutdownResult, funded_channel: &mut FundedChannel<_, _>| {
 			locked_close_channel!($self, $peer_state, funded_channel, shutdown_res_mut, FUNDED);
 		};
 		convert_channel_err!($self, $peer_state, $err, $funded_channel, do_close, locked_close, chan_id, _internal)
@@ -3445,7 +3455,7 @@ macro_rules! convert_channel_err {
 	($self: ident, $peer_state: expr, $err: expr, $channel: expr, UNFUNDED_CHANNEL) => { {
 		let chan_id = $channel.context().channel_id();
 		let mut do_close = |reason| { ($channel.force_shutdown(reason), None) };
-		let locked_close = |_, chan: &mut Channel<_>| { locked_close_channel!($self, chan.context(), UNFUNDED); };
+		let locked_close = |_, chan: &mut Channel<_, _>| { locked_close_channel!($self, chan.context(), UNFUNDED); };
 		convert_channel_err!($self, $peer_state, $err, $channel, do_close, locked_close, chan_id, _internal)
 	} };
 	($self: ident, $peer_state: expr, $err: expr, $channel: expr) => {
@@ -3953,7 +3963,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -3986,7 +3997,8 @@ where
 	pub fn new(
 		fee_est: F, chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
 		entropy_source: ES, node_signer: NS, signer_provider: SP, config: UserConfig,
-		params: ChainParameters, current_timestamp: u32, ldk_data_dir: PathBuf
+		params: ChainParameters, current_timestamp: u32, ldk_data_dir: PathBuf,
+		rgb_kv_store: Arc<KV>,
 	) -> Self
 	where
 		L: Clone,
@@ -4015,7 +4027,7 @@ where
 			best_block: RwLock::new(params.best_block),
 
 			outbound_scid_aliases: Mutex::new(new_hash_set()),
-			pending_outbound_payments: OutboundPayments::new(new_hash_map(), ldk_data_dir.clone()),
+			pending_outbound_payments: OutboundPayments::new(new_hash_map(), Arc::clone(&rgb_kv_store)),
 			forward_htlcs: Mutex::new(new_hash_map()),
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
@@ -4062,6 +4074,7 @@ where
 			testing_dnssec_proof_offer_resolution_override: Mutex::new(new_hash_map()),
 
 			ldk_data_dir,
+			rgb_kv_store,
 		}
 	}
 
@@ -4180,7 +4193,8 @@ where
 			};
 			match OutboundV1Channel::new(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
 				their_features, channel_value_satoshis, push_msat, user_channel_id, config,
-				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, rgb_asset, self.ldk_data_dir.clone())
+				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, rgb_asset, self.ldk_data_dir.clone(),
+				Arc::clone(&self.rgb_kv_store))
 			{
 				Ok(res) => res,
 				Err(e) => {
@@ -4214,7 +4228,7 @@ where
 	}
 
 	fn list_funded_channels_with_filter<
-		Fn: FnMut(&(&InitFeatures, &ChannelId, &Channel<SP>)) -> bool,
+		Fn: FnMut(&(&InitFeatures, &ChannelId, &Channel<SP, KV>)) -> bool,
 	>(
 		&self, mut f: Fn,
 	) -> Vec<ChannelDetails> {
@@ -4952,7 +4966,7 @@ where
 
 	#[rustfmt::skip]
 	fn can_forward_htlc_to_outgoing_channel(
-		&self, chan: &mut FundedChannel<SP>, msg: &msgs::UpdateAddHTLC, next_packet: &NextPacketDetails
+		&self, chan: &mut FundedChannel<SP, KV>, msg: &msgs::UpdateAddHTLC, next_packet: &NextPacketDetails
 	) -> Result<(), LocalHTLCFailureReason> {
 		if !chan.context.should_announce()
 			&& !self.config.read().unwrap().accept_forwards_to_priv_channels
@@ -4995,7 +5009,7 @@ where
 
 	/// Executes a callback `C` that returns some value `X` on the channel found with the given
 	/// `scid`. `None` is returned when the channel is not found.
-	fn do_funded_channel_callback<X, C: Fn(&mut FundedChannel<SP>) -> X>(
+	fn do_funded_channel_callback<X, C: Fn(&mut FundedChannel<SP, KV>) -> X>(
 		&self, scid: u64, callback: C,
 	) -> Option<X> {
 		let (counterparty_node_id, channel_id) =
@@ -5026,7 +5040,7 @@ where
 				return Err(LocalHTLCFailureReason::InvalidTrampolineForward);
 			}
 		};
-		match self.do_funded_channel_callback(outgoing_scid, |chan: &mut FundedChannel<SP>| {
+		match self.do_funded_channel_callback(outgoing_scid, |chan: &mut FundedChannel<SP, KV>| {
 			self.can_forward_htlc_to_outgoing_channel(chan, msg, next_packet_details)
 		}) {
 			Some(Ok(())) => {},
@@ -5171,7 +5185,7 @@ where
 	/// [`channel_update`]: msgs::ChannelUpdate
 	/// [`internal_closing_signed`]: Self::internal_closing_signed
 	fn get_channel_update_for_broadcast(
-		&self, chan: &FundedChannel<SP>,
+		&self, chan: &FundedChannel<SP, KV>,
 	) -> Result<msgs::ChannelUpdate, LightningError> {
 		if !chan.context.should_announce() {
 			return Err(LightningError {
@@ -5206,7 +5220,7 @@ where
 	/// [`channel_update`]: msgs::ChannelUpdate
 	/// [`internal_closing_signed`]: Self::internal_closing_signed
 	#[rustfmt::skip]
-	fn get_channel_update_for_unicast(&self, chan: &FundedChannel<SP>) -> Result<msgs::ChannelUpdate, LightningError> {
+	fn get_channel_update_for_unicast(&self, chan: &FundedChannel<SP, KV>) -> Result<msgs::ChannelUpdate, LightningError> {
 		let logger = WithChannelContext::from(&self.logger, &chan.context, None);
 		log_trace!(logger, "Attempting to generate channel update for channel {}", chan.context.channel_id());
 		let short_channel_id = match chan.funding.get_short_channel_id().or(chan.context.latest_inbound_scid_alias()) {
@@ -5284,18 +5298,11 @@ where
 		// The top-level caller should hold the total_consistency_lock read lock.
 		debug_assert!(self.total_consistency_lock.try_write().is_err());
 
-		let rgb_payment_info_hash_path_outbound =
-			get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
-		let needs_rgb_modification = if rgb_payment_info_hash_path_outbound.exists() {
-			let info = parse_rgb_payment_info(&rgb_payment_info_hash_path_outbound);
-			if !info.swap_payment {
-				Some(info)
-			} else {
-				None
-			}
-		} else {
-			None
-		};
+		let needs_rgb_modification =
+			match self.rgb_kv_store.read_rgb_payment_info(payment_hash, false) {
+				Ok(info) if !info.swap_payment => Some(info),
+				_ => None,
+			};
 		let modified_path;
 		let path = if let Some(rgb_payment_info) = needs_rgb_modification {
 			modified_path = {
@@ -6166,7 +6173,7 @@ where
 	/// Handles the generation of a funding transaction, optionally (for tests) with a function
 	/// which checks the correctness of the funding transaction given the associated channel.
 	#[rustfmt::skip]
-	fn funding_transaction_generated_intern<FundingOutput: FnMut(&OutboundV1Channel<SP>) -> Result<OutPoint, &'static str>>(
+	fn funding_transaction_generated_intern<FundingOutput: FnMut(&OutboundV1Channel<SP, KV>) -> Result<OutPoint, &'static str>>(
 		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey, funding_transaction: Transaction, is_batch_funding: bool,
 		mut find_funding_output: FundingOutput, is_manual_broadcast: bool,
 	) -> Result<(), APIError> {
@@ -6697,7 +6704,7 @@ where
 	}
 
 	fn broadcast_interactive_funding(
-		&self, channel: &mut FundedChannel<SP>, funding_tx: &Transaction, logger: &L,
+		&self, channel: &mut FundedChannel<SP, KV>, funding_tx: &Transaction, logger: &L,
 	) {
 		let logger = WithChannelContext::from(logger, channel.context(), None);
 		log_info!(
@@ -7013,7 +7020,7 @@ where
 			should_persist = true;
 			let incoming_channel_details_opt = self.do_funded_channel_callback(
 				incoming_scid_alias,
-				|chan: &mut FundedChannel<SP>| {
+				|chan: &mut FundedChannel<SP, KV>| {
 					let counterparty_node_id = chan.context.get_counterparty_node_id();
 					let channel_id = chan.context.channel_id();
 					let funding_txo = chan.funding.get_funding_txo().unwrap();
@@ -7097,7 +7104,7 @@ where
 				// Process the HTLC on the incoming channel.
 				match self.do_funded_channel_callback(
 					incoming_scid_alias,
-					|chan: &mut FundedChannel<SP>| {
+					|chan: &mut FundedChannel<SP, KV>| {
 						let logger = WithChannelContext::from(
 							&self.logger,
 							&chan.context,
@@ -7601,15 +7608,19 @@ where
 								.contains(&outgoing_amt_msat);
 							if is_in_range && chan.context.is_usable() {
 								if let Some((cid, outgoing_amount_rgb)) = outgoing_rgb_payment {
-									if !is_channel_rgb(&chan.context.channel_id, &self.ldk_data_dir)
-									{
+									if !is_channel_rgb(
+										&chan.context.channel_id,
+										self.rgb_kv_store.as_ref(),
+									) {
 										return None;
 									}
-									let (rgb_chan_info, _) = get_rgb_channel_info(
-										&chan.context.channel_id.0.as_hex().to_string(),
-										&self.ldk_data_dir,
-										false,
-									);
+									let rgb_chan_info = self
+										.rgb_kv_store
+										.read_rgb_channel_info(
+											&chan.context.channel_id.0.as_hex().to_string(),
+											false,
+										)
+										.expect("channel info must exist in KVStore");
 									if rgb_chan_info.contract_id == *cid
 										&& rgb_chan_info.local_rgb_amount >= *outgoing_amount_rgb
 									{
@@ -8226,7 +8237,7 @@ where
 	}
 
 	#[rustfmt::skip]
-	fn update_channel_fee(&self, chan_id: &ChannelId, chan: &mut FundedChannel<SP>, new_feerate: u32) -> NotifyOption {
+	fn update_channel_fee(&self, chan_id: &ChannelId, chan: &mut FundedChannel<SP, KV>, new_feerate: u32) -> NotifyOption {
 		if !chan.funding.is_outbound() { return NotifyOption::SkipPersistNoEvents; }
 
 		let logger = WithChannelContext::from(&self.logger, &chan.context, None);
@@ -9693,7 +9704,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	/// update completion.
 	#[rustfmt::skip]
 	fn handle_channel_resumption(&self, pending_msg_events: &mut Vec<MessageSendEvent>,
-		channel: &mut FundedChannel<SP>, raa: Option<msgs::RevokeAndACK>,
+		channel: &mut FundedChannel<SP, KV>, raa: Option<msgs::RevokeAndACK>,
 		commitment_update: Option<msgs::CommitmentUpdate>, commitment_order: RAACommitmentOrder,
 		pending_forwards: Vec<(PendingHTLCInfo, u64)>, pending_update_adds: Vec<msgs::UpdateAddHTLC>,
 		funding_broadcastable: Option<Transaction>,
@@ -10071,7 +10082,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						InboundV1Channel::new(
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
-							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone()
+							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, self.ldk_data_dir.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
 							let logger = WithChannelContext::from(&self.logger, &channel.context, None);
@@ -10093,6 +10105,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							user_channel_id, &config, best_block_height,
 							&self.logger,
 							self.ldk_data_dir.clone(),
+							Arc::clone(&self.rgb_kv_store),
 						).map_err(|e| {
 							let channel_id = open_channel_msg.common_fields.temporary_channel_id;
 							MsgHandleErrInternal::from_chan_no_close(e, channel_id)
@@ -10187,7 +10200,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	/// non-0-conf channels we have with the peer.
 	fn peers_without_funded_channels<Filter>(&self, maybe_count_peer: Filter) -> usize
 	where
-		Filter: Fn(&PeerState<SP>) -> bool,
+		Filter: Fn(&PeerState<SP, KV>) -> bool,
 	{
 		let mut peers_without_funded_channels = 0;
 		let best_block_height = self.best_block.read().unwrap().height;
@@ -10209,7 +10222,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 
 	#[rustfmt::skip]
 	fn unfunded_channel_count(
-		peer: &PeerState<SP>, best_block_height: u32
+		peer: &PeerState<SP, KV>, best_block_height: u32
 	) -> usize {
 		let mut num_unfunded_channels = 0;
 		for (_, chan) in peer.channel_by_id.iter() {
@@ -10362,7 +10375,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				let mut channel = InboundV1Channel::new(
 					&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 					&self.channel_type_features(), &peer_state.latest_features, msg, user_channel_id,
-					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone()
+					&self.config.read().unwrap(), best_block_height, &self.logger, /*is_0conf=*/false, self.ldk_data_dir.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let logger = WithChannelContext::from(&self.logger, &channel.context, None);
 				let message_send_event = channel.accept_inbound_channel(&&logger).map(|msg| {
@@ -10380,6 +10394,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					&peer_state.latest_features, msg, user_channel_id,
 					&self.config.read().unwrap(), best_block_height, &self.logger,
 					self.ldk_data_dir.clone(),
+					Arc::clone(&self.rgb_kv_store),
 				).map_err(|e| MsgHandleErrInternal::from_chan_no_close(e, msg.common_fields.temporary_channel_id))?;
 				let message_send_event = MessageSendEvent::SendAcceptChannelV2 {
 					node_id: *counterparty_node_id,
@@ -10464,7 +10479,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				Some(Ok(inbound_chan)) => {
 					let logger = WithChannelContext::from(&self.logger, &inbound_chan.context, None);
 					if inbound_chan.funding.is_colored() {
-						match handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), &self.ldk_data_dir, inbound_chan.funding.push_asset_amount()) {
+						match handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), &self.ldk_data_dir, inbound_chan.funding.push_asset_amount(), self.rgb_kv_store.as_ref()) {
 							Ok(()) => (),
 							Err(e) => {
 								// at this point the channel initiator already transitioned its channel to the funded channel ID
@@ -10728,7 +10743,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 
 	fn internal_tx_msg<
 		HandleTxMsgFn: Fn(
-			&mut Channel<SP>,
+			&mut Channel<SP, KV>,
 		) -> Result<InteractiveTxMessageSend, (ChannelError, Option<SpliceFundingFailed>)>,
 	>(
 		&self, counterparty_node_id: &PublicKey, channel_id: ChannelId,
@@ -10782,33 +10797,41 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	fn internal_tx_add_input(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::TxAddInput,
 	) -> Result<NotifyOption, MsgHandleErrInternal> {
-		self.internal_tx_msg(&counterparty_node_id, msg.channel_id, |channel: &mut Channel<SP>| {
-			channel.tx_add_input(msg, &self.logger)
-		})
+		self.internal_tx_msg(
+			&counterparty_node_id,
+			msg.channel_id,
+			|channel: &mut Channel<SP, KV>| channel.tx_add_input(msg, &self.logger),
+		)
 	}
 
 	fn internal_tx_add_output(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::TxAddOutput,
 	) -> Result<NotifyOption, MsgHandleErrInternal> {
-		self.internal_tx_msg(&counterparty_node_id, msg.channel_id, |channel: &mut Channel<SP>| {
-			channel.tx_add_output(msg, &self.logger)
-		})
+		self.internal_tx_msg(
+			&counterparty_node_id,
+			msg.channel_id,
+			|channel: &mut Channel<SP, KV>| channel.tx_add_output(msg, &self.logger),
+		)
 	}
 
 	fn internal_tx_remove_input(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::TxRemoveInput,
 	) -> Result<NotifyOption, MsgHandleErrInternal> {
-		self.internal_tx_msg(&counterparty_node_id, msg.channel_id, |channel: &mut Channel<SP>| {
-			channel.tx_remove_input(msg, &self.logger)
-		})
+		self.internal_tx_msg(
+			&counterparty_node_id,
+			msg.channel_id,
+			|channel: &mut Channel<SP, KV>| channel.tx_remove_input(msg, &self.logger),
+		)
 	}
 
 	fn internal_tx_remove_output(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::TxRemoveOutput,
 	) -> Result<NotifyOption, MsgHandleErrInternal> {
-		self.internal_tx_msg(&counterparty_node_id, msg.channel_id, |channel: &mut Channel<SP>| {
-			channel.tx_remove_output(msg, &self.logger)
-		})
+		self.internal_tx_msg(
+			&counterparty_node_id,
+			msg.channel_id,
+			|channel: &mut Channel<SP, KV>| channel.tx_remove_output(msg, &self.logger),
+		)
 	}
 
 	#[rustfmt::skip]
@@ -12379,7 +12402,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			for (_cp_id, peer_state_mutex) in per_peer_state.iter() {
 				'chan_loop: loop {
 					let mut peer_state_lock = peer_state_mutex.lock().unwrap();
-					let peer_state: &mut PeerState<_> = &mut *peer_state_lock;
+					let peer_state: &mut PeerState<_, _> = &mut *peer_state_lock;
 					for (channel_id, chan) in
 						peer_state.channel_by_id.iter_mut().filter_map(|(chan_id, chan)| {
 							chan.as_funded_mut().map(|chan| (chan_id, chan))
@@ -12439,7 +12462,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 
 		// Returns whether we should remove this channel as it's just been closed.
-		let unblock_chan = |chan: &mut Channel<SP>, pending_msg_events: &mut Vec<MessageSendEvent>| -> Option<ShutdownResult> {
+		let unblock_chan = |chan: &mut Channel<SP, KV>, pending_msg_events: &mut Vec<MessageSendEvent>| -> Option<ShutdownResult> {
 			let channel_id = chan.context().channel_id();
 			let outbound_scid_alias = chan.context().outbound_scid_alias();
 			let logger = WithChannelContext::from(&self.logger, &chan.context(), None);
@@ -13081,7 +13104,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -13950,7 +13974,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> BaseMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> BaseMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -14291,7 +14316,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> EventsProvider for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> EventsProvider for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -14326,7 +14352,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> chain::Listen for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> chain::Listen for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -14387,7 +14414,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> chain::Confirm for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> chain::Confirm for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -14417,7 +14445,7 @@ where
 		let last_best_block_height = self.best_block.read().unwrap().height;
 		if height < last_best_block_height {
 			let timestamp = self.highest_seen_timestamp.load(Ordering::Acquire);
-			let do_update = |channel: &mut FundedChannel<SP>| {
+			let do_update = |channel: &mut FundedChannel<SP, KV>| {
 				channel.best_block_updated(
 					last_best_block_height,
 					Some(timestamp as u32),
@@ -14560,7 +14588,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -14576,7 +14605,7 @@ where
 	/// un/confirmed, etc) on each channel, handling any resulting errors or messages generated by
 	/// the function.
 	#[rustfmt::skip]
-	fn do_chain_event<FN: Fn(&mut FundedChannel<SP>) -> Result<(Option<FundingConfirmedMessage>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason>>
+	fn do_chain_event<FN: Fn(&mut FundedChannel<SP, KV>) -> Result<(Option<FundingConfirmedMessage>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason>>
 			(&self, height_opt: Option<u32>, f: FN) {
 		// Note that we MUST NOT end up calling methods on self.chain_monitor here - we're called
 		// during initialization prior to the chain_monitor being fully configured in some cases.
@@ -14888,7 +14917,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> ChannelMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ChannelMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -15463,7 +15493,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> OffersMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> OffersMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -15633,7 +15664,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> AsyncPaymentsMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> AsyncPaymentsMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -15835,7 +15867,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> DNSResolverMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> DNSResolverMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -15903,7 +15936,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> NodeIdLookUp for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> NodeIdLookUp for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16421,7 +16455,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref,
-	> Writeable for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> Writeable for ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16788,6 +16823,7 @@ pub struct ChannelManagerReadArgs<
 	R: Deref,
 	MR: Deref,
 	L: Deref + Clone,
+	KV: KVStoreSync + Send + Sync + 'static,
 > where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16858,6 +16894,9 @@ pub struct ChannelManagerReadArgs<
 
 	/// LDK data directory
 	pub ldk_data_dir: PathBuf,
+
+	/// KVStore for RGB data persistence
+	pub rgb_kv_store: Arc<KV>,
 }
 
 impl<
@@ -16871,7 +16910,8 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref + Clone,
-	> ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L, KV>
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16891,7 +16931,7 @@ where
 		chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
 		config: UserConfig,
 		mut channel_monitors: Vec<&'a ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>,
-		ldk_data_dir: PathBuf,
+		ldk_data_dir: PathBuf, rgb_kv_store: Arc<KV>,
 	) -> Self {
 		Self {
 			entropy_source,
@@ -16908,6 +16948,7 @@ where
 				channel_monitors.drain(..).map(|monitor| (monitor.channel_id(), monitor)),
 			),
 			ldk_data_dir,
+			rgb_kv_store,
 		}
 	}
 }
@@ -16925,8 +16966,9 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref + Clone,
-	> ReadableArgs<ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>>
-	for (BlockHash, Arc<ChannelManager<M, T, ES, NS, SP, F, R, MR, L>>)
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ReadableArgs<ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L, KV>>
+	for (BlockHash, Arc<ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>>)
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16939,10 +16981,10 @@ where
 	L::Target: Logger,
 {
 	fn read<Reader: io::Read>(
-		reader: &mut Reader, args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>,
+		reader: &mut Reader, args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L, KV>,
 	) -> Result<Self, DecodeError> {
 		let (blockhash, chan_manager) =
-			<(BlockHash, ChannelManager<M, T, ES, NS, SP, F, R, MR, L>)>::read(reader, args)?;
+			<(BlockHash, ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>)>::read(reader, args)?;
 		Ok((blockhash, Arc::new(chan_manager)))
 	}
 }
@@ -16958,8 +17000,9 @@ impl<
 		R: Deref,
 		MR: Deref,
 		L: Deref + Clone,
-	> ReadableArgs<ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>>
-	for (BlockHash, ChannelManager<M, T, ES, NS, SP, F, R, MR, L>)
+		KV: KVStoreSync + Send + Sync + 'static,
+	> ReadableArgs<ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L, KV>>
+	for (BlockHash, ChannelManager<M, T, ES, NS, SP, F, R, MR, L, KV>)
 where
 	M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	T::Target: BroadcasterInterface,
@@ -16972,7 +17015,8 @@ where
 	L::Target: Logger,
 {
 	fn read<Reader: io::Read>(
-		reader: &mut Reader, mut args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>,
+		reader: &mut Reader,
+		mut args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L, KV>,
 	) -> Result<Self, DecodeError> {
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
@@ -16998,19 +17042,20 @@ where
 		let mut channel_id_set = hash_set_with_capacity(cmp::min(channel_count as usize, 128));
 		let mut per_peer_state = hash_map_with_capacity(cmp::min(
 			channel_count as usize,
-			MAX_ALLOC_SIZE / mem::size_of::<(PublicKey, Mutex<PeerState<SP>>)>(),
+			MAX_ALLOC_SIZE / mem::size_of::<(PublicKey, Mutex<PeerState<SP, KV>>)>(),
 		));
 		let mut short_to_chan_info = hash_map_with_capacity(cmp::min(channel_count as usize, 128));
 		let mut channel_closures = VecDeque::new();
 		let mut close_background_events = Vec::new();
 		for _ in 0..channel_count {
-			let mut channel: FundedChannel<SP> = FundedChannel::read(
+			let mut channel: FundedChannel<SP, KV> = FundedChannel::read(
 				reader,
 				(
 					&args.entropy_source,
 					&args.signer_provider,
 					&provided_channel_type_features(&args.config),
 					args.ldk_data_dir.clone(),
+					Arc::clone(&args.rgb_kv_store),
 				),
 			)?;
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17440,8 +17485,10 @@ where
 			}
 			pending_outbound_payments = Some(outbounds);
 		}
-		let pending_outbounds =
-			OutboundPayments::new(pending_outbound_payments.unwrap(), args.ldk_data_dir.clone());
+		let pending_outbounds = OutboundPayments::new(
+			pending_outbound_payments.unwrap(),
+			Arc::clone(&args.rgb_kv_store),
+		);
 
 		for (peer_pubkey, peer_storage) in peer_storage_dir {
 			if let Some(peer_state) = per_peer_state.get_mut(&peer_pubkey) {
@@ -18384,6 +18431,7 @@ where
 			testing_dnssec_proof_offer_resolution_override: Mutex::new(new_hash_map()),
 
 			ldk_data_dir: args.ldk_data_dir,
+			rgb_kv_store: args.rgb_kv_store,
 		};
 
 		let mut processed_claims: HashSet<Vec<MPPClaimHTLCSource>> = new_hash_set();
