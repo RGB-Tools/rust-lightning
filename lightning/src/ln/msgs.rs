@@ -3397,14 +3397,15 @@ impl_writeable_msg!(UpdateAddHTLC, {
 	amount_msat,
 	payment_hash,
 	cltv_expiry,
-	onion_routing_packet,
-	rgb_payment
+	onion_routing_packet
 }, {
 	(0, blinding_point, option),
 	(65537, skimmed_fee_msat, option),
 	// TODO: currently we may fail to read the `ChannelManager` if we write a new even TLV in this message
 	// and then downgrade. Once this is fixed, update the type here to match BOLTs PR 989.
 	(75537, hold_htlc, option),
+	// odd type outside the range the BOLTs may assign, so that peers not supporting RGB ignore it
+	(85537, rgb_payment, option),
 });
 
 impl LengthReadable for OnionMessage {
@@ -4025,7 +4026,9 @@ impl Writeable for UnsignedChannelAnnouncement {
 		self.node_id_2.write(w)?;
 		self.bitcoin_key_1.write(w)?;
 		self.bitcoin_key_2.write(w)?;
-		self.contract_id.write(w)?;
+		if self.contract_id.is_some() {
+			self.contract_id.write(w)?;
+		}
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
 	}
@@ -4041,7 +4044,7 @@ impl LengthReadable for UnsignedChannelAnnouncement {
 			node_id_2: Readable::read(r)?,
 			bitcoin_key_1: Readable::read(r)?,
 			bitcoin_key_2: Readable::read(r)?,
-			contract_id: Readable::read(r)?,
+			contract_id: if r.remaining_bytes() > 0 { Readable::read(r)? } else { None },
 			excess_data: read_to_end(r)?,
 		})
 	}
@@ -4084,7 +4087,9 @@ impl Writeable for UnsignedChannelUpdate {
 		self.fee_base_msat.write(w)?;
 		self.fee_proportional_millionths.write(w)?;
 		self.htlc_maximum_msat.write(w)?;
-		self.htlc_maximum_rgb.write(w)?;
+		if self.htlc_maximum_rgb > 0 {
+			self.htlc_maximum_rgb.write(w)?;
+		}
 		w.write_all(&self.excess_data[..])?;
 		Ok(())
 	}
@@ -4103,7 +4108,7 @@ impl LengthReadable for UnsignedChannelUpdate {
 			fee_base_msat: Readable::read(r)?,
 			fee_proportional_millionths: Readable::read(r)?,
 			htlc_maximum_msat: Readable::read(r)?,
-			htlc_maximum_rgb: Readable::read(r)?,
+			htlc_maximum_rgb: if r.remaining_bytes() >= 8 { Readable::read(r)? } else { 0 },
 			excess_data: read_to_end(r)?,
 		};
 		if res.message_flags & 1 != 1 {
@@ -4715,6 +4720,7 @@ mod tests {
 			node_id_2: NodeId::from_pubkey(&pubkey_2),
 			bitcoin_key_1: NodeId::from_pubkey(&pubkey_3),
 			bitcoin_key_2: NodeId::from_pubkey(&pubkey_4),
+			contract_id: None,
 			excess_data: if excess_data {
 				vec![10, 0, 0, 20, 0, 0, 30, 0, 0, 40]
 			} else {
@@ -4913,6 +4919,7 @@ mod tests {
 			cltv_expiry_delta: 144,
 			htlc_minimum_msat: 1000000,
 			htlc_maximum_msat: 131355275467161,
+			htlc_maximum_rgb: 0x0000777788889999,
 			fee_base_msat: 10000,
 			fee_proportional_millionths: 20,
 			excess_data: if excess_data { vec![0, 0, 0, 0, 59, 154, 202, 0] } else { Vec::new() },
