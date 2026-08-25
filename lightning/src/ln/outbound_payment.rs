@@ -27,7 +27,7 @@ use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::nonce::Nonce;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::rgb_utils::{
-	filter_first_hops, get_rgb_payment_info_path, is_payment_rgb, parse_rgb_payment_info,
+	filter_first_hops, get_rgb_payment_info_path, is_payment_rgb_out, parse_rgb_payment_info,
 };
 use crate::routing::router::{
 	BlindedTail, InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters,
@@ -1049,7 +1049,7 @@ impl OutboundPayments {
 		}
 
 		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
-		let rgb_payment = is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+		let rgb_payment = is_payment_rgb_out(&self.ldk_data_dir, &payment_hash).then(|| {
 			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
 		});
 		let mut route_params = RouteParameters::from_payment_params_and_value(
@@ -1569,7 +1569,7 @@ impl OutboundPayments {
 		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
 	{
 		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
-		is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+		is_payment_rgb_out(&self.ldk_data_dir, &payment_hash).then(|| {
 			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
 		});
 		let route = self.find_initial_route(
@@ -1626,7 +1626,7 @@ impl OutboundPayments {
 		}
 
 		let mut filtered_first_hops = first_hops.into_iter().collect::<Vec<_>>();
-		is_payment_rgb(&self.ldk_data_dir, &payment_hash).then(|| {
+		is_payment_rgb_out(&self.ldk_data_dir, &payment_hash).then(|| {
 			filter_first_hops(&self.ldk_data_dir, &payment_hash, &mut filtered_first_hops)
 		});
 

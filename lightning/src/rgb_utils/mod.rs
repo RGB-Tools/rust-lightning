@@ -742,10 +742,9 @@ pub(crate) fn update_rgb_channel_amount_pending(
 	)
 }
 
-/// Whether the payment is colored
-pub(crate) fn is_payment_rgb(ldk_data_dir: &Path, payment_hash: &PaymentHash) -> bool {
+/// Whether the outbound payment is colored.
+pub(crate) fn is_payment_rgb_out(ldk_data_dir: &Path, payment_hash: &PaymentHash) -> bool {
 	get_rgb_payment_info_path(payment_hash, ldk_data_dir, false).exists()
-		|| get_rgb_payment_info_path(payment_hash, ldk_data_dir, true).exists()
 }
 
 /// Detect the contract ID of the payment and then filter hops based on contract ID and amount
