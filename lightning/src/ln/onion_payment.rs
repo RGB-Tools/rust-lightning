@@ -24,6 +24,7 @@ use crate::sign::{NodeSigner, Recipient};
 use crate::types::features::BlindedHopFeatures;
 use crate::types::payment::PaymentHash;
 use crate::util::logger::Logger;
+use crate::util::scid_utils::fake_scid;
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -90,6 +91,41 @@ enum RoutingInfo {
 		shared_secret: SharedSecret,
 		current_path_key: Option<PublicKey>,
 	},
+}
+
+/// Checks that the RGB assets a forwarded HTLC carries out are covered by the RGB assets it carried
+/// in.
+///
+/// Bitcoin amounts are protected on the forwarding path by the HTLC amount/fee checks, but the RGB
+/// amount and contract travel separately: the incoming one in `update_add_htlc` and the outgoing one
+/// in the sender-controlled onion payload. Without this check the onion could ask us to forward more
+/// of an asset (or a different asset) than we received, which we would pay out of our own channel
+/// balance. Both sides must either carry no RGB at all, or carry the same contract with
+/// `outgoing <= incoming`.
+fn check_forwarded_rgb(
+	ingoing_rgb_payment: Option<(ContractId, u64)>, outgoing_rgb_payment: Option<(ContractId, u64)>,
+) -> Result<(), InboundHTLCErr> {
+	match (ingoing_rgb_payment, outgoing_rgb_payment) {
+		(None, None) => Ok(()),
+		(Some((in_contract, in_amount)), Some((out_contract, out_amount)))
+			if in_contract == out_contract =>
+		{
+			if out_amount <= in_amount {
+				Ok(())
+			} else {
+				Err(InboundHTLCErr {
+					reason: LocalHTLCFailureReason::RgbForwardNotCoveredByIncoming,
+					err_data: Vec::new(),
+					msg: "The forwarded RGB amount exceeds the incoming RGB amount",
+				})
+			}
+		},
+		_ => Err(InboundHTLCErr {
+			reason: LocalHTLCFailureReason::RgbForwardNotCoveredByIncoming,
+			err_data: Vec::new(),
+			msg: "The forwarded RGB asset doesn't match the incoming one",
+		}),
+	}
 }
 
 #[rustfmt::skip]
@@ -183,6 +219,23 @@ pub(super) fn create_fwd_pending_htlc_info(
 			)
 		},
 	};
+
+	// Swaps are the one case where the assets on the two sides are meant to differ. They are marked by
+	// the swap bit of the next hop's short channel id and are intercepted and checked against the
+	// swap the node agreed to, so only non-swap forwards are held to "outgoing is covered by incoming".
+	//
+	// The swap bit is chosen by the sender and nothing here enforces anything for swaps: skipping the
+	// check is only safe if the node's `HTLCIntercepted` handler fails every HTLC that doesn't match a
+	// swap the node agreed to, including the RGB payment it is asked to forward.
+	let is_swap = match &routing_info {
+		RoutingInfo::Direct { short_channel_id, .. } => {
+			fake_scid::is_valid_swap(*short_channel_id)
+		},
+		_ => false,
+	};
+	if !is_swap {
+		check_forwarded_rgb(msg.rgb_payment, outgoing_rgb_payment)?;
+	}
 
 	let routing = match routing_info {
 		RoutingInfo::Direct { short_channel_id, new_packet_bytes, next_hop_hmac } => {
