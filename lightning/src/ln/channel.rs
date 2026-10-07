@@ -9843,6 +9843,22 @@ where
 
 		for htlc in self.context.pending_outbound_htlcs.iter() {
 			if let &OutboundHTLCState::LocalAnnounced(ref onion_packet) = &htlc.state {
+				#[cfg(any(test, feature = "_rln_test_hooks"))]
+				let rgb_payment = match (
+					htlc.rgb_payment,
+					&*super::channelmanager::FORCE_UPDATE_ADD_HTLC_RGB_CONTRACT_TO_PEER
+						.lock()
+						.unwrap(),
+				) {
+					(Some((_, amount)), Some((peer, contract_id)))
+						if *peer == self.context.counterparty_node_id =>
+					{
+						Some((*contract_id, amount))
+					},
+					_ => htlc.rgb_payment,
+				};
+				#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+				let rgb_payment = htlc.rgb_payment;
 				update_add_htlcs.push(msgs::UpdateAddHTLC {
 					channel_id: self.context.channel_id(),
 					htlc_id: htlc.htlc_id,
@@ -9853,7 +9869,7 @@ where
 					skimmed_fee_msat: htlc.skimmed_fee_msat,
 					blinding_point: htlc.blinding_point,
 					hold_htlc: htlc.hold_htlc,
-					rgb_payment: htlc.rgb_payment,
+					rgb_payment,
 				});
 			}
 		}
