@@ -209,6 +209,37 @@ use crate::ln::script::ShutdownScript;
 #[cfg(any(test, feature = "_rln_test_hooks"))]
 pub static DROP_FUNDING_SIGNED_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
+/// Test-only hook: if set to a node pubkey and an optional RGB payment, that sender puts the given
+/// RGB payment (or none, for `None`) in its first hop's `update_add_htlc` while leaving the rest of
+/// the onion payloads unchanged.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static FORCE_FIRST_HOP_RGB_PAYMENT_ON_NODE: Mutex<
+	Option<(PublicKey, Option<(ContractId, u64)>)>,
+> = Mutex::new(None);
+
+/// RGB payment info of payments sent while [`FORCE_FIRST_HOP_RGB_PAYMENT_ON_NODE`] is set. That hook
+/// deletes the sender's payment info files, so this keeps retries of the same payment building the
+/// same onion, as a real attacker's node would.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+static FORCED_FIRST_HOP_RGB_PAYMENT_INFO: Mutex<
+	Vec<(PaymentHash, crate::rgb_utils::RgbPaymentInfo)>,
+> = Mutex::new(Vec::new());
+
+/// Test-only hook: if set to a node pubkey and an RGB payment, that sender puts the given RGB
+/// payment on the second hop of the paths it sends. The first hop's `update_add_htlc` is left
+/// untouched, so the first hop's onion payload, which carries the RGB payment to forward, asks it
+/// to forward something other than what it received (more of the asset, or a different asset).
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static FORCE_SECOND_HOP_RGB_PAYMENT_ON_NODE: Mutex<Option<(PublicKey, ContractId, u64)>> =
+	Mutex::new(None);
+
+/// Test-only hook: if set, every `update_add_htlc` we send to the given peer that carries an RGB
+/// payment has its contract replaced with the given one, as a patched sender node could do. The
+/// amount, the onion and our own commitment are left untouched.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static FORCE_UPDATE_ADD_HTLC_RGB_CONTRACT_TO_PEER: Mutex<Option<(PublicKey, ContractId)>> =
+	Mutex::new(None);
+
 // We hold various information about HTLC relay in the HTLC objects in Channel itself:
 //
 // Upon receipt of an HTLC from a peer, we'll give it a PendingHTLCStatus indicating if it should
@@ -5296,12 +5327,66 @@ where
 		} else {
 			None
 		};
+		#[cfg(any(test, feature = "_rln_test_hooks"))]
+		let forced_first_hop_rgb_payment = FORCE_FIRST_HOP_RGB_PAYMENT_ON_NODE.lock().unwrap().clone();
+		#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+		let forced_first_hop_rgb_payment: Option<(PublicKey, Option<(ContractId, u64)>)> = None;
+		#[cfg(any(test, feature = "_rln_test_hooks"))]
+		let needs_rgb_modification = match &forced_first_hop_rgb_payment {
+			Some((target_node_id, _)) if *target_node_id == self.get_our_node_id() => {
+				let mut stash = FORCED_FIRST_HOP_RGB_PAYMENT_INFO.lock().unwrap();
+				match needs_rgb_modification {
+					Some(info) => {
+						stash.retain(|(hash, _)| hash != payment_hash);
+						stash.push((*payment_hash, info.clone()));
+						Some(info)
+					},
+					None => {
+						stash.iter().find(|(hash, _)| hash == payment_hash).map(|(_, i)| i.clone())
+					},
+				}
+			},
+			_ => needs_rgb_modification,
+		};
+		#[cfg(any(test, feature = "_rln_test_hooks"))]
+		let forced_second_hop_rgb_payment = FORCE_SECOND_HOP_RGB_PAYMENT_ON_NODE.lock().unwrap().clone();
+		#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+		let forced_second_hop_rgb_payment: Option<(PublicKey, ContractId, u64)> = None;
+
 		let modified_path;
-		let path = if let Some(rgb_payment_info) = needs_rgb_modification {
+		let path = if needs_rgb_modification.is_some()
+			|| forced_first_hop_rgb_payment.is_some()
+			|| forced_second_hop_rgb_payment.is_some()
+		{
 			modified_path = {
 				let mut p = path.clone();
-				for hop in &mut p.hops {
-					hop.rgb_payment = Some((rgb_payment_info.contract_id, rgb_payment_info.amount));
+				if let Some(rgb_payment_info) = needs_rgb_modification {
+					for hop in &mut p.hops {
+						hop.rgb_payment =
+							Some((rgb_payment_info.contract_id, rgb_payment_info.amount));
+					}
+				}
+				if let Some((target_node_id, forced_payment)) = forced_first_hop_rgb_payment {
+					if target_node_id == self.get_our_node_id() && !p.hops.is_empty() {
+						p.hops[0].rgb_payment = forced_payment;
+						// On this branch the commitment is colored from the sender's on-disk
+						// RGB payment info (see color_commitment), so a wire value that
+						// disagrees with that file fails commitment signature verification
+						// before the HTLC can be forwarded. A real attacker controls their
+						// own node and keeps the two consistent; drop the files to simulate
+						// that, letting commitment coloring fall back to the wire value.
+						let outbound_path =
+							get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
+						let mut pending_path = outbound_path.clone();
+						pending_path.set_extension("outbound_pending");
+						let _ = std::fs::remove_file(outbound_path);
+						let _ = std::fs::remove_file(pending_path);
+					}
+				}
+				if let Some((target_node_id, contract_id, amount)) = forced_second_hop_rgb_payment {
+					if target_node_id == self.get_our_node_id() && p.hops.len() > 1 {
+						p.hops[1].rgb_payment = Some((contract_id, amount));
+					}
 				}
 				p
 			};
