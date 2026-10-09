@@ -7851,7 +7851,12 @@ where
 			return Err(ChannelError::close(format!("Remote side tried to send less than our minimum HTLC value. Lower limit: ({}). Actual: ({})", self.context.holder_htlc_minimum_msat, msg.amount_msat)));
 		}
 
-		if let Some((_, amount_rgb)) = msg.rgb_payment {
+		if let Some((contract_id, amount_rgb)) = msg.rgb_payment {
+			// Commitment coloring always uses the channel's own asset, so a wire contract that
+			// differs from it would let the sender pay with one asset while claiming another.
+			if self.funding.contract_id() != Some(contract_id) {
+				return Err(ChannelError::close("Remote side sent an HTLC with an RGB asset that doesn't match this channel".to_owned()));
+			}
 			if amount_rgb > self.context.get_remote_rgb_amount() {
 				return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
 			}
@@ -12796,7 +12801,13 @@ where
 			));
 		}
 
-		if let Some((_, amount_rgb)) = rgb_payment {
+		if let Some((contract_id, amount_rgb)) = rgb_payment {
+			if self.funding.contract_id() != Some(contract_id) {
+				return Err((
+					LocalHTLCFailureReason::RgbAssetNotCarriedByChannel,
+					"Cannot send an RGB asset that doesn't match this channel".to_owned(),
+				));
+			}
 			let local_rgb_amount = self.context.get_local_rgb_amount();
 			if amount_rgb > local_rgb_amount {
 				return Err((
