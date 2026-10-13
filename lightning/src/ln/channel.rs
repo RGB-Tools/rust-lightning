@@ -7851,7 +7851,12 @@ where
 			return Err(ChannelError::close(format!("Remote side tried to send less than our minimum HTLC value. Lower limit: ({}). Actual: ({})", self.context.holder_htlc_minimum_msat, msg.amount_msat)));
 		}
 
-		if let Some((_, amount_rgb)) = msg.rgb_payment {
+		if let Some((contract_id, amount_rgb)) = msg.rgb_payment {
+			// Commitment coloring always uses the channel's own asset, so a wire contract that
+			// differs from it would let the sender pay with one asset while claiming another.
+			if self.funding.contract_id() != Some(contract_id) {
+				return Err(ChannelError::close("Remote side sent an HTLC with an RGB asset that doesn't match this channel".to_owned()));
+			}
 			if amount_rgb > self.context.get_remote_rgb_amount() {
 				return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
 			}
@@ -9843,6 +9848,22 @@ where
 
 		for htlc in self.context.pending_outbound_htlcs.iter() {
 			if let &OutboundHTLCState::LocalAnnounced(ref onion_packet) = &htlc.state {
+				#[cfg(any(test, feature = "_rln_test_hooks"))]
+				let rgb_payment = match (
+					htlc.rgb_payment,
+					&*super::channelmanager::FORCE_UPDATE_ADD_HTLC_RGB_CONTRACT_TO_PEER
+						.lock()
+						.unwrap(),
+				) {
+					(Some((_, amount)), Some((peer, contract_id)))
+						if *peer == self.context.counterparty_node_id =>
+					{
+						Some((*contract_id, amount))
+					},
+					_ => htlc.rgb_payment,
+				};
+				#[cfg(not(any(test, feature = "_rln_test_hooks")))]
+				let rgb_payment = htlc.rgb_payment;
 				update_add_htlcs.push(msgs::UpdateAddHTLC {
 					channel_id: self.context.channel_id(),
 					htlc_id: htlc.htlc_id,
@@ -9853,7 +9874,7 @@ where
 					skimmed_fee_msat: htlc.skimmed_fee_msat,
 					blinding_point: htlc.blinding_point,
 					hold_htlc: htlc.hold_htlc,
-					rgb_payment: htlc.rgb_payment,
+					rgb_payment,
 				});
 			}
 		}
@@ -12780,7 +12801,13 @@ where
 			));
 		}
 
-		if let Some((_, amount_rgb)) = rgb_payment {
+		if let Some((contract_id, amount_rgb)) = rgb_payment {
+			if self.funding.contract_id() != Some(contract_id) {
+				return Err((
+					LocalHTLCFailureReason::RgbAssetNotCarriedByChannel,
+					"Cannot send an RGB asset that doesn't match this channel".to_owned(),
+				));
+			}
 			let local_rgb_amount = self.context.get_local_rgb_amount();
 			if amount_rgb > local_rgb_amount {
 				return Err((
