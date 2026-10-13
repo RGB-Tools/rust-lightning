@@ -1755,7 +1755,8 @@ pub enum LocalHTLCFailureReason {
 	PeerOffline,
 	/// The HTLC was failed because the channel balance was overdrawn.
 	ChannelBalanceOverdrawn,
-	/// The HTLC was failed because the forarding node didn't send what we were expecting.
+	/// The HTLC was failed because the previous hop didn't send what we were expecting for the final
+	/// node, i.e. the RGB payment it carries doesn't match what the sender asked for.
 	RgbSentUnexpected,
 	/// The HTLC's RGB amount is less than the amount specified by the sender.
 	///
@@ -1768,6 +1769,16 @@ pub enum LocalHTLCFailureReason {
 	/// we have reached the counterparty's in-flight limits, or the HTLC exceeds our advertised
 	/// maximum accepted HTLC size.
 	RgbHTLCMaximum,
+	/// The HTLC was failed because the RGB payment the onion asks us to forward isn't covered by the
+	/// RGB payment the incoming HTLC carries: it is for a different asset or for a larger amount.
+	///
+	/// This is reported by a forwarding node about the onion it received, so unlike
+	/// [`Self::RgbFinalIncorrectHTLCAmount`] it doesn't say anything about the previous hop's
+	/// behaviour, only that the payload it was handed is invalid.
+	RgbForwardNotCoveredByIncoming,
+	/// The HTLC was failed because the channel we would forward it over isn't colored with the RGB
+	/// asset the HTLC is for, so it can't carry it.
+	RgbAssetNotCarriedByChannel,
 }
 
 impl LocalHTLCFailureReason {
@@ -1788,6 +1799,7 @@ impl LocalHTLCFailureReason {
 			| Self::HTLCMinimum
 			| Self::HTLCMaximum
 			| Self::RgbHTLCMaximum
+			| Self::RgbAssetNotCarriedByChannel
 			| Self::PeerOffline
 			| Self::ChannelBalanceOverdrawn => UPDATE | 7,
 			Self::PermanentChannelFailure | Self::ChannelClosed | Self::OnChainTimeout => PERM | 8,
@@ -1809,7 +1821,9 @@ impl LocalHTLCFailureReason {
 			| Self::RgbFinalIncorrectHTLCAmount => 19,
 			Self::ChannelDisabled => UPDATE | 20,
 			Self::CLTVExpiryTooFar => 21,
-			Self::InvalidOnionPayload | Self::InvalidTrampolinePayload => PERM | 22,
+			Self::InvalidOnionPayload
+			| Self::InvalidTrampolinePayload
+			| Self::RgbForwardNotCoveredByIncoming => PERM | 22,
 			Self::MPPTimeout => 23,
 			Self::InvalidOnionBlinding => BADONION | PERM | 24,
 			Self::UnknownFailureCode { code } => *code,
@@ -1974,7 +1988,9 @@ ser_failure_reasons!(
 	(42, ChannelBalanceOverdrawn),
 	(43, RgbSentUnexpected),
 	(44, RgbFinalIncorrectHTLCAmount),
-	(45, RgbHTLCMaximum)
+	(45, RgbHTLCMaximum),
+	(46, RgbForwardNotCoveredByIncoming),
+	(47, RgbAssetNotCarriedByChannel)
 );
 
 impl From<&HTLCFailReason> for HTLCHandlingFailureReason {
@@ -2091,6 +2107,7 @@ impl HTLCFailReason {
 			| LocalHTLCFailureReason::HTLCMinimum
 			| LocalHTLCFailureReason::HTLCMaximum
 			| LocalHTLCFailureReason::RgbHTLCMaximum
+			| LocalHTLCFailureReason::RgbAssetNotCarriedByChannel
 			| LocalHTLCFailureReason::PeerOffline
 			| LocalHTLCFailureReason::ChannelBalanceOverdrawn => {
 				debug_assert_eq!(
@@ -2136,7 +2153,8 @@ impl HTLCFailReason {
 			),
 			LocalHTLCFailureReason::CLTVExpiryTooFar => debug_assert!(data.is_empty()),
 			LocalHTLCFailureReason::InvalidOnionPayload
-			| LocalHTLCFailureReason::InvalidTrampolinePayload => debug_assert!(data.len() <= 11),
+			| LocalHTLCFailureReason::InvalidTrampolinePayload
+			| LocalHTLCFailureReason::RgbForwardNotCoveredByIncoming => debug_assert!(data.len() <= 11),
 			LocalHTLCFailureReason::MPPTimeout => debug_assert!(data.is_empty()),
 			LocalHTLCFailureReason::InvalidOnionBlinding => debug_assert_eq!(data.len(), 32),
 			LocalHTLCFailureReason::UnknownFailureCode { code } => {
