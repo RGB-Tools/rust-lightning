@@ -3183,7 +3183,7 @@ where
 			holder_commitment_point.next_transaction_number(), &holder_commitment_point.next_point(),
 			true, false, logger);
 		if self.context().is_colored() {
-			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, false).expect("successful commitment coloring");
+			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, false)?;
 		}
 		let initial_commitment_tx = commitment_data.tx;
 		let trusted_tx = initial_commitment_tx.trust();
@@ -3227,7 +3227,7 @@ where
 			context.counterparty_next_commitment_transaction_number,
 			&context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 		if self.context().is_colored() {
-			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, true).unwrap();
+			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, true)?;
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
@@ -3287,7 +3287,7 @@ where
 			funding.get_holder_selected_contest_delay(), &context.destination_script,
 			&funding.channel_transaction_parameters, funding.is_outbound(), obscure_factor,
 			holder_commitment_tx, best_block, context.counterparty_node_id, context.channel_id(),
-			context.is_manual_broadcast,
+			context.is_manual_broadcast, Some(context.ldk_data_dir.to_string_lossy().into_owned()),
 		);
 		channel_monitor.provide_initial_counterparty_commitment_tx(
 			counterparty_initial_commitment_tx.clone(),
@@ -5048,8 +5048,7 @@ where
 			logger,
 		);
 		if self.is_colored() {
-			color_commitment(&self, &funding, &mut commitment_data.tx, false)
-				.expect("successful commitment coloring");
+			color_commitment(&self, &funding, &mut commitment_data.tx, false)?;
 		}
 		let commitment_txid = {
 			let trusted_tx = commitment_data.tx.trust();
@@ -6371,8 +6370,10 @@ where
 			logger,
 		);
 		if self.is_colored() {
-			color_commitment(&self, &funding, &mut commitment_data.tx, true)
-				.expect("successful commitment coloring");
+			if let Err(e) = color_commitment(&self, &funding, &mut commitment_data.tx, true) {
+				log_error!(logger, "RGB commitment coloring failed, aborting: {}", e);
+				return None;
+			}
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		match self.holder_signer {
@@ -7350,8 +7351,7 @@ where
 				&self.context.channel_id,
 				&mut closing_transaction,
 				&self.context.ldk_data_dir,
-			)
-			.expect("successful closing TX coloring");
+			)?;
 		}
 		Ok((closing_transaction, total_fee_satoshis))
 	}
@@ -8082,8 +8082,7 @@ where
 				&pending_splice_funding,
 				&mut counterparty_commitment_tx,
 				true,
-			)
-			.expect("successful commitment coloring");
+			)?;
 		}
 
 		{
@@ -9682,7 +9681,9 @@ where
 				self.context.counterparty_next_commitment_transaction_number + 1,
 				&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 			if self.context.is_colored() {
-				color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).expect("successful commitment coloring");
+				if let Err(e) = color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true) {
+					log_error!(logger, "RGB commitment coloring failed, skipping: {}", e);
+				}
 			}
 			let counterparty_initial_commitment_tx = commitment_data.tx;
 			self.context.get_funding_signed_msg(&self.funding.channel_transaction_parameters, logger, counterparty_initial_commitment_tx)
@@ -13004,7 +13005,9 @@ where
 			&self.context.counterparty_next_commitment_point.unwrap(), false, true, logger,
 		);
 		if self.context.is_colored() {
-			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).expect("successful commitment coloring");
+			if let Err(e) = color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true) {
+				log_error!(logger, "RGB commitment coloring failed, skipping: {}", e);
+			}
 		}
 		let counterparty_commitment_tx = commitment_data.tx;
 
@@ -13642,7 +13645,10 @@ where
 			self.context.counterparty_next_commitment_transaction_number,
 			&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 		if self.context.is_colored() {
-			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).unwrap();
+			if let Err(e) = color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true) {
+				log_error!(logger, "RGB commitment coloring failed, aborting: {}", e);
+				return None;
+			}
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		let signature = match &self.context.holder_signer {
