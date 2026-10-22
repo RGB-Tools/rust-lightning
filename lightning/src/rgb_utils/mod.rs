@@ -6,8 +6,9 @@
 compile_error!("at least one of the `electrum` and `esplora` features needs to be enabled");
 
 use crate::ln::chan_utils::{
-	get_countersigner_payment_script, BuiltCommitmentTransaction, ClosingTransaction,
-	CommitmentTransaction, HTLCOutputInCommitment,
+	commitment_tx_base_weight, get_countersigner_payment_script, BuiltCommitmentTransaction,
+	ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment,
+	COMMITMENT_TX_WEIGHT_PER_HTLC,
 };
 use crate::ln::channel::{ChannelContext, ChannelError, FundingScope};
 use crate::ln::channel_state::ChannelDetails;
@@ -219,6 +220,23 @@ pub fn op_return_position(tx: &Transaction) -> Option<usize> {
 /// Whether the transaction is colored (i.e. it has an OP_RETURN output)
 pub fn is_tx_colored(tx: &Transaction) -> bool {
 	op_return_position(tx).is_some()
+}
+
+/// Weight of the OP_RETURN output coloring a commitment transaction: 8-byte value, 1-byte script
+/// length and 34-byte `OP_RETURN OP_PUSHBYTES_32 <commitment>` script
+const COMMITMENT_TX_OP_RETURN_WEIGHT: u64 = 172;
+
+/// Get the fee cost of a colored commitment tx with a given number of HTLC outputs, which includes
+/// the weight of the OP_RETURN output.
+/// Note that num_htlcs should not include dust HTLCs.
+pub(crate) fn colored_commit_tx_fee_sat(
+	feerate_per_kw: u32, num_htlcs: usize, channel_type_features: &ChannelTypeFeatures,
+) -> u64 {
+	feerate_per_kw as u64
+		* (commitment_tx_base_weight(channel_type_features)
+			+ COMMITMENT_TX_OP_RETURN_WEIGHT
+			+ num_htlcs as u64 * COMMITMENT_TX_WEIGHT_PER_HTLC)
+		/ 1000
 }
 
 /// Color commitment transaction
