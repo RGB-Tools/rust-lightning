@@ -4398,6 +4398,25 @@ where
 		}
 	}
 
+	/// RGB amount locked in pending HTLCs offered by us
+	fn rgb_in_flight_outbound(&self) -> u64 {
+		self.pending_outbound_htlcs
+			.iter()
+			.filter_map(|htlc| htlc.rgb_payment.map(|(_, amount)| amount))
+			.fold(0u64, |acc, amount| acc.saturating_add(amount))
+	}
+
+	/// RGB amount locked in pending HTLCs offered by the counterparty. HTLCs we already resolved
+	/// no longer lock the counterparty's RGB, so they are skipped: counting them could make us
+	/// close the channel on a valid HTLC.
+	fn rgb_in_flight_inbound(&self) -> u64 {
+		self.pending_inbound_htlcs
+			.iter()
+			.filter(|htlc| !matches!(htlc.state, InboundHTLCState::LocalRemoved(_)))
+			.filter_map(|htlc| htlc.rgb_payment.map(|(_, amount)| amount))
+			.fold(0u64, |acc, amount| acc.saturating_add(amount))
+	}
+
 	/// Get the channel RGB capacity
 	pub fn get_rgb_capacity(&self) -> u64 {
 		self.get_local_rgb_amount() + self.get_remote_rgb_amount()
@@ -7851,9 +7870,17 @@ where
 			return Err(ChannelError::close(format!("Remote side tried to send less than our minimum HTLC value. Lower limit: ({}). Actual: ({})", self.context.holder_htlc_minimum_msat, msg.amount_msat)));
 		}
 
-		if let Some((_, amount_rgb)) = msg.rgb_payment {
-			if amount_rgb > self.context.get_remote_rgb_amount() {
-				return Err(ChannelError::close("Not enough RGB funds to accept this HTLC".to_owned()));
+		if let Some((contract_id, amount_rgb)) = msg.rgb_payment {
+			if self.funding.contract_id() != Some(contract_id) {
+				return Err(ChannelError::close("RGB HTLC asset does not match the channel asset".to_owned()));
+			}
+			let remote_rgb_amount = self.context.get_remote_rgb_amount();
+			let in_flight = self.context.rgb_in_flight_inbound();
+			if amount_rgb > remote_rgb_amount.saturating_sub(in_flight) {
+				return Err(ChannelError::close(format!(
+					"Not enough RGB funds to accept this HTLC: amount {}, remote balance {}, already in flight {}",
+					amount_rgb, remote_rgb_amount, in_flight
+				)));
 			}
 		}
 
@@ -12781,7 +12808,10 @@ where
 		}
 
 		if let Some((_, amount_rgb)) = rgb_payment {
-			let local_rgb_amount = self.context.get_local_rgb_amount();
+			let local_rgb_amount = self
+				.context
+				.get_local_rgb_amount()
+				.saturating_sub(self.context.rgb_in_flight_outbound());
 			if amount_rgb > local_rgb_amount {
 				return Err((
 					LocalHTLCFailureReason::RgbHTLCMaximum,
