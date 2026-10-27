@@ -209,6 +209,13 @@ use crate::ln::script::ShutdownScript;
 #[cfg(any(test, feature = "_rln_test_hooks"))]
 pub static DROP_FUNDING_SIGNED_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
+/// Test-only hook: if set to a node pubkey and RGB payment, that sender puts the given RGB payment
+/// on every hop of its outgoing payments (overriding the amount from the payment's RGB info), as
+/// a payer whose wire client is not bound by the invoice would.
+#[cfg(any(test, feature = "_rln_test_hooks"))]
+pub static FORCE_PATH_RGB_PAYMENT_ON_NODE: Mutex<Option<(PublicKey, ContractId, u64)>> =
+	Mutex::new(None);
+
 // We hold various information about HTLC relay in the HTLC objects in Channel itself:
 //
 // Upon receipt of an HTLC from a peer, we'll give it a PendingHTLCStatus indicating if it should
@@ -5295,6 +5302,28 @@ where
 			}
 		} else {
 			None
+		};
+		#[cfg(any(test, feature = "_rln_test_hooks"))]
+		let needs_rgb_modification = match FORCE_PATH_RGB_PAYMENT_ON_NODE.lock().unwrap().clone() {
+			Some((node_id, contract_id, amount))
+				if node_id == self.get_our_node_id() && needs_rgb_modification.is_some() =>
+			{
+				needs_rgb_modification.map(|mut info| {
+					info.contract_id = contract_id;
+					info.amount = amount;
+					// commitment coloring reads the file too, so keep it in sync with the HTLC
+					crate::rgb_utils::write_rgb_payment_info_file(
+						&self.ldk_data_dir,
+						&payment_hash,
+						contract_id,
+						amount,
+						info.swap_payment,
+						false,
+					);
+					info
+				})
+			},
+			_ => needs_rgb_modification,
 		};
 		let modified_path;
 		let path = if let Some(rgb_payment_info) = needs_rgb_modification {
