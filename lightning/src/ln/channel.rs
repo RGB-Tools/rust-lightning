@@ -78,9 +78,9 @@ use crate::ln::types::ChannelId;
 use crate::ln::LN_MAX_MSG_LEN;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::rgb_utils::{
-	color_closing, color_commitment, color_htlc, get_rgb_channel_info_path,
-	get_rgb_channel_info_pending, is_asset_known, parse_rgb_channel_info, rename_rgb_files,
-	set_counterparty_knows_asset, update_rgb_channel_amount_pending,
+	color_closing, color_commitment, color_htlc, get_rgb_channel_info_pending, is_asset_known,
+	set_counterparty_knows_asset, update_rgb_channel_amount_pending, update_rgb_channel_id,
+	RgbKvStoreExt,
 };
 use crate::routing::gossip::NodeId;
 use crate::sign::ecdsa::EcdsaChannelSigner;
@@ -102,8 +102,10 @@ use alloc::collections::{btree_map, BTreeMap};
 use crate::io;
 use crate::prelude::*;
 use crate::sign::type_resolver::ChannelSignerType;
+use crate::sync::Arc;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
+use crate::util::persist::KVStoreSync;
 use core::ops::Deref;
 use core::time::Duration;
 use core::{cmp, fmt, mem};
@@ -998,8 +1000,8 @@ impl<'a, 'b, L: Deref> WithChannelContext<'a, L>
 where
 	L::Target: Logger,
 {
-	pub(super) fn from<S: Deref>(
-		logger: &'a L, context: &'b ChannelContext<S>, payment_hash: Option<PaymentHash>,
+	pub(super) fn from<S: Deref, KV: KVStoreSync + Send + Sync + 'static>(
+		logger: &'a L, context: &'b ChannelContext<S, KV>, payment_hash: Option<PaymentHash>,
 	) -> Self
 	where
 		S::Target: SignerProvider,
@@ -1420,32 +1422,32 @@ impl_writeable_tlv_based!(PendingChannelMonitorUpdate, {
 
 /// A payment channel with a counterparty throughout its life-cycle, encapsulating negotiation and
 /// funding phases.
-pub(super) struct Channel<SP: Deref>
+pub(super) struct Channel<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
-	phase: ChannelPhase<SP>,
+	phase: ChannelPhase<SP, KV>,
 }
 
 /// The `ChannelPhase` enum describes the current phase in life of a lightning channel with each of
 /// its variants containing an appropriate channel struct.
-enum ChannelPhase<SP: Deref>
+enum ChannelPhase<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	Undefined,
-	UnfundedOutboundV1(OutboundV1Channel<SP>),
-	UnfundedInboundV1(InboundV1Channel<SP>),
-	UnfundedV2(PendingV2Channel<SP>),
-	Funded(FundedChannel<SP>),
+	UnfundedOutboundV1(OutboundV1Channel<SP, KV>),
+	UnfundedInboundV1(InboundV1Channel<SP, KV>),
+	UnfundedV2(PendingV2Channel<SP, KV>),
+	Funded(FundedChannel<SP, KV>),
 }
 
-impl<SP: Deref> Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: ChannelSigner,
 {
-	pub fn context(&self) -> &ChannelContext<SP> {
+	pub fn context(&self) -> &ChannelContext<SP, KV> {
 		match &self.phase {
 			ChannelPhase::Undefined => unreachable!(),
 			ChannelPhase::Funded(chan) => &chan.context,
@@ -1455,7 +1457,7 @@ where
 		}
 	}
 
-	pub fn context_mut(&mut self) -> &mut ChannelContext<SP> {
+	pub fn context_mut(&mut self) -> &mut ChannelContext<SP, KV> {
 		match &mut self.phase {
 			ChannelPhase::Undefined => unreachable!(),
 			ChannelPhase::Funded(chan) => &mut chan.context,
@@ -1486,7 +1488,7 @@ where
 		}
 	}
 
-	pub fn funding_and_context_mut(&mut self) -> (&FundingScope, &mut ChannelContext<SP>) {
+	pub fn funding_and_context_mut(&mut self) -> (&FundingScope, &mut ChannelContext<SP, KV>) {
 		match &mut self.phase {
 			ChannelPhase::Undefined => unreachable!(),
 			ChannelPhase::Funded(chan) => (&chan.funding, &mut chan.context),
@@ -1513,7 +1515,7 @@ where
 		matches!(self.phase, ChannelPhase::Funded(_))
 	}
 
-	pub fn as_funded(&self) -> Option<&FundedChannel<SP>> {
+	pub fn as_funded(&self) -> Option<&FundedChannel<SP, KV>> {
 		if let ChannelPhase::Funded(channel) = &self.phase {
 			Some(channel)
 		} else {
@@ -1521,7 +1523,7 @@ where
 		}
 	}
 
-	pub fn as_funded_mut(&mut self) -> Option<&mut FundedChannel<SP>> {
+	pub fn as_funded_mut(&mut self) -> Option<&mut FundedChannel<SP, KV>> {
 		if let ChannelPhase::Funded(channel) = &mut self.phase {
 			Some(channel)
 		} else {
@@ -1529,7 +1531,7 @@ where
 		}
 	}
 
-	pub fn as_unfunded_outbound_v1_mut(&mut self) -> Option<&mut OutboundV1Channel<SP>> {
+	pub fn as_unfunded_outbound_v1_mut(&mut self) -> Option<&mut OutboundV1Channel<SP, KV>> {
 		if let ChannelPhase::UnfundedOutboundV1(channel) = &mut self.phase {
 			Some(channel)
 		} else {
@@ -1561,7 +1563,7 @@ where
 		}
 	}
 
-	pub fn into_unfunded_outbound_v1(self) -> Result<OutboundV1Channel<SP>, Self> {
+	pub fn into_unfunded_outbound_v1(self) -> Result<OutboundV1Channel<SP, KV>, Self> {
 		if let ChannelPhase::UnfundedOutboundV1(channel) = self.phase {
 			Ok(channel)
 		} else {
@@ -1569,7 +1571,7 @@ where
 		}
 	}
 
-	pub fn into_unfunded_inbound_v1(self) -> Result<InboundV1Channel<SP>, Self> {
+	pub fn into_unfunded_inbound_v1(self) -> Result<InboundV1Channel<SP, KV>, Self> {
 		if let ChannelPhase::UnfundedInboundV1(channel) = self.phase {
 			Ok(channel)
 		} else {
@@ -1577,7 +1579,7 @@ where
 		}
 	}
 
-	pub fn as_unfunded_v2(&self) -> Option<&PendingV2Channel<SP>> {
+	pub fn as_unfunded_v2(&self) -> Option<&PendingV2Channel<SP, KV>> {
 		if let ChannelPhase::UnfundedV2(channel) = &self.phase {
 			Some(channel)
 		} else {
@@ -1989,7 +1991,7 @@ where
 	#[rustfmt::skip]
 	pub fn funding_signed<L: Deref>(
 		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, signer_provider: &SP, logger: &L
-	) -> Result<(&mut FundedChannel<SP>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), ChannelError>
+	) -> Result<(&mut FundedChannel<SP, KV>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), ChannelError>
 	where
 		L::Target: Logger
 	{
@@ -2244,42 +2246,46 @@ where
 	}
 }
 
-impl<SP: Deref> From<OutboundV1Channel<SP>> for Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> From<OutboundV1Channel<SP, KV>>
+	for Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: ChannelSigner,
 {
-	fn from(channel: OutboundV1Channel<SP>) -> Self {
+	fn from(channel: OutboundV1Channel<SP, KV>) -> Self {
 		Channel { phase: ChannelPhase::UnfundedOutboundV1(channel) }
 	}
 }
 
-impl<SP: Deref> From<InboundV1Channel<SP>> for Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> From<InboundV1Channel<SP, KV>>
+	for Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: ChannelSigner,
 {
-	fn from(channel: InboundV1Channel<SP>) -> Self {
+	fn from(channel: InboundV1Channel<SP, KV>) -> Self {
 		Channel { phase: ChannelPhase::UnfundedInboundV1(channel) }
 	}
 }
 
-impl<SP: Deref> From<PendingV2Channel<SP>> for Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> From<PendingV2Channel<SP, KV>>
+	for Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: ChannelSigner,
 {
-	fn from(channel: PendingV2Channel<SP>) -> Self {
+	fn from(channel: PendingV2Channel<SP, KV>) -> Self {
 		Channel { phase: ChannelPhase::UnfundedV2(channel) }
 	}
 }
 
-impl<SP: Deref> From<FundedChannel<SP>> for Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> From<FundedChannel<SP, KV>>
+	for Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: ChannelSigner,
 {
-	fn from(channel: FundedChannel<SP>) -> Self {
+	fn from(channel: FundedChannel<SP, KV>) -> Self {
 		Channel { phase: ChannelPhase::Funded(channel) }
 	}
 }
@@ -2551,10 +2557,10 @@ impl FundingScope {
 	}
 
 	/// Constructs a `FundingScope` for splicing a channel.
-	fn for_splice<SP: Deref>(
-		prev_funding: &Self, context: &ChannelContext<SP>, our_funding_contribution: SignedAmount,
-		their_funding_contribution: SignedAmount, counterparty_funding_pubkey: PublicKey,
-		our_new_holder_keys: ChannelPublicKeys,
+	fn for_splice<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>(
+		prev_funding: &Self, context: &ChannelContext<SP, KV>,
+		our_funding_contribution: SignedAmount, their_funding_contribution: SignedAmount,
+		counterparty_funding_pubkey: PublicKey, our_new_holder_keys: ChannelPublicKeys,
 	) -> Self
 	where
 		SP::Target: SignerProvider,
@@ -2760,8 +2766,8 @@ impl FundingNegotiation {
 }
 
 impl PendingFunding {
-	fn check_get_splice_locked<SP: Deref>(
-		&mut self, context: &ChannelContext<SP>, confirmed_funding_index: usize, height: u32,
+	fn check_get_splice_locked<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>(
+		&mut self, context: &ChannelContext<SP, KV>, confirmed_funding_index: usize, height: u32,
 	) -> Option<msgs::SpliceLocked>
 	where
 		SP::Target: SignerProvider,
@@ -2868,7 +2874,7 @@ impl<'a> From<&'a Transaction> for ConfirmedTransaction<'a> {
 }
 
 /// Contains everything about the channel including state, and various flags.
-pub(crate) struct ChannelContext<SP: Deref>
+pub(crate) struct ChannelContext<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
@@ -3155,17 +3161,20 @@ where
 	pub(super) is_colored: bool,
 
 	pub(crate) ldk_data_dir: PathBuf,
+
+	/// KVStore for RGB data persistence
+	pub(crate) rgb_kv_store: Arc<KV>,
 }
 
 /// A channel struct implementing this trait can receive an initial counterparty commitment
 /// transaction signature.
-trait InitialRemoteCommitmentReceiver<SP: Deref>
+trait InitialRemoteCommitmentReceiver<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
-	fn context(&self) -> &ChannelContext<SP>;
+	fn context(&self) -> &ChannelContext<SP, KV>;
 
-	fn context_mut(&mut self) -> &mut ChannelContext<SP>;
+	fn context_mut(&mut self) -> &mut ChannelContext<SP, KV>;
 
 	fn funding(&self) -> &FundingScope;
 
@@ -3255,7 +3264,7 @@ where
 		let temporary_channel_id = context.channel_id;
 		context.channel_id = channel_id;
 		if context.is_colored() {
-			rename_rgb_files(&context.channel_id, &temporary_channel_id, &context.ldk_data_dir);
+			update_rgb_channel_id(&context.channel_id, &temporary_channel_id, context.rgb_kv_store.as_ref());
 		}
 
 		assert!(!context.channel_state.is_monitor_update_in_progress()); // We have not had any monitor(s) yet to fail update!
@@ -3301,15 +3310,16 @@ where
 	fn is_v2_established(&self) -> bool;
 }
 
-impl<SP: Deref> InitialRemoteCommitmentReceiver<SP> for OutboundV1Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> InitialRemoteCommitmentReceiver<SP, KV>
+	for OutboundV1Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
-	fn context(&self) -> &ChannelContext<SP> {
+	fn context(&self) -> &ChannelContext<SP, KV> {
 		&self.context
 	}
 
-	fn context_mut(&mut self) -> &mut ChannelContext<SP> {
+	fn context_mut(&mut self) -> &mut ChannelContext<SP, KV> {
 		&mut self.context
 	}
 
@@ -3330,15 +3340,16 @@ where
 	}
 }
 
-impl<SP: Deref> InitialRemoteCommitmentReceiver<SP> for InboundV1Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> InitialRemoteCommitmentReceiver<SP, KV>
+	for InboundV1Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
-	fn context(&self) -> &ChannelContext<SP> {
+	fn context(&self) -> &ChannelContext<SP, KV> {
 		&self.context
 	}
 
-	fn context_mut(&mut self) -> &mut ChannelContext<SP> {
+	fn context_mut(&mut self) -> &mut ChannelContext<SP, KV> {
 		&mut self.context
 	}
 
@@ -3359,15 +3370,16 @@ where
 	}
 }
 
-impl<SP: Deref> InitialRemoteCommitmentReceiver<SP> for FundedChannel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> InitialRemoteCommitmentReceiver<SP, KV>
+	for FundedChannel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
-	fn context(&self) -> &ChannelContext<SP> {
+	fn context(&self) -> &ChannelContext<SP, KV> {
 		&self.context
 	}
 
-	fn context_mut(&mut self) -> &mut ChannelContext<SP> {
+	fn context_mut(&mut self) -> &mut ChannelContext<SP, KV> {
 		&mut self.context
 	}
 
@@ -3400,7 +3412,7 @@ where
 	}
 }
 
-impl<SP: Deref> ChannelContext<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> ChannelContext<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -3425,7 +3437,8 @@ where
 		open_channel_fields: msgs::CommonOpenChannelFields,
 		rgb_asset: Option<(ContractId, Option<u64>)>,
 		ldk_data_dir: PathBuf,
-	) -> Result<(FundingScope, ChannelContext<SP>), ChannelError>
+		rgb_kv_store: Arc<KV>,
+	) -> Result<(FundingScope, ChannelContext<SP, KV>), ChannelError>
 		where
 			ES::Target: EntropySource,
 			F::Target: FeeEstimator,
@@ -3467,7 +3480,7 @@ where
 		if open_channel_fields.htlc_minimum_msat >= full_channel_value_msat {
 			return Err(ChannelError::close(format!("Minimum htlc value ({}) was larger than full channel value ({})", open_channel_fields.htlc_minimum_msat, full_channel_value_msat)));
 		}
-		FundedChannel::<SP>::check_remote_fee(&channel_type, fee_estimator, open_channel_fields.commitment_feerate_sat_per_1000_weight, None, &&logger)?;
+		FundedChannel::<SP, KV>::check_remote_fee(&channel_type, fee_estimator, open_channel_fields.commitment_feerate_sat_per_1000_weight, None, &&logger)?;
 
 		let max_counterparty_selected_contest_delay = u16::min(config.channel_handshake_limits.their_to_self_delay, MAX_LOCAL_BREAKDOWN_TIMEOUT);
 		if open_channel_fields.to_self_delay > max_counterparty_selected_contest_delay {
@@ -3748,6 +3761,7 @@ where
 
 			is_colored: funding.is_colored(),
 			ldk_data_dir,
+			rgb_kv_store,
 		};
 
 		Ok((funding, channel_context))
@@ -3773,7 +3787,8 @@ where
 		_logger: L,
 		rgb_asset: Option<(ContractId, Option<u64>)>,
 		ldk_data_dir: PathBuf,
-	) -> Result<(FundingScope, ChannelContext<SP>), APIError>
+		rgb_kv_store: Arc<KV>,
+	) -> Result<(FundingScope, ChannelContext<SP, KV>), APIError>
 		where
 			ES::Target: EntropySource,
 			F::Target: FeeEstimator,
@@ -3992,6 +4007,7 @@ where
 
 			is_colored: funding.is_colored(),
 			ldk_data_dir,
+			rgb_kv_store,
 		};
 
 		Ok((funding, channel_context))
@@ -4370,13 +4386,8 @@ where
 
 	/// Get the channel local RGB amount
 	pub fn get_local_rgb_amount(&self) -> u64 {
-		let info_file_path = get_rgb_channel_info_path(
-			&self.channel_id.0.as_hex().to_string(),
-			&self.ldk_data_dir,
-			false,
-		);
-		if info_file_path.exists() {
-			let rgb_info = parse_rgb_channel_info(&info_file_path);
+		let channel_id_str = self.channel_id.0.as_hex().to_string();
+		if let Ok(rgb_info) = self.rgb_kv_store.read_rgb_channel_info(&channel_id_str, false) {
 			rgb_info.local_rgb_amount
 		} else {
 			0
@@ -4385,13 +4396,8 @@ where
 
 	/// Get the channel remote RGB amount
 	pub fn get_remote_rgb_amount(&self) -> u64 {
-		let info_file_path = get_rgb_channel_info_path(
-			&self.channel_id.0.as_hex().to_string(),
-			&self.ldk_data_dir,
-			false,
-		);
-		if info_file_path.exists() {
-			let rgb_info = parse_rgb_channel_info(&info_file_path);
+		let channel_id_str = self.channel_id.0.as_hex().to_string();
+		if let Ok(rgb_info) = self.rgb_kv_store.read_rgb_channel_info(&channel_id_str, false) {
 			rgb_info.remote_rgb_amount
 		} else {
 			0
@@ -5106,7 +5112,7 @@ where
 				&holder_keys.revocation_key,
 			);
 			if self.is_colored() {
-				color_htlc(&mut htlc_tx, htlc, &self.ldk_data_dir)
+				color_htlc(&mut htlc_tx, htlc, &self.ldk_data_dir, self.rgb_kv_store.as_ref())
 					.expect("successful htlc coloring");
 			}
 
@@ -6745,8 +6751,12 @@ pub(super) struct FundingNegotiationContext {
 impl FundingNegotiationContext {
 	/// Prepare and start interactive transaction negotiation.
 	/// If error occurs, it is caused by our side, not the counterparty.
-	fn into_interactive_tx_constructor<SP: Deref, ES: Deref>(
-		mut self, context: &ChannelContext<SP>, funding: &FundingScope, signer_provider: &SP,
+	fn into_interactive_tx_constructor<
+		SP: Deref,
+		ES: Deref,
+		KV: KVStoreSync + Send + Sync + 'static,
+	>(
+		mut self, context: &ChannelContext<SP, KV>, funding: &FundingScope, signer_provider: &SP,
 		entropy_source: &ES, holder_node_id: PublicKey,
 	) -> Result<InteractiveTxConstructor, NegotiationError>
 	where
@@ -6855,12 +6865,12 @@ impl FundingNegotiationContext {
 
 // Holder designates channel data owned for the benefit of the user client.
 // Counterparty designates channel data owned by the another channel participant entity.
-pub(super) struct FundedChannel<SP: Deref>
+pub(super) struct FundedChannel<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	pub funding: FundingScope,
-	pub context: ChannelContext<SP>,
+	pub context: ChannelContext<SP, KV>,
 	holder_commitment_point: HolderCommitmentPoint,
 
 	/// Information about any pending splice candidates, including RBF attempts.
@@ -7038,12 +7048,12 @@ pub struct SpliceFundingPromotion {
 	pub discarded_funding: Vec<FundingInfo>,
 }
 
-impl<SP: Deref> FundedChannel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> FundedChannel<SP, KV>
 where
 	SP::Target: SignerProvider,
 	<SP::Target as SignerProvider>::EcdsaSigner: EcdsaChannelSigner,
 {
-	pub fn context(&self) -> &ChannelContext<SP> {
+	pub fn context(&self) -> &ChannelContext<SP, KV> {
 		&self.context
 	}
 
@@ -7350,6 +7360,7 @@ where
 				&self.context.channel_id,
 				&mut closing_transaction,
 				&self.context.ldk_data_dir,
+				self.context.rgb_kv_store.as_ref(),
 			)
 			.expect("successful closing TX coloring");
 		}
@@ -8949,7 +8960,7 @@ where
 				&self.context.channel_id,
 				rgb_offered_htlc,
 				rgb_received_htlc,
-				&self.context.ldk_data_dir,
+				self.context.rgb_kv_store.as_ref(),
 			);
 		}
 
@@ -9657,7 +9668,7 @@ where
 
 		core::iter::once(&self.funding)
 			.chain(self.pending_funding().iter())
-			.try_for_each(|funding| FundedChannel::<SP>::check_remote_fee(funding.get_channel_type(), fee_estimator, msg.feerate_per_kw, Some(self.context.feerate_per_kw), logger))?;
+			.try_for_each(|funding| FundedChannel::<SP, KV>::check_remote_fee(funding.get_channel_type(), fee_estimator, msg.feerate_per_kw, Some(self.context.feerate_per_kw), logger))?;
 
 		self.context.pending_update_fee = Some((msg.feerate_per_kw, FeeUpdateState::RemoteAnnounced));
 		self.context.update_time_counter += 1;
@@ -11763,7 +11774,7 @@ where
 		let were_node_one = node_id.as_slice() < counterparty_node_id.as_slice();
 
 		let contract_id = if self.context.is_colored() {
-			let (rgb_info, _) = get_rgb_channel_info_pending(&self.context.channel_id, &self.context.ldk_data_dir);
+			let rgb_info = get_rgb_channel_info_pending(&self.context.channel_id, self.context.rgb_kv_store.as_ref());
 			Some(rgb_info.contract_id)
 		} else {
 			None
@@ -12917,7 +12928,7 @@ where
 			}
 		}
 		if self.context.is_colored() && rgb_received_htlc > 0 {
-			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
+			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, self.context.rgb_kv_store.as_ref());
 		}
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {
@@ -13557,12 +13568,12 @@ where
 }
 
 /// A not-yet-funded outbound (from holder) channel using V1 channel establishment.
-pub(super) struct OutboundV1Channel<SP: Deref>
+pub(super) struct OutboundV1Channel<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	pub funding: FundingScope,
-	pub context: ChannelContext<SP>,
+	pub context: ChannelContext<SP, KV>,
 	pub unfunded_context: UnfundedChannelContext,
 	/// We tried to send an `open_channel` message but our commitment point wasn't ready.
 	/// This flag tells us we need to send it when we are retried once the
@@ -13570,7 +13581,7 @@ where
 	pub signer_pending_open_channel: bool,
 }
 
-impl<SP: Deref> OutboundV1Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> OutboundV1Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -13584,7 +13595,8 @@ where
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
 		outbound_scid_alias: u64, temporary_channel_id: Option<ChannelId>, logger: L, rgb_asset: Option<(ContractId, Option<u64>)>, ldk_data_dir: PathBuf,
-	) -> Result<OutboundV1Channel<SP>, APIError>
+		rgb_kv_store: Arc<KV>,
+	) -> Result<OutboundV1Channel<SP, KV>, APIError>
 	where ES::Target: EntropySource,
 	      F::Target: FeeEstimator,
 	      L::Target: Logger,
@@ -13623,6 +13635,7 @@ where
 			logger,
 			rgb_asset,
 			ldk_data_dir,
+			rgb_kv_store,
 		)?;
 		let unfunded_context = UnfundedChannelContext {
 			unfunded_channel_age_ticks: 0,
@@ -13706,7 +13719,7 @@ where
 		let temporary_channel_id = self.context.channel_id;
 		self.context.channel_id = ChannelId::v1_from_funding_outpoint(funding_txo);
 		if self.context.is_colored() {
-			rename_rgb_files(&self.context.channel_id, &temporary_channel_id, &self.context.ldk_data_dir);
+			update_rgb_channel_id(&self.context.channel_id, &temporary_channel_id, self.context.rgb_kv_store.as_ref());
 		}
 
 		// If the funding transaction is a coinbase transaction, we need to set the minimum depth to 100.
@@ -13821,7 +13834,10 @@ where
 		)?;
 
 		if self.funding.is_colored() && msg.known_asset {
-			set_counterparty_knows_asset(&self.context.channel_id, &self.context.ldk_data_dir);
+			set_counterparty_knows_asset(
+				&self.context.channel_id,
+				self.context.rgb_kv_store.as_ref(),
+			);
 		}
 
 		Ok(())
@@ -13832,7 +13848,7 @@ where
 	#[rustfmt::skip]
 	pub fn funding_signed<L: Deref>(
 		mut self, msg: &msgs::FundingSigned, best_block: BestBlock, signer_provider: &SP, logger: &L
-	) -> Result<(FundedChannel<SP>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), (OutboundV1Channel<SP>, ChannelError)>
+	) -> Result<(FundedChannel<SP, KV>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), (OutboundV1Channel<SP, KV>, ChannelError)>
 	where
 		L::Target: Logger
 	{
@@ -13913,12 +13929,12 @@ where
 }
 
 /// A not-yet-funded inbound (from counterparty) channel using V1 channel establishment.
-pub(super) struct InboundV1Channel<SP: Deref>
+pub(super) struct InboundV1Channel<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	pub funding: FundingScope,
-	pub context: ChannelContext<SP>,
+	pub context: ChannelContext<SP, KV>,
 	pub unfunded_context: UnfundedChannelContext,
 	pub signer_pending_accept_channel: bool,
 }
@@ -13954,7 +13970,7 @@ pub(super) fn channel_type_from_open_channel(
 	Ok(channel_type.clone())
 }
 
-impl<SP: Deref> InboundV1Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> InboundV1Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -13965,8 +13981,9 @@ where
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
-		current_chain_height: u32, logger: &L, is_0conf: bool, ldk_data_dir: PathBuf
-	) -> Result<InboundV1Channel<SP>, ChannelError>
+		current_chain_height: u32, logger: &L, is_0conf: bool, ldk_data_dir: PathBuf,
+		rgb_kv_store: Arc<KV>,
+	) -> Result<InboundV1Channel<SP, KV>, ChannelError>
 		where ES::Target: EntropySource,
 			  F::Target: FeeEstimator,
 			  L::Target: Logger,
@@ -14007,6 +14024,7 @@ where
 			msg.common_fields.clone(),
 			msg.rgb_asset,
 			ldk_data_dir,
+			rgb_kv_store,
 		)?;
 		let unfunded_context = UnfundedChannelContext {
 			unfunded_channel_age_ticks: 0,
@@ -14063,7 +14081,11 @@ where
 		let keys = self.funding.get_holder_pubkeys();
 
 		let known_asset = match self.funding.contract_id() {
-			Some(contract_id) => is_asset_known(contract_id, &self.context.ldk_data_dir),
+			Some(contract_id) => is_asset_known(
+				contract_id,
+				&self.context.ldk_data_dir,
+				self.context.rgb_kv_store.as_ref(),
+			),
 			None => false,
 		};
 
@@ -14112,7 +14134,7 @@ where
 	#[rustfmt::skip]
 	pub fn funding_created<L: Deref>(
 		mut self, msg: &msgs::FundingCreated, best_block: BestBlock, signer_provider: &SP, logger: &L
-	) -> Result<(FundedChannel<SP>, Option<msgs::FundingSigned>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), (Self, ChannelError)>
+	) -> Result<(FundedChannel<SP, KV>, Option<msgs::FundingSigned>, ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>), (Self, ChannelError)>
 	where
 		L::Target: Logger
 	{
@@ -14190,19 +14212,19 @@ where
 }
 
 // A not-yet-funded channel using V2 channel establishment.
-pub(super) struct PendingV2Channel<SP: Deref>
+pub(super) struct PendingV2Channel<SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
 where
 	SP::Target: SignerProvider,
 {
 	pub funding: FundingScope,
-	pub context: ChannelContext<SP>,
+	pub context: ChannelContext<SP, KV>,
 	pub unfunded_context: UnfundedChannelContext,
 	pub funding_negotiation_context: FundingNegotiationContext,
 	/// The current interactive transaction construction session under negotiation.
 	pub interactive_tx_constructor: Option<InteractiveTxConstructor>,
 }
 
-impl<SP: Deref> PendingV2Channel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> PendingV2Channel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -14213,7 +14235,7 @@ where
 		counterparty_node_id: PublicKey, their_features: &InitFeatures, funding_satoshis: u64,
 		funding_inputs: Vec<FundingTxInput>, user_id: u128, config: &UserConfig,
 		current_chain_height: u32, outbound_scid_alias: u64, funding_confirmation_target: ConfirmationTarget,
-		logger: L, ldk_data_dir: PathBuf,
+		logger: L, ldk_data_dir: PathBuf, rgb_kv_store: Arc<KV>,
 	) -> Result<Self, APIError>
 	where ES::Target: EntropySource,
 	      F::Target: FeeEstimator,
@@ -14256,6 +14278,7 @@ where
 			// ok to pass rgb_asset as None since this method is unused
 			None,
 			ldk_data_dir,
+			rgb_kv_store,
 		)?;
 		let unfunded_context = UnfundedChannelContext {
 			unfunded_channel_age_ticks: 0,
@@ -14365,7 +14388,7 @@ where
 		holder_node_id: PublicKey, counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannelV2,
 		user_id: u128, config: &UserConfig, current_chain_height: u32, logger: &L,
-		ldk_data_dir: PathBuf,
+		ldk_data_dir: PathBuf, rgb_kv_store: Arc<KV>,
 	) -> Result<Self, ChannelError>
 		where ES::Target: EntropySource,
 			  F::Target: FeeEstimator,
@@ -14412,6 +14435,7 @@ where
 			msg.common_fields.clone(),
 			None,
 			ldk_data_dir,
+			rgb_kv_store,
 		)?;
 		let channel_id = ChannelId::v2_from_revocation_basepoints(
 			&funding.get_holder_pubkeys().revocation_basepoint,
@@ -14629,7 +14653,7 @@ impl Readable for AnnouncementSigsState {
 	}
 }
 
-impl<SP: Deref> Writeable for FundedChannel<SP>
+impl<SP: Deref, KV: KVStoreSync + Send + Sync + 'static> Writeable for FundedChannel<SP, KV>
 where
 	SP::Target: SignerProvider,
 {
@@ -15103,16 +15127,17 @@ where
 	}
 }
 
-impl<'a, 'b, 'c, ES: Deref, SP: Deref>
-	ReadableArgs<(&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf)> for FundedChannel<SP>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref, KV: KVStoreSync + Send + Sync + 'static>
+	ReadableArgs<(&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<KV>)> for FundedChannel<SP, KV>
 where
 	ES::Target: EntropySource,
 	SP::Target: SignerProvider,
 {
 	fn read<R: io::Read>(
-		reader: &mut R, args: (&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf),
+		reader: &mut R, args: (&'a ES, &'b SP, &'c ChannelTypeFeatures, PathBuf, Arc<KV>),
 	) -> Result<Self, DecodeError> {
-		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir) = args;
+		let (entropy_source, signer_provider, our_supported_features, ldk_data_dir, rgb_kv_store) =
+			args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 		if ver <= 2 {
 			return Err(DecodeError::UnknownVersion);
@@ -15908,6 +15933,7 @@ where
 				interactive_tx_signing_session,
 				is_colored: rgb_asset.is_some(),
 				ldk_data_dir,
+				rgb_kv_store,
 			},
 			holder_commitment_point,
 			pending_splice,

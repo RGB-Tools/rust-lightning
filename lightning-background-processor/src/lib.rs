@@ -362,21 +362,51 @@ type DynMessageRouter = lightning::onion_message::messenger::DefaultMessageRoute
 	&'static (dyn EntropySource + Send + Sync),
 >;
 
+/// Placeholder [`lightning::util::persist::KVStoreSync`] used only to name the `Dyn*` alias types
+/// below, which are never instantiated.
+#[cfg(not(c_bindings))]
+#[doc(hidden)]
+pub struct UnusedKvStore;
+
+#[cfg(not(c_bindings))]
+impl lightning::util::persist::KVStoreSync for UnusedKvStore {
+	fn read(
+		&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str,
+	) -> Result<Vec<u8>, lightning::io::Error> {
+		unreachable!()
+	}
+	fn write(
+		&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str, _buf: Vec<u8>,
+	) -> Result<(), lightning::io::Error> {
+		unreachable!()
+	}
+	fn remove(
+		&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str, _lazy: bool,
+	) -> Result<(), lightning::io::Error> {
+		unreachable!()
+	}
+	fn list(
+		&self, _primary_namespace: &str, _secondary_namespace: &str,
+	) -> Result<Vec<String>, lightning::io::Error> {
+		unreachable!()
+	}
+}
+
 #[cfg(all(not(c_bindings), not(taproot)))]
-type DynSignerProvider = dyn lightning::sign::SignerProvider<EcdsaSigner = lightning::sign::InMemorySigner>
+type DynSignerProvider = dyn lightning::sign::SignerProvider<EcdsaSigner = lightning::sign::InMemorySigner<UnusedKvStore>>
 	+ Send
 	+ Sync;
 
 #[cfg(all(not(c_bindings), taproot))]
 type DynSignerProvider = (dyn lightning::sign::SignerProvider<
-	EcdsaSigner = lightning::sign::InMemorySigner,
-	TaprootSigner = lightning::sign::InMemorySigner,
+	EcdsaSigner = lightning::sign::InMemorySigner<UnusedKvStore>,
+	TaprootSigner = lightning::sign::InMemorySigner<UnusedKvStore>,
 > + Send
      + Sync);
 
 #[cfg(not(c_bindings))]
 type DynChannelManager = lightning::ln::channelmanager::ChannelManager<
-	&'static (dyn chain::Watch<lightning::sign::InMemorySigner> + Send + Sync),
+	&'static (dyn chain::Watch<lightning::sign::InMemorySigner<UnusedKvStore>> + Send + Sync),
 	&'static (dyn BroadcasterInterface + Send + Sync),
 	&'static (dyn EntropySource + Send + Sync),
 	&'static (dyn lightning::sign::NodeSigner + Send + Sync),
@@ -385,6 +415,7 @@ type DynChannelManager = lightning::ln::channelmanager::ChannelManager<
 	&'static DynRouter,
 	&'static DynMessageRouter,
 	&'static (dyn Logger + Send + Sync),
+	UnusedKvStore,
 >;
 
 /// When initializing a background processor without an onion messenger, this can be used to avoid

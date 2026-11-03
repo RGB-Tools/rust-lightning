@@ -21,6 +21,7 @@ use crate::sign::SignerProvider;
 use crate::types::features::{ChannelTypeFeatures, InitFeatures};
 use crate::types::payment::PaymentHash;
 use crate::util::config::ChannelConfig;
+use crate::util::persist::KVStoreSync;
 
 use core::ops::Deref;
 
@@ -530,8 +531,8 @@ impl ChannelDetails {
 		}
 	}
 
-	pub(super) fn from_channel<SP: Deref, F: Deref>(
-		channel: &Channel<SP>, best_block_height: u32, latest_features: InitFeatures,
+	pub(super) fn from_channel<SP: Deref, F: Deref, KV: KVStoreSync + Send + Sync + 'static>(
+		channel: &Channel<SP, KV>, best_block_height: u32, latest_features: InitFeatures,
 		fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> Self
 	where

@@ -190,6 +190,44 @@ pub trait KVStoreSync {
 	fn list(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> Result<Vec<String>, io::Error>;
+
+	/// Executes the given operations under `primary_namespace`.
+	///
+	/// The default implementation applies them sequentially; implementations backed by a
+	/// transactional store should override this to apply the whole batch atomically.
+	fn execute_batch(&self, primary_namespace: &str, ops: Vec<KvOp>) -> Result<(), io::Error> {
+		for op in ops {
+			match op {
+				KvOp::Write { secondary_namespace, key, value } => {
+					self.write(primary_namespace, &secondary_namespace, &key, value)?
+				},
+				KvOp::Remove { secondary_namespace, key } => {
+					self.remove(primary_namespace, &secondary_namespace, &key, false)?
+				},
+			}
+		}
+		Ok(())
+	}
+}
+
+/// A single operation for [`KVStoreSync::execute_batch`].
+pub enum KvOp {
+	/// Persists `value` under `secondary_namespace`/`key`.
+	Write {
+		/// The secondary namespace to write under.
+		secondary_namespace: String,
+		/// The key to write.
+		key: String,
+		/// The value to persist.
+		value: Vec<u8>,
+	},
+	/// Removes any data stored under `secondary_namespace`/`key`.
+	Remove {
+		/// The secondary namespace to remove from.
+		secondary_namespace: String,
+		/// The key to remove.
+		key: String,
+	},
 }
 
 /// A wrapper around a [`KVStoreSync`] that implements the [`KVStore`] trait. It is not necessary to use this type
