@@ -490,6 +490,12 @@ pub struct ChannelDetails {
 
 	/// The largest RGB value HTLC we currently will accept, for this channel.
 	pub inbound_htlc_maximum_rgb: u64,
+
+	/// Whether the channel was negotiated as an RGB (colored) channel.
+	///
+	/// Known from the first message (`open_channel`) on, so unlike the RGB channel info on disk it
+	/// is already set for a channel that is still being funded.
+	pub is_colored: bool,
 }
 
 impl ChannelDetails {
@@ -604,6 +610,7 @@ impl ChannelDetails {
 			pending_outbound_htlcs: context.get_pending_outbound_htlc_details(funding),
 			next_outbound_htlc_limit_rgb: context.get_local_rgb_amount(),
 			inbound_htlc_maximum_rgb: context.get_remote_rgb_amount(),
+			is_colored: context.is_colored(),
 		}
 	}
 }
@@ -649,6 +656,7 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	)),
 	(48, next_outbound_htlc_limit_rgb, required),
 	(50, inbound_htlc_maximum_rgb, required),
+	(52, is_colored, required),
 });
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
