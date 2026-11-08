@@ -221,6 +221,13 @@ pub fn is_tx_colored(tx: &Transaction) -> bool {
 	op_return_position(tx).is_some()
 }
 
+/// Test-only: a node whose `ldk_data_dir` path contains this substring leaves its commitments
+/// uncolored instead of coloring (and panicking when the funding output lacks the assets). Models
+/// a malicious funder that does not honestly color its commitment transactions.
+#[cfg(feature = "_rln_test_hooks")]
+pub static SKIP_COMMITMENT_COLORING_FOR_DIR: std::sync::Mutex<Option<String>> =
+	std::sync::Mutex::new(None);
+
 /// Color commitment transaction
 pub(crate) fn color_commitment<SP: Deref>(
 	channel_context: &ChannelContext<SP>, funding_scope: &FundingScope,
@@ -231,6 +238,13 @@ where
 {
 	let channel_id = &channel_context.channel_id;
 	let ldk_data_dir = channel_context.ldk_data_dir.as_path();
+
+	#[cfg(feature = "_rln_test_hooks")]
+	if let Some(dir) = SKIP_COMMITMENT_COLORING_FOR_DIR.lock().unwrap().as_ref() {
+		if ldk_data_dir.to_string_lossy().contains(dir.as_str()) {
+			return Ok(());
+		}
+	}
 
 	let commitment_tx = commitment_transaction.clone().built.transaction;
 
