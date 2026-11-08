@@ -896,7 +896,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		let channel = get_channel_ref!(nodes[0], nodes[1], per_peer_lock, peer_state_lock, chan.2);
 		let chan_signer = channel.as_funded().unwrap().get_signer();
 
-		let (commitment_tx, _stats) = SpecTxBuilder {}.build_commitment_transaction(
+		let (commitment_tx, _stats) = SpecTxBuilder::new(false).build_commitment_transaction(
 			false,
 			commitment_number,
 			&remote_point,

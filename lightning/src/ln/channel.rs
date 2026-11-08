@@ -3534,9 +3534,9 @@ where
 		// check if the funder's amount for the initial commitment tx is sufficient
 		// for full fee payment plus a few HTLCs to ensure the channel will be useful.
 		let funders_amount_msat = open_channel_fields.funding_satoshis * 1000 - msg_push_msat;
-		let commit_tx_fee_sat = SpecTxBuilder {}.commit_tx_fee_sat(open_channel_fields.commitment_feerate_sat_per_1000_weight, MIN_AFFORDABLE_HTLC_COUNT, &channel_type);
+		let commit_tx_fee_sat = SpecTxBuilder::new(rgb_asset.is_some()).commit_tx_fee_sat(open_channel_fields.commitment_feerate_sat_per_1000_weight, MIN_AFFORDABLE_HTLC_COUNT, &channel_type);
 		// Subtract any non-HTLC outputs from the remote balance
-		let (_, remote_balance_before_fee_msat) = SpecTxBuilder {}.subtract_non_htlc_outputs(false, value_to_self_msat, funders_amount_msat, &channel_type);
+		let (_, remote_balance_before_fee_msat) = SpecTxBuilder::new(rgb_asset.is_some()).subtract_non_htlc_outputs(false, value_to_self_msat, funders_amount_msat, &channel_type);
 		if remote_balance_before_fee_msat / 1000 < commit_tx_fee_sat {
 			return Err(ChannelError::close(format!("Funding amount ({} sats) can't even pay fee for initial commitment transaction fee of {} sats.", funders_amount_msat / 1000, commit_tx_fee_sat)));
 		}
@@ -3808,9 +3808,9 @@ where
 		);
 
 		let value_to_self_msat = channel_value_satoshis * 1000 - push_msat;
-		let commit_tx_fee_sat = SpecTxBuilder {}.commit_tx_fee_sat(commitment_feerate, MIN_AFFORDABLE_HTLC_COUNT, &channel_type);
+		let commit_tx_fee_sat = SpecTxBuilder::new(rgb_asset.is_some()).commit_tx_fee_sat(commitment_feerate, MIN_AFFORDABLE_HTLC_COUNT, &channel_type);
 		// Subtract any non-HTLC outputs from the local balance
-		let (local_balance_before_fee_msat, _) = SpecTxBuilder {}.subtract_non_htlc_outputs(
+		let (local_balance_before_fee_msat, _) = SpecTxBuilder::new(rgb_asset.is_some()).subtract_non_htlc_outputs(
 			true,
 			value_to_self_msat,
 			push_msat,
@@ -4724,7 +4724,7 @@ where
 		);
 		let next_value_to_self_msat = self.get_next_commitment_value_to_self_msat(true, funding);
 
-		let ret = SpecTxBuilder {}.get_next_commitment_stats(
+		let ret = SpecTxBuilder::new(funding.is_colored()).get_next_commitment_stats(
 			true,
 			funding.is_outbound(),
 			funding.get_value_satoshis(),
@@ -4746,7 +4746,7 @@ where
 					predicted_fee_sat: ret.commit_tx_fee_sat,
 				};
 			} else {
-				let predicted_stats = SpecTxBuilder {}
+				let predicted_stats = SpecTxBuilder::new(funding.is_colored())
 					.get_next_commitment_stats(
 						true,
 						funding.is_outbound(),
@@ -4783,7 +4783,7 @@ where
 		);
 		let next_value_to_self_msat = self.get_next_commitment_value_to_self_msat(false, funding);
 
-		let ret = SpecTxBuilder {}.get_next_commitment_stats(
+		let ret = SpecTxBuilder::new(funding.is_colored()).get_next_commitment_stats(
 			false,
 			funding.is_outbound(),
 			funding.get_value_satoshis(),
@@ -4805,7 +4805,7 @@ where
 					predicted_fee_sat: ret.commit_tx_fee_sat,
 				};
 			} else {
-				let predicted_stats = SpecTxBuilder {}
+				let predicted_stats = SpecTxBuilder::new(funding.is_colored())
 					.get_next_commitment_stats(
 						false,
 						funding.is_outbound(),
@@ -5453,7 +5453,7 @@ where
 
 		let value_to_self_msat = (funding.value_to_self_msat + value_to_self_claimed_msat).checked_sub(value_to_remote_claimed_msat).unwrap();
 
-		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
+		let (tx, stats) = SpecTxBuilder::new(funding.is_colored()).build_commitment_transaction(
 			local,
 			commitment_number,
 			per_commitment_point,
@@ -5639,10 +5639,10 @@ where
 		}
 
 		let extra_nondust_htlc_on_counterparty_tx_dust_exposure_msat = excess_feerate_opt.map(|excess_feerate| {
-			let extra_htlc_commit_tx_fee_sat = SpecTxBuilder {}.commit_tx_fee_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs + 1 + on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
+			let extra_htlc_commit_tx_fee_sat = SpecTxBuilder::new(funding.is_colored()).commit_tx_fee_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs + 1 + on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
 			let extra_htlc_htlc_tx_fees_sat = chan_utils::htlc_tx_fees_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs + 1, on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
 
-			let commit_tx_fee_sat = SpecTxBuilder {}.commit_tx_fee_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs + on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
+			let commit_tx_fee_sat = SpecTxBuilder::new(funding.is_colored()).commit_tx_fee_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs + on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
 			let htlc_tx_fees_sat = chan_utils::htlc_tx_fees_sat(excess_feerate, on_counterparty_tx_accepted_nondust_htlcs, on_counterparty_tx_offered_nondust_htlcs, funding.get_channel_type());
 
 			let extra_htlc_dust_exposure = on_counterparty_tx_dust_exposure_msat + (extra_htlc_commit_tx_fee_sat + extra_htlc_htlc_tx_fees_sat) * 1000;
@@ -5770,7 +5770,7 @@ where
 		let htlc_stats = context.get_pending_htlc_stats(funding, None, dust_exposure_limiting_feerate);
 
 		// Subtract any non-HTLC outputs from the local and remote balances
-		let (local_balance_before_fee_msat, remote_balance_before_fee_msat) = SpecTxBuilder {}.subtract_non_htlc_outputs(
+		let (local_balance_before_fee_msat, remote_balance_before_fee_msat) = SpecTxBuilder::new(funding.is_colored()).subtract_non_htlc_outputs(
 			funding.is_outbound(),
 			funding.value_to_self_msat.saturating_sub(htlc_stats.pending_outbound_htlcs_value_msat),
 			(funding.get_value_satoshis() * 1000).checked_sub(funding.value_to_self_msat).unwrap().saturating_sub(htlc_stats.pending_inbound_htlcs_value_msat),
@@ -5987,7 +5987,7 @@ where
 		}
 
 		let num_htlcs = included_htlcs + addl_htlcs;
-		SpecTxBuilder {}.commit_tx_fee_sat(context.feerate_per_kw, num_htlcs, funding.get_channel_type()) * 1000
+		SpecTxBuilder::new(funding.is_colored()).commit_tx_fee_sat(context.feerate_per_kw, num_htlcs, funding.get_channel_type()) * 1000
 	}
 
 	/// Get the commitment tx fee for the remote's next commitment transaction based on the number of
@@ -6064,7 +6064,7 @@ where
 		}
 
 		let num_htlcs = included_htlcs + addl_htlcs;
-		SpecTxBuilder {}.commit_tx_fee_sat(context.feerate_per_kw, num_htlcs, funding.get_channel_type()) * 1000
+		SpecTxBuilder::new(funding.is_colored()).commit_tx_fee_sat(context.feerate_per_kw, num_htlcs, funding.get_channel_type()) * 1000
 	}
 
 	#[rustfmt::skip]

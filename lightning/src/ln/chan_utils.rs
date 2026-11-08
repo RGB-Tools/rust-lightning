@@ -277,7 +277,7 @@ impl HTLCClaim {
 }
 
 #[cfg(not(any(test, feature = "_test_utils")))]
-const COMMITMENT_TX_WEIGHT_PER_HTLC: u64 = 172;
+pub(crate) const COMMITMENT_TX_WEIGHT_PER_HTLC: u64 = 172;
 #[cfg(any(test, feature = "_test_utils"))]
 pub const COMMITMENT_TX_WEIGHT_PER_HTLC: u64 = 172;
 
@@ -285,9 +285,7 @@ pub const COMMITMENT_TX_WEIGHT_PER_HTLC: u64 = 172;
 pub(crate) fn commitment_tx_base_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
 	const COMMITMENT_TX_BASE_WEIGHT: u64 = 724;
 	const COMMITMENT_TX_BASE_ANCHOR_WEIGHT: u64 = 1124;
-	let base_weight = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { COMMITMENT_TX_BASE_ANCHOR_WEIGHT } else { COMMITMENT_TX_BASE_WEIGHT };
-	// add OP_RETURN weight (RGB coloring)
-	base_weight + 172
+	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { COMMITMENT_TX_BASE_ANCHOR_WEIGHT } else { COMMITMENT_TX_BASE_WEIGHT }
 }
 
 /// Get the fee cost of a commitment tx with a given number of HTLC outputs.
