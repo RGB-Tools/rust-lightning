@@ -160,9 +160,8 @@ pub(crate) fn is_asset_known(contract_id: ContractId, ldk_data_dir: &Path) -> bo
 }
 
 async fn _accept_transfer(
-	ldk_data_dir: &Path, funding_txid: String,
+	ldk_data_dir: &Path, funding_txid: String, funding_vout: u32,
 ) -> Result<(RgbTransfer, Vec<Assignment>, HashSet<String>, PathBuf), RgbLibError> {
-	let funding_vout = 1;
 	let (data_dir, master_fingerprint) = _get_wallet_data(ldk_data_dir);
 	let indexer_url = _get_indexer_url(ldk_data_dir);
 	// the consignment is received from the channel counterparty over the p2p link and written to disk
@@ -616,13 +615,16 @@ pub fn get_media_staging_dir(ldk_data_dir: &Path, funding_txid: &str) -> PathBuf
 
 /// Handle funding on the receiver side
 pub(crate) fn handle_funding(
-	temporary_channel_id: &ChannelId, funding_txid: String, ldk_data_dir: &Path,
+	temporary_channel_id: &ChannelId, funding_txid: String, funding_vout: u32, ldk_data_dir: &Path,
 	push_asset_amount: Option<u64>,
 ) -> Result<(), ChannelError> {
 	let handle = Handle::current();
 	let _ = handle.enter();
-	let accept_res =
-		futures::executor::block_on(_accept_transfer(ldk_data_dir, funding_txid.clone()));
+	let accept_res = futures::executor::block_on(_accept_transfer(
+		ldk_data_dir,
+		funding_txid.clone(),
+		funding_vout,
+	));
 	let (consignment, remote_rgb_assignments, media_digests, media_dir) = match accept_res {
 		Ok(res) => res,
 		Err(RgbLibError::InvalidConsignment) => {

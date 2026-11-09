@@ -10464,7 +10464,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				Some(Ok(inbound_chan)) => {
 					let logger = WithChannelContext::from(&self.logger, &inbound_chan.context, None);
 					if inbound_chan.funding.is_colored() {
-						match handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), &self.ldk_data_dir, inbound_chan.funding.push_asset_amount()) {
+						match handle_funding(&msg.temporary_channel_id, msg.funding_txid.to_string(), msg.funding_output_index.into(), &self.ldk_data_dir, inbound_chan.funding.push_asset_amount()) {
 							Ok(()) => (),
 							Err(e) => {
 								// at this point the channel initiator already transitioned its channel to the funded channel ID
