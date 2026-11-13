@@ -3267,6 +3267,9 @@ macro_rules! handle_error {
 		debug_assert_ne!($self.per_peer_state.held_by_thread(), LockHeldState::HeldByThread);
 
 		match $internal {
+			// Some callers pass a `Result<Infallible, _>`, which makes this arm uninhabited
+			// and thus the `Ok` construction below unreachable.
+			#[allow(unreachable_code)]
 			Ok(msg) => Ok(msg),
 			Err(MsgHandleErrInternal { err, shutdown_finish, tx_abort, .. }) => {
 				let mut msg_event = None;
