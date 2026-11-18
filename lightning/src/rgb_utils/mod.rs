@@ -231,6 +231,7 @@ pub static SKIP_COMMITMENT_COLORING_FOR_DIR: std::sync::Mutex<Option<String>> =
 pub(crate) fn color_commitment<SP: Deref>(
 	channel_context: &ChannelContext<SP>, funding_scope: &FundingScope,
 	commitment_transaction: &mut CommitmentTransaction, counterparty: bool,
+	rgb_balance: (u64, u64),
 ) -> Result<(), ChannelError>
 where
 	<SP as std::ops::Deref>::Target: SignerProvider,
@@ -253,7 +254,6 @@ where
 	let chan_id = channel_id.0.as_hex();
 	let mut rgb_offered_htlc = 0;
 	let mut rgb_received_htlc = 0;
-	let mut last_rgb_payment_info = None;
 	let mut output_map = HashMap::new();
 
 	for htlc in commitment_transaction.nondust_htlcs() {
@@ -282,8 +282,8 @@ where
 
 		if rgb_payment_info_tmp_path.exists() {
 			let mut rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_tmp_path);
-			rgb_payment_info.local_rgb_amount = rgb_info.local_rgb_amount;
-			rgb_payment_info.remote_rgb_amount = rgb_info.remote_rgb_amount;
+			rgb_payment_info.local_rgb_amount = rgb_balance.0;
+			rgb_payment_info.remote_rgb_amount = rgb_balance.1;
 			let serialized_info =
 				serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 			fs::write(&rgb_payment_info_proxy_id_path, serialized_info)
@@ -297,8 +297,8 @@ where
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id,
 				amount: htlc_amount_rgb,
-				local_rgb_amount: rgb_info.local_rgb_amount,
-				remote_rgb_amount: rgb_info.remote_rgb_amount,
+				local_rgb_amount: rgb_balance.0,
+				remote_rgb_amount: rgb_balance.1,
 				swap_payment: true,
 				inbound,
 			};
@@ -318,18 +318,10 @@ where
 		};
 
 		output_map.insert(htlc_vout, rgb_payment_info.amount);
-
-		last_rgb_payment_info = Some(rgb_payment_info);
 	}
 
-	let (local_amt, remote_amt) = if let Some(last_rgb_payment_info) = last_rgb_payment_info {
-		(
-			last_rgb_payment_info.local_rgb_amount - rgb_offered_htlc,
-			last_rgb_payment_info.remote_rgb_amount - rgb_received_htlc,
-		)
-	} else {
-		(rgb_info.local_rgb_amount, rgb_info.remote_rgb_amount)
-	};
+	let (local_amt, remote_amt) =
+		(rgb_balance.0 - rgb_offered_htlc, rgb_balance.1 - rgb_received_htlc);
 	let (vout_p2wpkh_amt, vout_p2wsh_amt) =
 		if counterparty { (local_amt, remote_amt) } else { (remote_amt, local_amt) };
 
@@ -438,15 +430,13 @@ pub(crate) fn color_htlc(
 
 /// Color closing transaction
 pub(crate) fn color_closing(
-	channel_id: &ChannelId, closing_transaction: &mut ClosingTransaction, ldk_data_dir: &Path,
+	channel_id: &ChannelId, closing_transaction: &mut ClosingTransaction,
+	(holder_vout_amount, counterparty_vout_amount): (u64, u64), ldk_data_dir: &Path,
 ) -> Result<(), ChannelError> {
 	let closing_tx = closing_transaction.clone().built;
 
 	let (rgb_info, _) = get_rgb_channel_info_pending(channel_id, ldk_data_dir);
 	let contract_id = rgb_info.contract_id;
-
-	let holder_vout_amount = rgb_info.local_rgb_amount;
-	let counterparty_vout_amount = rgb_info.remote_rgb_amount;
 
 	let mut output_map = HashMap::new();
 
@@ -743,19 +733,6 @@ pub fn update_rgb_channel_amount(
 	}
 
 	write_rgb_channel_info(&info_file_path, &rgb_info)
-}
-
-/// Update pending RGB channel amount
-pub(crate) fn update_rgb_channel_amount_pending(
-	channel_id: &ChannelId, rgb_offered_htlc: u64, rgb_received_htlc: u64, ldk_data_dir: &Path,
-) {
-	update_rgb_channel_amount(
-		&channel_id.0.as_hex().to_string(),
-		rgb_offered_htlc,
-		rgb_received_htlc,
-		ldk_data_dir,
-		true,
-	)
 }
 
 /// Whether the payment is colored

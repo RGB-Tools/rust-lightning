@@ -7,7 +7,7 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::amount::{Amount, SignedAmount};
@@ -80,7 +80,7 @@ use crate::offers::static_invoice::StaticInvoice;
 use crate::rgb_utils::{
 	color_closing, color_commitment, color_htlc, get_rgb_channel_info_path,
 	get_rgb_channel_info_pending, is_asset_known, parse_rgb_channel_info, rename_rgb_files,
-	set_counterparty_knows_asset, update_rgb_channel_amount_pending,
+	set_counterparty_knows_asset,
 };
 use crate::routing::gossip::NodeId;
 use crate::sign::ecdsa::EcdsaChannelSigner;
@@ -1086,6 +1086,7 @@ struct CommitmentData<'a> {
 	htlcs_included: Vec<(HTLCOutputInCommitment, Option<&'a HTLCSource>)>, // the list of HTLCs (dust HTLCs *included*) which were not ignored when building the transaction
 	outbound_htlc_preimages: Vec<PaymentPreimage>, // preimages for successful offered HTLCs since last commitment
 	inbound_htlc_preimages: Vec<PaymentPreimage>, // preimages for successful received HTLCs since last commitment
+	rgb_balance: (u64, u64), // (local, remote) RGB amounts before subtracting the included HTLCs
 }
 
 /// A struct gathering stats on a commitment transaction, either local or remote.
@@ -2361,6 +2362,9 @@ pub(crate) struct FundingScope {
 	/// The RGB asset this channel is for, if it is a colored channel: the contract ID of the asset
 	/// plus the amount of it pushed to the counterparty on channel open, if any.
 	pub(super) rgb_asset: Option<(ContractId, Option<u64>)>,
+	/// The (local, remote) RGB amounts of settled HTLCs, moved together with
+	/// `value_to_self_msat`. `None` until the first RGB HTLC settles.
+	rgb_balance: Option<(u64, u64)>,
 }
 
 impl Writeable for FundingScope {
@@ -2376,6 +2380,7 @@ impl Writeable for FundingScope {
 			(15, self.short_channel_id, option),
 			(17, self.minimum_depth_override, option),
 			(21, self.rgb_asset, option),
+			(23, self.rgb_balance, option),
 		});
 		Ok(())
 	}
@@ -2394,6 +2399,7 @@ impl Readable for FundingScope {
 		let mut short_channel_id = None;
 		let mut minimum_depth_override = None;
 		let mut rgb_asset: Option<(ContractId, Option<u64>)> = None;
+		let mut rgb_balance: Option<(u64, u64)> = None;
 
 		read_tlv_fields!(reader, {
 			(1, value_to_self_msat, required),
@@ -2406,6 +2412,7 @@ impl Readable for FundingScope {
 			(15, short_channel_id, option),
 			(17, minimum_depth_override, option),
 			(21, rgb_asset, option),
+			(23, rgb_balance, option),
 		});
 
 		Ok(Self {
@@ -2423,6 +2430,7 @@ impl Readable for FundingScope {
 			short_channel_id,
 			minimum_depth_override,
 			rgb_asset,
+			rgb_balance,
 			#[cfg(any(test, fuzzing))]
 			next_local_fee: Mutex::new(PredictedNextFee::default()),
 			#[cfg(any(test, fuzzing))]
@@ -2443,6 +2451,15 @@ impl FundingScope {
 	/// Whether this is an RGB (colored) channel.
 	pub(crate) fn is_colored(&self) -> bool {
 		self.rgb_asset.is_some()
+	}
+
+	/// The (local, remote) RGB amounts of settled HTLCs. Channels that never settled an RGB HTLC
+	/// read them from the pending RGB info file written at funding time.
+	fn settled_rgb_balance(&self, channel_id: &ChannelId, ldk_data_dir: &Path) -> (u64, u64) {
+		self.rgb_balance.unwrap_or_else(|| {
+			let (rgb_info, _) = get_rgb_channel_info_pending(channel_id, ldk_data_dir);
+			(rgb_info.local_rgb_amount, rgb_info.remote_rgb_amount)
+		})
 	}
 
 	/// The RGB contract ID of the asset this channel is for, if it is a colored channel.
@@ -2626,6 +2643,7 @@ impl FundingScope {
 			minimum_depth_override: None,
 			short_channel_id: None,
 			rgb_asset: None,
+			rgb_balance: None,
 		}
 	}
 
@@ -3183,7 +3201,7 @@ where
 			holder_commitment_point.next_transaction_number(), &holder_commitment_point.next_point(),
 			true, false, logger);
 		if self.context().is_colored() {
-			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, false).expect("successful commitment coloring");
+			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, false, commitment_data.rgb_balance).expect("successful commitment coloring");
 		}
 		let initial_commitment_tx = commitment_data.tx;
 		let trusted_tx = initial_commitment_tx.trust();
@@ -3227,7 +3245,7 @@ where
 			context.counterparty_next_commitment_transaction_number,
 			&context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 		if self.context().is_colored() {
-			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, true).unwrap();
+			color_commitment(&self.context(), &self.funding(), &mut commitment_data.tx, true, commitment_data.rgb_balance).unwrap();
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
@@ -3633,6 +3651,7 @@ where
 			short_channel_id: None,
 			minimum_depth_override: None,
 			rgb_asset,
+			rgb_balance: None,
 		};
 		let channel_context = ChannelContext {
 			user_id,
@@ -3879,6 +3898,7 @@ where
 			short_channel_id: None,
 			minimum_depth_override: None,
 			rgb_asset,
+			rgb_balance: None,
 		};
 		let channel_context = Self {
 			user_id,
@@ -5048,8 +5068,14 @@ where
 			logger,
 		);
 		if self.is_colored() {
-			color_commitment(&self, &funding, &mut commitment_data.tx, false)
-				.expect("successful commitment coloring");
+			color_commitment(
+				&self,
+				&funding,
+				&mut commitment_data.tx,
+				false,
+				commitment_data.rgb_balance,
+			)
+			.expect("successful commitment coloring");
 		}
 		let commitment_txid = {
 			let trusted_tx = commitment_data.tx.trust();
@@ -5389,6 +5415,8 @@ where
 		let mut htlcs_included: Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)> = Vec::with_capacity(num_htlcs);
 		let mut value_to_self_claimed_msat = 0;
 		let mut value_to_remote_claimed_msat = 0;
+		let mut rgb_to_self_claimed = 0;
+		let mut rgb_to_remote_claimed = 0;
 
 		log_trace!(logger, "Building commitment transaction number {} (really {} xor {}) for channel {} for {}, generated by {} with fee {}...",
 			commitment_number, (INITIAL_COMMITMENT_NUMBER - commitment_number),
@@ -5428,6 +5456,7 @@ where
 				if let Some(preimage) = htlc.state.preimage() {
 					inbound_htlc_preimages.push(preimage);
 					value_to_self_claimed_msat += htlc.amount_msat;
+					rgb_to_self_claimed += htlc.rgb_payment.map_or(0, |(_, amount_rgb)| amount_rgb);
 				}
 			}
 		};
@@ -5443,6 +5472,7 @@ where
 				log_trace!(logger, "   ...not including outbound HTLC {} (hash {}) with value {} due to state ({})", htlc.htlc_id, htlc.payment_hash, htlc.amount_msat, htlc.state);
 				if htlc.state.preimage().is_some() {
 					value_to_remote_claimed_msat += htlc.amount_msat;
+					rgb_to_remote_claimed += htlc.rgb_payment.map_or(0, |(_, amount_rgb)| amount_rgb);
 				}
 			}
 		};
@@ -5452,6 +5482,15 @@ where
 		// After all HTLC claims have been accounted for, the local balance MUST remain greater than or equal to 0.
 
 		let value_to_self_msat = (funding.value_to_self_msat + value_to_self_claimed_msat).checked_sub(value_to_remote_claimed_msat).unwrap();
+		let rgb_balance = if funding.is_colored() {
+			let (local, remote) = funding.settled_rgb_balance(&self.channel_id, &self.ldk_data_dir);
+			(
+				(local + rgb_to_self_claimed).checked_sub(rgb_to_remote_claimed).unwrap(),
+				(remote + rgb_to_remote_claimed).checked_sub(rgb_to_self_claimed).unwrap(),
+			)
+		} else {
+			(0, 0)
+		};
 
 		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
 			local,
@@ -5524,6 +5563,7 @@ where
 			htlcs_included,
 			inbound_htlc_preimages,
 			outbound_htlc_preimages,
+			rgb_balance,
 		}
 	}
 
@@ -6371,8 +6411,14 @@ where
 			logger,
 		);
 		if self.is_colored() {
-			color_commitment(&self, &funding, &mut commitment_data.tx, true)
-				.expect("successful commitment coloring");
+			color_commitment(
+				&self,
+				&funding,
+				&mut commitment_data.tx,
+				true,
+				commitment_data.rgb_balance,
+			)
+			.expect("successful commitment coloring");
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		match self.holder_signer {
@@ -7349,6 +7395,8 @@ where
 			color_closing(
 				&self.context.channel_id,
 				&mut closing_transaction,
+				self.funding
+					.settled_rgb_balance(&self.context.channel_id, &self.context.ldk_data_dir),
 				&self.context.ldk_data_dir,
 			)
 			.expect("successful closing TX coloring");
@@ -8065,23 +8113,23 @@ where
 		)?;
 		// This corresponds to the same `commitment_signed` we sent earlier, which we know to be the
 		// same since the state machine is paused until `tx_signatures` are exchanged.
-		let mut counterparty_commitment_tx = self
-			.context
-			.build_commitment_transaction(
-				pending_splice_funding,
-				self.context.counterparty_next_commitment_transaction_number + 1,
-				&self.context.counterparty_current_commitment_point.unwrap(),
-				false,
-				false,
-				logger,
-			)
-			.tx;
+		let commitment_data = self.context.build_commitment_transaction(
+			pending_splice_funding,
+			self.context.counterparty_next_commitment_transaction_number + 1,
+			&self.context.counterparty_current_commitment_point.unwrap(),
+			false,
+			false,
+			logger,
+		);
+		let rgb_balance = commitment_data.rgb_balance;
+		let mut counterparty_commitment_tx = commitment_data.tx;
 		if self.context.is_colored() {
 			color_commitment(
 				&self.context,
 				&pending_splice_funding,
 				&mut counterparty_commitment_tx,
 				true,
+				rgb_balance,
 			)
 			.expect("successful commitment coloring");
 		}
@@ -8777,8 +8825,8 @@ where
 		let mut static_invoices = Vec::new();
 		let mut require_commitment = false;
 		let mut value_to_self_msat_diff: i64 = 0;
-		let mut rgb_offered_htlc = 0;
-		let mut rgb_received_htlc = 0;
+		let mut rgb_to_self_settled = 0;
+		let mut rgb_to_remote_settled = 0;
 
 		{
 			// Take references explicitly so that we can hold multiple references to self.context.
@@ -8793,6 +8841,7 @@ where
 					log_trace!(logger, " ...removing inbound LocalRemoved {}", &htlc.payment_hash);
 					if let &InboundHTLCRemovalReason::Fulfill(_, _) = reason {
 						value_to_self_msat_diff += htlc.amount_msat as i64;
+						rgb_to_self_settled += htlc.rgb_payment.map_or(0, |(_, a)| a);
 					}
 					*expecting_peer_commitment_signed = true;
 					false
@@ -8822,6 +8871,7 @@ where
 							finalized_claimed_htlcs.push((htlc.source.clone(), attribution_data));
 							// They fulfilled, so we sent them money
 							value_to_self_msat_diff -= htlc.amount_msat as i64;
+							rgb_to_remote_settled += htlc.rgb_payment.map_or(0, |(_, a)| a);
 						},
 					}
 					false
@@ -8846,10 +8896,6 @@ where
 						log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 						htlc.state = InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution);
 						require_commitment = true;
-
-						if let Some((_, amount_rgb)) = htlc.rgb_payment {
-							rgb_received_htlc += amount_rgb;
-						}
 					} else if let InboundHTLCState::AwaitingAnnouncedRemoteRevoke(resolution) =
 						state
 					{
@@ -8921,9 +8967,6 @@ where
 						&htlc.payment_hash
 					);
 					htlc.state = OutboundHTLCState::Committed;
-					if let Some((_, amount_rgb)) = htlc.rgb_payment {
-						rgb_offered_htlc += amount_rgb;
-					}
 					*expecting_peer_commitment_signed = true;
 				}
 				if let &mut OutboundHTLCState::AwaitingRemoteRevokeToRemove(ref mut outcome) =
@@ -8939,18 +8982,18 @@ where
 			}
 		}
 
+		let channel_id = self.context.channel_id;
+		let ldk_data_dir = self.context.ldk_data_dir.clone();
 		for funding in self.funding_and_pending_funding_iter_mut() {
 			funding.value_to_self_msat =
 				(funding.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
-		}
-
-		if self.context.is_colored() && (rgb_offered_htlc > 0 || rgb_received_htlc > 0) {
-			update_rgb_channel_amount_pending(
-				&self.context.channel_id,
-				rgb_offered_htlc,
-				rgb_received_htlc,
-				&self.context.ldk_data_dir,
-			);
+			if funding.is_colored() && (rgb_to_self_settled > 0 || rgb_to_remote_settled > 0) {
+				let (local, remote) = funding.settled_rgb_balance(&channel_id, &ldk_data_dir);
+				funding.rgb_balance = Some((
+					(local + rgb_to_self_settled).checked_sub(rgb_to_remote_settled).unwrap(),
+					(remote + rgb_to_remote_settled).checked_sub(rgb_to_self_settled).unwrap(),
+				));
+			}
 		}
 
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
@@ -9682,7 +9725,7 @@ where
 				self.context.counterparty_next_commitment_transaction_number + 1,
 				&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 			if self.context.is_colored() {
-				color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).expect("successful commitment coloring");
+				color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true, commitment_data.rgb_balance).expect("successful commitment coloring");
 			}
 			let counterparty_initial_commitment_tx = commitment_data.tx;
 			self.context.get_funding_signed_msg(&self.funding.channel_transaction_parameters, logger, counterparty_initial_commitment_tx)
@@ -12893,7 +12936,6 @@ where
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
 		// is acceptable.
-		let mut rgb_received_htlc = 0;
 		for htlc in self.context.pending_inbound_htlcs.iter_mut() {
 			let new_state = if let &InboundHTLCState::AwaitingRemoteRevokeToAnnounce(ref forward_info) = &htlc.state {
 				Some(InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info.clone()))
@@ -12901,10 +12943,6 @@ where
 			if let Some(state) = new_state {
 				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 				htlc.state = state;
-
-				if let Some((_, amount_rgb)) = htlc.rgb_payment {
-					rgb_received_htlc += amount_rgb;
-				}
 			}
 		}
 		for htlc in self.context.pending_outbound_htlcs.iter_mut() {
@@ -12915,9 +12953,6 @@ where
 				mem::swap(outcome, &mut reason);
 				htlc.state = OutboundHTLCState::AwaitingRemovedRemoteRevoke(reason);
 			}
-		}
-		if self.context.is_colored() && rgb_received_htlc > 0 {
-			update_rgb_channel_amount_pending(&self.context.channel_id, 0, rgb_received_htlc, &self.context.ldk_data_dir);
 		}
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			if update_state == FeeUpdateState::AwaitingRemoteRevokeToAnnounce {
@@ -13004,7 +13039,7 @@ where
 			&self.context.counterparty_next_commitment_point.unwrap(), false, true, logger,
 		);
 		if self.context.is_colored() {
-			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).expect("successful commitment coloring");
+			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true, commitment_data.rgb_balance).expect("successful commitment coloring");
 		}
 		let counterparty_commitment_tx = commitment_data.tx;
 
@@ -13041,7 +13076,7 @@ where
 			&self.context.counterparty_next_commitment_point.unwrap(), false, true, logger,
 		);
 		if self.context.is_colored() {
-			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true)?;
+			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true, commitment_data.rgb_balance)?;
 		}
 		let counterparty_commitment_tx = commitment_data.tx;
 
@@ -13642,7 +13677,7 @@ where
 			self.context.counterparty_next_commitment_transaction_number,
 			&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 		if self.context.is_colored() {
-			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true).unwrap();
+			color_commitment(&self.context, &self.funding, &mut commitment_data.tx, true, commitment_data.rgb_balance).unwrap();
 		}
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		let signature = match &self.context.holder_signer {
@@ -15097,6 +15132,7 @@ where
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
 			(73, self.funding.rgb_asset, option),
+			(75, self.funding.rgb_balance, option),
 		});
 
 		Ok(())
@@ -15432,6 +15468,7 @@ where
 		let mut channel_keys_id = [0u8; 32];
 		let mut temporary_channel_id: Option<ChannelId> = None;
 		let mut holder_max_accepted_htlcs: Option<u16> = None;
+		let mut rgb_balance: Option<(u64, u64)> = None;
 		let mut rgb_asset: Option<(ContractId, Option<u64>)> = None;
 
 		let mut blocked_monitor_updates = Some(Vec::new());
@@ -15516,6 +15553,7 @@ where
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(73, rgb_asset, option),
+			(75, rgb_balance, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -15795,6 +15833,7 @@ where
 				short_channel_id,
 				minimum_depth_override,
 				rgb_asset,
+				rgb_balance,
 			},
 			context: ChannelContext {
 				user_id,
@@ -17898,6 +17937,7 @@ mod tests {
 			short_channel_id: None,
 			minimum_depth_override: None,
 			rgb_asset: None,
+			rgb_balance: None,
 		};
 		let post_channel_value =
 			funding.compute_post_splice_value(our_funding_contribution, their_funding_contribution);
